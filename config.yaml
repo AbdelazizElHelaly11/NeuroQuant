@@ -1,0 +1,116 @@
+# NeuroQuant v2.0 — Full Configuration
+# Every pipeline knob is exposed here so code does not need to be edited.
+# Keys below map 1:1 onto the dataclasses in config.py (QuantizationConfig +
+# HyperparameterSet). Unknown keys are ignored at load time.
+
+# ── Model ────────────────────────────────────────────────────────────────
+model:
+  name: "mobilenetv2"           # torchvision name OR empty if using `class`
+  path: null                    # optional: path to pre-trained weights (.pth)
+  class: null                   # optional: fully-qualified "pkg.mod.ClassName"
+  num_classes: 10
+  input_shape: [3, 32, 32]      # (C, H, W)
+
+# ── Dataset ──────────────────────────────────────────────────────────────
+dataset:
+  name: "cifar10"               # torchvision dataset name OR "imagefolder" OR "synthetic"
+  path: "./data"
+  batch_size: 128
+  num_workers: 4                # auto-forced to 0 on Windows
+
+# ── Output ───────────────────────────────────────────────────────────────
+output:
+  dir: "./artifacts"
+  mlflow_tracking_uri: "./mlruns"
+  experiment_name: "neuroquant_v2"
+
+# ── Methods to run in Phase 1f (and PTQ gating in Phase 1c) ──────────────
+methods:
+  - ptq
+  - qat
+  - gptq
+  - smoothquant
+  - awq
+
+# ── Bitwidths ────────────────────────────────────────────────────────────
+bitwidths:
+  supported: [4, 8]
+  io_layer: 8                   # force this bitwidth on first + last layers
+
+# ── Hyperparameters ──────────────────────────────────────────────────────
+hyperparams:
+  # General
+  seed: 42
+  device: "auto"                # auto | cuda | cpu | mps
+
+  # Calibration (activation observers + PTQ strategy)
+  calibration_batches: 20
+  calibration_strategy_io: "kl_divergence"      # kl_divergence | mse
+  calibration_strategy_intermediate: "mse"      # kl_divergence | mse
+
+  # Hessian / clustering
+  hessian_batches: 20
+  cluster_high_percentile: 0.66
+  cluster_low_percentile: 0.33
+
+  # NSGA-II search
+  nsga_population_size: 8
+  nsga_generations: 20
+  nsga_crossover_prob: 0.9
+  nsga_mutation_prob: 0.1
+  nsga_accuracy_objective: "top1"   # top1 | top5 — objective driving NSGA fitness
+
+  # FITCompress seed generation
+  fit_low_percentile: 0.25          # below → force INT4 (compress)
+  fit_high_percentile: 0.75         # above → force INT8 (preserve)
+
+  # AdaRound
+  adaround_epochs: 100
+  adaround_lr: 0.0001
+  adaround_reg_param: 0.01          # λ for the entropy regulariser
+
+  # QAT
+  qat_epochs: 5
+  qat_lr: 0.001
+  qat_momentum: 0.9
+  qat_weight_decay: 0.0001
+  qat_early_stop_patience: 3
+
+  # GPTQ
+  gptq_block_size: 128
+  gptq_percdamp: 0.01
+
+  # SmoothQuant
+  smoothquant_alpha: 0.5            # 0 → all difficulty on activations, 1 → on weights
+
+  # AWQ
+  awq_group_size: 128
+
+  # XAI / explainability
+  xai_num_images: 5
+  xai_grad_cam_alpha: 0.4
+  xai_shap_n_samples: 50
+  xai_plot_dpi: 150
+
+  # Evaluation + reporting
+  eval_primary_accuracy: "top1"     # top1 | top5 — printed in the final report
+  latency_warmup_runs: 10
+  latency_measure_runs: 50
+  latency_batch_size: 1
+  hardware_report_path: ""          # path to Vivado/Quartus JSON/CSV; empty = skip
+  use_latency_in_pareto: false      # adds mean latency as an MLflow Pareto metric
+
+# ── Phases ───────────────────────────────────────────────────────────────
+# Comment out any phase to skip it. Order is fixed; the pipeline always
+# executes them in the registry order regardless of yaml ordering.
+phases:
+  - phase_0_preparation
+  - phase_1a_hessian_clustering
+  - phase_1b_fitcompress
+  - phase_1c_nsga_search
+  - phase_1d_adaround
+  - phase_1e_qat
+  - phase_1f_gptq_smooth_awq
+  - phase_2_pareto
+  - phase_3_xai
+  - phase_4_mlflow

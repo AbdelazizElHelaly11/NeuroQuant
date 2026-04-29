@@ -1,0 +1,41 @@
+# NeuroQuant v2.0 - Git Ignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data (auto-downloaded, large)
+data/
+*.tar.gz
+
+# Artifacts (generated at runtime)
+artifacts/
+mlruns/
+logs/
+
+# Checkpoints (large binary files)
+*.pth
+!examples/*.pth
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
