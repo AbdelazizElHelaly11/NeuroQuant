@@ -220,6 +220,22 @@ class HyperparameterSet:
     qat_momentum: float = 0.9
     qat_weight_decay: float = 1e-4
     qat_early_stop_patience: int = 3  # Stop if no val improvement for N epochs
+    # Which PTQ artefact warmstarts QAT/Adaround. "ptq_best_acc" picks
+    # the highest real Top-1 PTQ; "ptq_best_tradeoff" picks the most
+    # compressed PTQ that stays within ``ptq_tradeoff_max_acc_drop`` of
+    # FP32. The chosen source ID is persisted to checkpoints/metadata.
+    qat_warmstart_source: str = "ptq_best_acc"  # 'ptq_best_acc' | 'ptq_best_tradeoff'
+
+    # Multi-fidelity PTQ rerank (phase 1c)
+    # Number of NSGA candidates materialised through real PTQ +
+    # bitwidth-aware calibration before final selection. K=1 disables
+    # reranking (only the NSGA winner is materialised).
+    ptq_real_rerank_topk: int = 3
+    # Maximum tolerated Top-1 accuracy drop (percentage points) for the
+    # ``ptq_best_tradeoff`` candidate. If no rerank candidate satisfies
+    # the cap, the smallest-size candidate is chosen as a knee-like
+    # fallback.
+    ptq_tradeoff_max_acc_drop: float = 1.0
 
     # GPTQ
     gptq_block_size: int = 128
@@ -504,6 +520,17 @@ class QuantizationConfig:
             errors.append("adaround_lr must be > 0.")
         if hp.qat_lr <= 0:
             errors.append("qat_lr must be > 0.")
+
+        # ── PTQ rerank / warmstart ──
+        if hp.qat_warmstart_source not in ("ptq_best_acc", "ptq_best_tradeoff"):
+            errors.append(
+                f"qat_warmstart_source='{hp.qat_warmstart_source}' invalid. "
+                "Use 'ptq_best_acc' or 'ptq_best_tradeoff'."
+            )
+        if hp.ptq_real_rerank_topk < 1:
+            errors.append("ptq_real_rerank_topk must be >= 1.")
+        if hp.ptq_tradeoff_max_acc_drop < 0:
+            errors.append("ptq_tradeoff_max_acc_drop must be >= 0.")
 
         # ── Phases ──
         valid_phases = {name for name, _ in [

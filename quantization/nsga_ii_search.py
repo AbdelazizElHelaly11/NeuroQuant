@@ -127,19 +127,50 @@ class NSGAIIClusterSearch:
         self.config = config
         self.device = self._resolve_device(config.hyperparams.device)
 
-        # Separate clusters into fixed (HIGH) and searchable (MEDIUM/LOW)
+        # Build the canonical set of TRULY quantizable parameters (the
+        # weight tensors of Conv2d / Linear modules). Anything else
+        # — BatchNorm γ/β, biases, embeddings — must never appear in a
+        # searchable cluster, must never get a gene, and must never be
+        # accounted for in the size objective. Doing so was the source
+        # of pollution in the prior implementation.
+        self._quantizable_weights: set = self._build_quantizable_weight_set(model)
+
+        # Filter every incoming cluster down to the quantizable set, then
+        # split into fixed (HIGH) and searchable (MEDIUM/LOW). Empty
+        # clusters after filtering are dropped — they can't contribute to
+        # the search.
         self.fixed_clusters: List[ClusterAssignment] = []
         self.searchable_clusters: List[ClusterAssignment] = []
 
+        dropped_layers: List[str] = []
         for ca in cluster_assignments:
+            keep = [n for n in ca.get("layer_names", [])
+                    if n in self._quantizable_weights]
+            dropped_layers.extend(
+                n for n in ca.get("layer_names", []) if n not in self._quantizable_weights
+            )
+            if not keep:
+                continue
+            filtered_ca: ClusterAssignment = {
+                **ca,
+                "layer_names": keep,
+            }
             if ca["tier"] == "HIGH":
-                self.fixed_clusters.append(ca)
+                self.fixed_clusters.append(filtered_ca)
             else:
-                self.searchable_clusters.append(ca)
+                self.searchable_clusters.append(filtered_ca)
+
+        if dropped_layers:
+            logger.info(
+                "NSGA-II: dropped %d non-quantizable params from clusters "
+                "(BN/bias/embeddings stay FP32).",
+                len(dropped_layers),
+            )
 
         self.num_genes = len(self.searchable_clusters)
 
-        # Build the fixed part of the bitwidth config (HIGH → INT8)
+        # Build the fixed part of the bitwidth config (HIGH → INT8). Only
+        # quantizable weights end up here by construction.
         self._fixed_config: Dict[str, int] = {}
         for ca in self.fixed_clusters:
             for pname in ca["layer_names"]:
@@ -793,6 +824,28 @@ class NSGAIIClusterSearch:
         """
         return list(self._last_pareto)
 
+    def get_quantizable_param_names(self) -> List[str]:
+        """Return the parameter names that NSGA-II treats as quantizable.
+
+        These are the only parameters that can appear in a gene-derived
+        bitwidth assignment. BatchNorm/bias/etc. are excluded by
+        construction.
+        """
+        return sorted(self._quantizable_weights)
+
+    def get_searchable_param_names(self) -> List[str]:
+        """Return the parameter names that genes actually search over.
+
+        Equivalent to the union of ``layer_names`` across all
+        searchable (MEDIUM/LOW) clusters, after the non-quantizable
+        filter has been applied.
+        """
+        names: set = set()
+        for ca in self.searchable_clusters:
+            for n in ca.get("layer_names", []):
+                names.add(n)
+        return sorted(names)
+
     @staticmethod
     def _resolve_device(device_str: str) -> torch.device:
         """Resolve device string to torch.device."""
@@ -804,3 +857,23 @@ class NSGAIIClusterSearch:
             else:
                 return torch.device("cpu")
         return torch.device(device_str)
+
+    @staticmethod
+    def _build_quantizable_weight_set(model: nn.Module) -> set:
+        """Return the set of parameter names that NSGA-II is allowed to
+        assign a quantization bitwidth to.
+
+        Only the ``.weight`` tensor of ``nn.Conv2d`` / ``nn.Linear``
+        modules is considered quantizable. BatchNorm γ/β, biases, and
+        any other module's parameters stay FP32 — both during evaluation
+        (no fake-quantization) and during real PTQ materialization.
+        """
+        quantizable: set = set()
+        for module_name, module in model.named_modules():
+            if not isinstance(module, (nn.Conv2d, nn.Linear)):
+                continue
+            if not hasattr(module, "weight") or module.weight is None:
+                continue
+            pname = f"{module_name}.weight" if module_name else "weight"
+            quantizable.add(pname)
+        return quantizable

@@ -506,9 +506,28 @@ class NeuroQuantPipeline:
         })
         self.tracker.end_run()
 
-        # Store the best solution's config for Adaround/QAT
+        # Store the PTQ materialization config for downstream phases.
+        # Prefer a mixed (INT4+INT8) solution when available so the
+        # resulting PTQ artifact reflects the mixed-precision flow.
         if self.pareto_front["solutions"]:
-            self.best_config = self.pareto_front["solutions"][0]["bitwidth_assignment"]
+            ranked = self.pareto_front["solutions"]
+            selected = ranked[0]
+            mixed_ranked = [
+                s for s in ranked
+                if self._is_mixed_bitwidth_assignment(
+                    s.get("bitwidth_assignment", {}),
+                )
+            ]
+            if mixed_ranked:
+                selected = mixed_ranked[0]
+                logger.info(
+                    "  Phase 1c: selected mixed PTQ config %s for "
+                    "materialization (acc=%.2f%%, size=%.2f MiB).",
+                    selected.get("solution_id", "unknown"),
+                    float(selected.get("accuracy", 0.0)),
+                    float(selected.get("model_size_mb", 0.0)),
+                )
+            self.best_config = selected.get("bitwidth_assignment", {})
 
         self.report_lines.append(
             f"[Phase 1c] NSGA-II: {n_pareto} Pareto solutions, "
@@ -516,61 +535,122 @@ class NeuroQuantPipeline:
         )
         self.results["pareto_solutions"] = n_pareto
 
-        # ── Real PTQ on the NSGA winner ──
-        # NSGA-II searches with fake-quant for speed; here we materialise
-        # the best configuration through PTQQuantizer + calibration so the
-        # downstream phases (XAI, reporting) have an actual quantized model
-        # rather than only search-time surrogates.
-        from quantization.ptq import PTQQuantizer
-
+        # ── Multi-fidelity PTQ rerank ──
+        # NSGA-II searches with fake-quant for speed; the proxy ranking
+        # is not the same as real PTQ ranking. We materialise the top-K
+        # NSGA candidates through PTQQuantizer + bitwidth-AWARE
+        # calibration, then pick:
+        #
+        #   * ptq_best_acc       — highest real Top-1
+        #   * ptq_best_tradeoff  — most compressed candidate within
+        #                          hp.ptq_tradeoff_max_acc_drop pp of
+        #                          FP32; falls back to the smallest-size
+        #                          candidate when none satisfies the cap.
+        #
+        # Both go into ``self.method_results`` (deduplicated) so the
+        # public phase-2 Pareto and the phase-3 XAI matrix can show
+        # them as distinct rows when they are not identical.
         methods_enabled = {m.value.lower() for m in self.config.methods}
-        if self.best_config and ("ptq" in methods_enabled or not methods_enabled):
-            from utils.common import compute_quantized_size_mb
+        ptq_enabled = ("ptq" in methods_enabled or not methods_enabled)
 
-            ptq = PTQQuantizer(self.model, self.config)
-            ptq.calibrate(
-                self.calib_loader,
-                num_batches=self.config.hyperparams.calibration_batches,
+        ptq_best_acc_result: Optional[Dict[str, Any]] = None
+        ptq_best_tradeoff_result: Optional[Dict[str, Any]] = None
+        ptq_best_acc_model: Optional[nn.Module] = None
+        ptq_best_tradeoff_model: Optional[nn.Module] = None
+
+        if self.best_config and ptq_enabled:
+            ranked_candidates = self._select_rerank_candidates(
+                self.pareto_front.get("solutions", []),
+                int(getattr(hp, "ptq_real_rerank_topk", 3)),
             )
-            ptq_model = ptq.quantize_with_config(self.best_config)
-            dom_bw = self._dominant_bitwidth(self.best_config)
-            ptq_res = ptq.evaluate(
-                ptq_model, self.val_loader, bitwidth=dom_bw,
-            )
-            # Canonical, bitwidth-tagged name (no METHOD_METHOD duplication).
-            ptq_res["config_id"] = f"PTQ_INT{dom_bw}"
-            ptq_res["display_name"] = f"PTQ_INT{dom_bw}"
-            ptq_res["bitwidth"] = int(dom_bw)
-            ptq_res["bitwidth_assignment"] = self.best_config
-            # Real model size in MiB from the actual bitwidth assignment
-            # rather than ebops/1e6 (which conflates units).
-            ptq_res["model_size_mb"] = compute_quantized_size_mb(
-                self.model, self.best_config,
+            if not ranked_candidates:
+                # No NSGA solutions to rerank — fall back to ``best_config``.
+                ranked_candidates = [{
+                    "solution_id": "ptq_candidate_0",
+                    "bitwidth_assignment": self.best_config,
+                }]
+
+            (
+                ptq_best_acc_model, ptq_best_acc_result,
+                ptq_best_tradeoff_model, ptq_best_tradeoff_result,
+            ) = self._materialize_and_rerank_ptq(
+                ranked_candidates, hp,
             )
 
-            # Expose to downstream phases + report/summary.
-            self.results["ptq_model"] = ptq_model
-            self.results["ptq_best_result"] = ptq_res
-            self.method_results.append(ptq_res)
-            lat = ptq_res.get("latency") or {}
-            self._add_summary_row(
-                ptq_res["display_name"],
-                ptq_res["accuracy"],
-                lat.get("latency_mean_ms", 0.0),
-                lat.get("throughput_fps", 0.0),
-                ptq_res["ebops"],
-                ptq_res["model_size_mb"],
+            # Surface to results + method_results (avoid duplicates when
+            # both pickers landed on the same configuration).
+            self.results["ptq_best_acc_result"] = ptq_best_acc_result
+            self.results["ptq_best_tradeoff_result"] = ptq_best_tradeoff_result
+            if ptq_best_acc_model is not None:
+                self.results["ptq_best_acc_model"] = ptq_best_acc_model
+                # Backwards compat: legacy keys consumed by phase 3 / phase 2.
+                self.results["ptq_model"] = ptq_best_acc_model
+                self.results["ptq_best_result"] = ptq_best_acc_result
+
+            distinct = (
+                ptq_best_tradeoff_result is not None
+                and ptq_best_acc_result is not None
+                and ptq_best_tradeoff_result.get("display_name")
+                    != ptq_best_acc_result.get("display_name")
             )
-            self.report_lines.append(
-                f"[Phase 1c] {ptq_res['display_name']}: "
-                f"acc={ptq_res['accuracy']:.2f}%, "
-                f"size={ptq_res['model_size_mb']:.2f} MiB"
+            if ptq_best_tradeoff_model is not None and distinct:
+                self.results["ptq_best_tradeoff_model"] = ptq_best_tradeoff_model
+
+            # Append to method_results (this is what phase 2 walks).
+            for res in (ptq_best_acc_result, ptq_best_tradeoff_result):
+                if res is None:
+                    continue
+                if any(
+                    r.get("display_name") == res["display_name"]
+                    for r in self.method_results
+                ):
+                    continue
+                self.method_results.append(res)
+                lat = res.get("latency") or {}
+                self._add_summary_row(
+                    res["display_name"],
+                    res["accuracy"],
+                    lat.get("latency_mean_ms", 0.0),
+                    lat.get("throughput_fps", 0.0),
+                    res["ebops"],
+                    res["model_size_mb"],
+                )
+                self.report_lines.append(
+                    f"[Phase 1c] {res['display_name']}: "
+                    f"acc={res['accuracy']:.2f}%, "
+                    f"size={res['model_size_mb']:.2f} MiB"
+                )
+
+        # Resolve the QAT/Adaround warmstart source from config and lock
+        # in ``self.best_config`` (consumed by phases 1d/1e). This makes
+        # the warmstart choice EXPLICIT and persisted.
+        warmstart_source = getattr(hp, "qat_warmstart_source", "ptq_best_acc")
+        warmstart_source = (warmstart_source or "ptq_best_acc").lower()
+        warmstart_pick: Optional[Dict[str, Any]] = None
+        if warmstart_source == "ptq_best_tradeoff" and ptq_best_tradeoff_result:
+            warmstart_pick = ptq_best_tradeoff_result
+        elif warmstart_source == "ptq_best_acc" and ptq_best_acc_result:
+            warmstart_pick = ptq_best_acc_result
+        elif ptq_best_acc_result is not None:
+            warmstart_pick = ptq_best_acc_result  # safe default
+
+        if warmstart_pick is not None:
+            self.best_config = dict(warmstart_pick.get("bitwidth_assignment") or {})
+            self.results["qat_warmstart_source"] = warmstart_source
+            self.results["qat_warmstart_id"] = warmstart_pick.get("display_name")
+            logger.info(
+                "  Phase 1c: QAT warmstart source = %s → %s",
+                warmstart_source, warmstart_pick.get("display_name"),
             )
 
         # Checkpoint
         self.ckpt.save_phase_json("phase_1c_nsga_search", {
             "pareto_front": self.pareto_front,
             "best_config": self.best_config,
+            "ptq_best_acc_result": ptq_best_acc_result,
+            "ptq_best_tradeoff_result": ptq_best_tradeoff_result,
+            "qat_warmstart_source": warmstart_source,
+            "qat_warmstart_id": (warmstart_pick or {}).get("display_name"),
         })
 
     # ==================================================================
@@ -663,14 +743,24 @@ class NeuroQuantPipeline:
             "qat_final_acc": self.qat_result["final_val_acc"],
             "qat_epochs": len(self.qat_result["val_accuracy"]),
         })
+        ws_src = self.results.get("qat_warmstart_source") or "ptq_best_acc"
+        ws_id = self.results.get("qat_warmstart_id") or "n/a"
+        self.tracker.log_params({
+            "qat_warmstart_source": str(ws_src),
+            "qat_warmstart_id": str(ws_id),
+        })
         self.tracker.end_run()
 
         self.report_lines.append(
-            f"[Phase 1e] QAT: final_acc={self.qat_result['final_val_acc']:.2f}%"
+            f"[Phase 1e] QAT: final_acc={self.qat_result['final_val_acc']:.2f}% "
+            f"(warmstart={ws_src}={ws_id})"
         )
         self.results["qat_acc"] = self.qat_result["final_val_acc"]
 
         # Checkpoint: save the fine-tuned QAT model and the metric history.
+        # The warmstart source (ptq_best_acc / ptq_best_tradeoff) and the
+        # PTQ ID it selected are persisted alongside so resuming or
+        # post-mortem analysis can answer "which PTQ was QAT trained on?".
         qat_meta = {
             "final_val_acc": self.qat_result.get("final_val_acc", 0.0),
             "best_epoch": self.qat_result.get("best_epoch", 0),
@@ -678,6 +768,8 @@ class NeuroQuantPipeline:
             "val_accuracy": self.qat_result.get("val_accuracy", []),
             "train_loss": self.qat_result.get("train_loss", []),
             "time_seconds": self.qat_result.get("time_seconds", 0.0),
+            "qat_warmstart_source": self.results.get("qat_warmstart_source"),
+            "qat_warmstart_id": self.results.get("qat_warmstart_id"),
         }
         qat_m = self.qat_result.get("model")
         if qat_m and isinstance(qat_m, nn.Module):
@@ -1004,12 +1096,27 @@ class NeuroQuantPipeline:
         # name and never NSGA internal ``nsga_*`` IDs.
         quant_models: Dict[str, nn.Module] = {}
 
-        # PTQ best (display_name set in phase 1c, e.g. PTQ_INT8)
-        ptq_res = self.results.get("ptq_best_result") or {}
-        ptq_model_obj = self.results.get("ptq_model")
-        if isinstance(ptq_model_obj, nn.Module):
-            ptq_label = ptq_res.get("display_name") or "PTQ_INT8"
-            quant_models[ptq_label] = ptq_model_obj
+        # PTQ best-accuracy (display_name set in phase 1c, e.g. PTQ_INT8)
+        ptq_acc_res = (
+            self.results.get("ptq_best_acc_result")
+            or self.results.get("ptq_best_result")
+            or {}
+        )
+        ptq_acc_model = (
+            self.results.get("ptq_best_acc_model")
+            or self.results.get("ptq_model")
+        )
+        if isinstance(ptq_acc_model, nn.Module):
+            ptq_label = ptq_acc_res.get("display_name") or "PTQ_INT8"
+            quant_models[ptq_label] = ptq_acc_model
+
+        # PTQ best-tradeoff — only if it differs from best-acc
+        ptq_to_res = self.results.get("ptq_best_tradeoff_result") or {}
+        ptq_to_model = self.results.get("ptq_best_tradeoff_model")
+        if isinstance(ptq_to_model, nn.Module):
+            to_label = ptq_to_res.get("display_name") or "PTQ_MIXED"
+            if to_label not in quant_models:
+                quant_models[to_label] = ptq_to_model
 
         # QAT fine-tuned (label includes the dominant bitwidth from
         # best_config so it's never just "QAT_warmstart").
@@ -1198,6 +1305,33 @@ class NeuroQuantPipeline:
         self.results["pareto_solutions"] = len(
             self.pareto_front.get("solutions", [])
         )
+        # Reranked PTQ picks + warmstart source so phases 1d/1e/2/3 see
+        # the same selections that the original run used.
+        ptq_acc = data.get("ptq_best_acc_result")
+        ptq_to = data.get("ptq_best_tradeoff_result")
+        if ptq_acc:
+            self.results["ptq_best_acc_result"] = ptq_acc
+            self.results["ptq_best_result"] = ptq_acc
+        if ptq_to:
+            self.results["ptq_best_tradeoff_result"] = ptq_to
+        if data.get("qat_warmstart_source"):
+            self.results["qat_warmstart_source"] = data["qat_warmstart_source"]
+        if data.get("qat_warmstart_id"):
+            self.results["qat_warmstart_id"] = data["qat_warmstart_id"]
+        # Re-add the PTQ rows to the public summary table on resume so
+        # the final report mirrors the original run.
+        for res in (ptq_acc, ptq_to):
+            if not res:
+                continue
+            lat = res.get("latency") or {}
+            self._add_summary_row(
+                res.get("display_name") or res.get("config_id", "PTQ"),
+                float(res.get("accuracy", 0.0)),
+                lat.get("latency_mean_ms", 0.0),
+                lat.get("throughput_fps", 0.0),
+                float(res.get("ebops", 0.0)),
+                float(res.get("model_size_mb", 0.0)),
+            )
 
     def _resume_phase_1d_adaround(self) -> None:
         # Build a fresh architecture and load the adaround weights into it so
@@ -1252,6 +1386,12 @@ class NeuroQuantPipeline:
             "time_seconds": float(metadata.get("time_seconds", 0.0)),
         }
         self.results["qat_acc"] = self.qat_result["final_val_acc"]
+        # Restore warmstart provenance so post-mortem reads from
+        # checkpoint match the original run.
+        if metadata.get("qat_warmstart_source"):
+            self.results["qat_warmstart_source"] = metadata["qat_warmstart_source"]
+        if metadata.get("qat_warmstart_id"):
+            self.results["qat_warmstart_id"] = metadata["qat_warmstart_id"]
 
     def _resume_phase_1f_gptq_smooth_awq(self) -> None:
         data = self.ckpt.load_phase_json("phase_1f_gptq_smooth_awq")
@@ -1389,6 +1529,152 @@ class NeuroQuantPipeline:
     # ==================================================================
 
     @staticmethod
+    def _select_rerank_candidates(
+        nsga_solutions: List[Dict[str, Any]],
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        """Pick up to ``top_k`` NSGA candidates for real-PTQ rerank.
+
+        Sort by ``accuracy_loss`` first (best proxy accuracy first), then
+        by ``model_size_mb`` (smallest first) as a tiebreaker. This gives
+        the rerank pool a mix of high-accuracy and high-compression
+        candidates so the downstream tradeoff pick has options to
+        choose from.
+        """
+        if not nsga_solutions or top_k < 1:
+            return []
+        seen_keys: set = set()
+        deduped: List[Dict[str, Any]] = []
+        for s in nsga_solutions:
+            ba = s.get("bitwidth_assignment") or {}
+            # Hashable key from the assignment so identical configs (e.g.
+            # the same gene reached from different parents) collapse.
+            key = tuple(sorted((str(k), int(v)) for k, v in ba.items()))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(s)
+        ranked = sorted(
+            deduped,
+            key=lambda s: (
+                float(s.get("accuracy_loss", float("inf"))),
+                float(s.get("model_size_mb", float("inf"))),
+            ),
+        )
+        return ranked[:max(1, int(top_k))]
+
+    def _materialize_and_rerank_ptq(
+        self,
+        candidates: List[Dict[str, Any]],
+        hp: Any,
+    ) -> tuple:
+        """Run real PTQ + bitwidth-aware calibration on each candidate
+        and return ``(best_acc_model, best_acc_res, best_tradeoff_model,
+        best_tradeoff_res)``.
+
+        ``best_acc_*`` is the candidate with the highest real Top-1.
+        ``best_tradeoff_*`` is the smallest-size candidate within
+        ``hp.ptq_tradeoff_max_acc_drop`` of the best Top-1 (knee-like
+        fallback if none satisfies the cap).
+        """
+        from quantization.ptq import PTQQuantizer
+        from utils.common import compute_quantized_size_mb
+
+        materialized: List[Dict[str, Any]] = []
+        models: List[nn.Module] = []
+        for cand in candidates:
+            assignment = dict(cand.get("bitwidth_assignment") or {})
+            if not assignment:
+                continue
+            ptq = PTQQuantizer(self.model, self.config)
+            # Bitwidth-aware calibration: each layer gets a threshold
+            # computed at its OWN target bitwidth (INT4 vs INT8).
+            ptq.calibrate_with_assignment(
+                self.calib_loader,
+                assignment,
+                num_batches=hp.calibration_batches,
+            )
+            q_model = ptq.quantize_with_config(assignment)
+            dom_bw = self._dominant_bitwidth(assignment)
+            res = ptq.evaluate(q_model, self.val_loader, bitwidth=dom_bw)
+
+            # Mixed assignments get an explicit "MIXED" tag so they can
+            # be distinguished from the uniform-INT8/INT4 picks in the
+            # public report and the XAI matrix.
+            tag = "MIXED" if self._is_mixed_bitwidth_assignment(assignment) \
+                else f"INT{dom_bw}"
+            display = f"PTQ_{tag}"
+            res["config_id"] = display
+            res["display_name"] = display
+            res["bitwidth"] = int(dom_bw)
+            res["bitwidth_assignment"] = assignment
+            res["model_size_mb"] = compute_quantized_size_mb(self.model, assignment)
+            materialized.append(res)
+            models.append(q_model)
+            logger.info(
+                "  PTQ rerank candidate %s: acc=%.2f%%, size=%.2f MiB",
+                display, float(res["accuracy"]), float(res["model_size_mb"]),
+            )
+
+        if not materialized:
+            return None, None, None, None
+
+        # Best by REAL Top-1.
+        best_acc_idx = max(
+            range(len(materialized)),
+            key=lambda i: float(materialized[i]["accuracy"]),
+        )
+
+        # Tradeoff: most compressed among those within the accuracy cap;
+        # fallback to smallest size overall when none satisfies the cap.
+        cap = float(getattr(hp, "ptq_tradeoff_max_acc_drop", 1.0))
+        ref_acc = float(materialized[best_acc_idx]["accuracy"])
+        within_cap = [
+            i for i, r in enumerate(materialized)
+            if (ref_acc - float(r["accuracy"])) <= cap
+        ]
+        if within_cap:
+            best_tradeoff_idx = min(
+                within_cap,
+                key=lambda i: float(materialized[i]["model_size_mb"]),
+            )
+        else:
+            best_tradeoff_idx = min(
+                range(len(materialized)),
+                key=lambda i: float(materialized[i]["model_size_mb"]),
+            )
+
+        # Disambiguate display names when best_acc and best_tradeoff
+        # land on the same config (the mixed/INT8 tag would collide).
+        if best_acc_idx == best_tradeoff_idx:
+            return (
+                models[best_acc_idx], materialized[best_acc_idx],
+                models[best_tradeoff_idx], materialized[best_tradeoff_idx],
+            )
+
+        # When tags collide but configs differ, append a discriminator.
+        if (
+            materialized[best_acc_idx]["display_name"]
+            == materialized[best_tradeoff_idx]["display_name"]
+        ):
+            tradeoff_dom = self._dominant_bitwidth(
+                materialized[best_tradeoff_idx]["bitwidth_assignment"]
+            )
+            tradeoff_tag = (
+                "MIXED" if self._is_mixed_bitwidth_assignment(
+                    materialized[best_tradeoff_idx]["bitwidth_assignment"]
+                ) else f"INT{tradeoff_dom}"
+            )
+            new_name = f"PTQ_{tradeoff_tag}_tradeoff"
+            materialized[best_tradeoff_idx]["display_name"] = new_name
+            materialized[best_tradeoff_idx]["config_id"] = new_name
+
+        return (
+            models[best_acc_idx], materialized[best_acc_idx],
+            models[best_tradeoff_idx], materialized[best_tradeoff_idx],
+        )
+
+    @staticmethod
     def _filter_non_dominated_solutions(
         solutions: List[ParetoSolution],
     ) -> List[ParetoSolution]:
@@ -1439,12 +1725,27 @@ class NeuroQuantPipeline:
             counts[int(bw)] = counts.get(int(bw), 0) + 1
         return max(counts.items(), key=lambda kv: kv[1])[0]
 
+    @staticmethod
+    def _is_mixed_bitwidth_assignment(bitwidth_assignment: Dict[str, int]) -> bool:
+        """True when both INT4 and INT8 are present in the assignment."""
+        if not bitwidth_assignment:
+            return False
+        bws = {int(bw) for bw in bitwidth_assignment.values() if int(bw) < 32}
+        return 4 in bws and 8 in bws
+
     def _add_summary_row(
         self, method: str, top1: float,
         latency_ms: float, throughput: float,
         ebops: float, size_mb: float,
     ) -> None:
-        """Add a row to the public summary table.
+        """Add or update a row in the public summary table.
+
+        Idempotent by ``method`` key: if a row with the same method
+        label already exists it is replaced in place rather than
+        appended. This keeps resume runs deterministic — when both
+        ``_resume_phase_1c_nsga_search`` and
+        ``_resume_phase_1f_gptq_smooth_awq`` reach the table with the
+        same PTQ entry, the row appears exactly once.
 
         Top-5 is intentionally NOT a column on the public report — only
         Top-1 is surfaced. Top-5 may still be computed internally but is
@@ -1452,11 +1753,16 @@ class NeuroQuantPipeline:
         """
         if not hasattr(self, '_summary_rows'):
             self._summary_rows = []
-        self._summary_rows.append({
+        row = {
             "method": method, "top1": top1,
             "latency_ms": latency_ms, "throughput": throughput,
             "ebops": ebops, "size_mb": size_mb,
-        })
+        }
+        for i, existing in enumerate(self._summary_rows):
+            if existing.get("method") == method:
+                self._summary_rows[i] = row
+                return
+        self._summary_rows.append(row)
 
     def _print_report(self, elapsed: float, phases_total: int) -> None:
         """Print the final pipeline report with metrics summary table."""

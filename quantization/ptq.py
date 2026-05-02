@@ -257,6 +257,10 @@ class PTQQuantizer(BaseQuantizer):
         # Remember the last bitwidth used during calibration so that
         # quantize() can reuse the cached thresholds consistently.
         self._calibrated_bitwidth: Optional[int] = None
+        # Per-layer bitwidth used during calibration when the
+        # bitwidth-assignment-aware path was taken. Empty when the
+        # legacy single-bitwidth ``calibrate()`` path was used.
+        self._per_layer_bitwidth: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -413,6 +417,111 @@ class PTQQuantizer(BaseQuantizer):
             "intermediate:%s}, bitwidth=%d",
             len(self._observers), strategy_io, strategy_intermediate,
             self._calibrated_bitwidth,
+        )
+
+    def calibrate_with_assignment(
+        self,
+        calibration_loader: DataLoader,
+        bitwidth_assignment: Dict[str, int],
+        num_batches: int = 20,
+    ) -> None:
+        """Run calibration where each layer's threshold is computed at its
+        own target bitwidth from ``bitwidth_assignment``.
+
+        This is the mixed-precision-aware variant of :meth:`calibrate`.
+        For an INT4/INT8 mixed assignment, INT4 layers get a threshold
+        chosen for ``2^3 - 1 = 7`` quantization levels and INT8 layers
+        get one chosen for ``2^7 - 1 = 127`` levels — both via the same
+        per-layer KL/MSE strategy. ``calibrate()`` would instead apply a
+        single global bitwidth to every layer's threshold search, which
+        is wrong on mixed configurations.
+
+        I/O layer enforcement still applies: the first and last
+        quantizable modules use ``config.io_layer_bitwidth`` regardless
+        of what's in ``bitwidth_assignment``.
+        """
+        self._observers.clear()
+        self._calibrated_bitwidth = None  # mixed/per-layer; see _per_layer_bitwidth
+        self._per_layer_bitwidth = {}
+
+        hp = self.config.hyperparams
+        io_names = set(self._io_layer_names)
+        io_bw = int(self.config.io_layer_bitwidth)
+        supported = list(self.config.supported_bitwidths) or [4, 8]
+        default_bw = max(supported)
+
+        strategy_io = getattr(
+            hp.calibration_strategy_io, "value", str(hp.calibration_strategy_io)
+        )
+        strategy_intermediate = getattr(
+            hp.calibration_strategy_intermediate,
+            "value", str(hp.calibration_strategy_intermediate),
+        )
+
+        # Resolve a per-module target bitwidth from the parameter-keyed
+        # assignment. We look up ``<module>.weight`` first, then fall back
+        # to any other key whose owner is this module.
+        def _resolve_bw(module_name: str) -> int:
+            if module_name in io_names:
+                return io_bw
+            weight_key = f"{module_name}.weight"
+            if weight_key in bitwidth_assignment:
+                return int(bitwidth_assignment[weight_key])
+            for pname, bw in bitwidth_assignment.items():
+                if pname.rsplit(".", 1)[0] == module_name and "weight" in pname:
+                    return int(bw)
+            return default_bw
+
+        for name, module in self.model.named_modules():
+            if not isinstance(module, _QUANTIZABLE_TYPES):
+                continue
+            bw_target = _resolve_bw(name)
+            if supported and bw_target != 32 and bw_target not in supported:
+                bw_target = max(supported)
+            self._per_layer_bitwidth[name] = bw_target
+            strategy = strategy_io if name in io_names else strategy_intermediate
+            self._apply_observer(module, strategy)
+            self._observers[name] = module._nq_observer  # type: ignore[attr-defined]
+
+        hooks = []
+        for name, module in self.model.named_modules():
+            obs = self._observers.get(name)
+            if obs is None:
+                continue
+
+            def make_hook(observer: _ActivationObserver):
+                def _hook(_mod, inputs, _output):
+                    if inputs:
+                        observer.observe(inputs[0])
+                return _hook
+
+            hooks.append(module.register_forward_hook(make_hook(obs)))
+
+        try:
+            self.model.eval()
+            self.model.to(self.device)
+            with torch.no_grad():
+                for i, batch in enumerate(calibration_loader):
+                    if i >= num_batches:
+                        break
+                    images = batch[0].to(self.device)
+                    self.model(images)
+        finally:
+            for h in hooks:
+                h.remove()
+
+        # Per-layer threshold search at each layer's target bitwidth.
+        bw_distribution: Dict[int, int] = {}
+        for name, obs in self._observers.items():
+            bw = self._per_layer_bitwidth[name]
+            obs.compute(bitwidth=bw)
+            bw_distribution[bw] = bw_distribution.get(bw, 0) + 1
+
+        logger.info(
+            "  PTQ mixed-precision calibration: %d observers, "
+            "strategies={io:%s, intermediate:%s}, bitwidths=%s",
+            len(self._observers), strategy_io, strategy_intermediate,
+            sorted(bw_distribution.items()),
         )
 
     def generate_cluster_configs(

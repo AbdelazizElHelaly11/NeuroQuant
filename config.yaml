@@ -75,6 +75,11 @@ hyperparams:
   qat_momentum: 0.9
   qat_weight_decay: 0.0001
   qat_early_stop_patience: 3
+  qat_warmstart_source: "ptq_best_acc"   # ptq_best_acc | ptq_best_tradeoff
+
+  # Multi-fidelity PTQ rerank (phase 1c)
+  ptq_real_rerank_topk: 3                # top-K NSGA candidates → real PTQ rerank
+  ptq_tradeoff_max_acc_drop: 1.0         # max Top-1 drop (pp) for tradeoff pick
 
   # GPTQ
   gptq_block_size: 128

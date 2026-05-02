@@ -89,6 +89,9 @@ hyperparams:
   latency_batch_size: 1
   hardware_report_path: ".\reports\hardware_metrics.json"
   use_latency_in_pareto: false           # set true to add latency objective
+  qat_warmstart_source: "ptq_best_acc"   # ptq_best_acc | ptq_best_tradeoff
+  ptq_real_rerank_topk: 3                # NSGA → real-PTQ rerank size
+  ptq_tradeoff_max_acc_drop: 1.0         # max Top-1 drop (pp) for tradeoff pick
 ```
 
 Hardware report parser accepts JSON or CSV and logs DSP/LUT/FF/Fmax/II/cycle latency when provided.
@@ -148,9 +151,31 @@ Run the launcher as in (A) and let the proxy handle TLS + auth.
 ### Final report contract
 
 - Public accuracy: **Top-1 only**. Top-5 is computed internally for diagnostics but never appears in the summary table, MLflow public keys, or plot annotations.
-- Method names use **canonical bitwidth-tagged IDs**: `PTQ_INT8`, `QAT_INT8`, `GPTQ_INT8`, `GPTQ_INT4`, `AWQ_INT4`, `AWQ_INT8`, `SmoothQuant_INT8`, `SmoothQuant_INT4`. There is no `AWQ_AWQ_INT4` or `PTQ_PTQ_best`-style duplication anywhere.
+- Method names use **canonical bitwidth-tagged IDs**: `PTQ_INT8`, `PTQ_MIXED`, `QAT_INT8`, `GPTQ_INT8`, `GPTQ_INT4`, `AWQ_INT4`, `AWQ_INT8`, `SmoothQuant_INT8`, `SmoothQuant_INT4`. There is no `AWQ_AWQ_INT4` or `PTQ_PTQ_best`-style duplication anywhere.
 - NSGA-II solutions (IDs prefixed `nsga_…`) are **search-internal only** — they are kept in `artifacts/checkpoints/phase_1c_nsga_search.json` for reproducibility but never appear on the public Pareto plot, ranking table, summary table, or XAI matrix.
 - Optimisation objectives surfaced to the user: **Top-1 accuracy ↑** and **Model size (MiB) ↓** (with EBops kept as the equivalent low-level byte count). Model size is computed from the actual bitwidth assignment using `1024 × 1024` (MiB).
+
+### PTQ family — multi-fidelity rerank + dual outputs
+
+NSGA-II searches with fast fake-quant; the proxy ranking is not the same as the real PTQ ranking. Phase 1c materialises the **top-K NSGA candidates** (default `K=3`, knob: `ptq_real_rerank_topk`) through `PTQQuantizer` with **bitwidth-aware calibration** — each layer gets a KL/MSE threshold computed at *its own* target bitwidth, so INT4 layers do not inherit an INT8 clipping range.
+
+Two PTQ models can be surfaced when the candidates differ:
+
+- **`ptq_best_acc`** — the candidate with the highest real Top-1.
+- **`ptq_best_tradeoff`** — the most compressed candidate within `ptq_tradeoff_max_acc_drop` (default `1.0` pp) of the best Top-1. If no candidate satisfies the cap, the smallest-size candidate is picked as a knee-like fallback.
+
+Both PTQ entries appear in the public Pareto/scatter/report when distinct (canonical IDs `PTQ_INT8`, `PTQ_INT4`, `PTQ_MIXED`); duplicates are collapsed automatically. The per-layer assignment of a mixed PTQ also flows into the `bitwidth_dist.png` plot so the colour split reflects the real assignment.
+
+### QAT warmstart policy (hybrid PTQ→QAT)
+
+The QAT/Adaround warmstart source is **explicit** and configurable via `qat_warmstart_source`:
+
+| Value                  | Behaviour                                              |
+|------------------------|--------------------------------------------------------|
+| `ptq_best_acc` (default) | QAT warmstarts from the highest-Top-1 PTQ pick.        |
+| `ptq_best_tradeoff`    | QAT warmstarts from the most-compressed PTQ within the accuracy cap. |
+
+The chosen source and the selected PTQ display name are logged at phase 1c, persisted in the phase-1c JSON checkpoint, attached to the phase-1e QAT model checkpoint metadata, and surfaced as MLflow params (`qat_warmstart_source`, `qat_warmstart_id`). Reading any of these tells you exactly which PTQ artefact was used to seed QAT.
 
 ### Pareto plot (`artifacts/pareto/pareto_scatter.png`)
 - White publication theme; per-method colour and marker (FP32 ◆ black, PTQ ● blue, QAT ■ orange, GPTQ ▲ green, AWQ ✚ purple, SmoothQuant ✕ red).
