@@ -2,8 +2,8 @@
 NeuroQuant v2.0 - Adaround: Learned Weight Rounding (Phase 1d)
 
 Instead of rounding each weight to the nearest quantization level,
-Adaround learns whether to round each weight UP or DOWN, minimising
-per-layer quantization MSE.
+Adaround learns whether to round each weight UP or DOWN to minimise
+the per-layer **output** reconstruction error on calibration data.
 
 Correct formulation (Nagel et al., ICLR 2021):
     For each weight w_i, compute floor(w_i/scale) = z_floor.
@@ -12,8 +12,18 @@ Correct formulation (Nagel et al., ICLR 2021):
     via a stretched sigmoid: h(V) = clamp(sigmoid(V) * 1.2 - 0.1, 0, 1).
     The soft quantized weight is:
         w_q = (z_floor + h(V)) * scale
-    MSE loss: ||w_q - w||^2
-    Regularizer: pushes h(V) to 0 or 1 (binary decision).
+
+    For a quantizable layer (Conv2d / Linear) with collected calibration
+    input X:
+        Loss_recon = || layer(X; w_q) - layer(X; w) ||²
+        Loss_round = h * (1 - h)            # push h toward {0, 1}
+        Loss = Loss_recon + λ · Loss_round
+
+    The reconstruction loss is what makes Adaround non-trivial: a
+    pure weight-MSE objective is uniquely minimised by ``h = frac``,
+    which collapses to round-to-nearest after hard rounding. Driving
+    the *layer output* error instead lets h trade weight-MSE against
+    activation-correlated rounding directions.
 
 Key insight: h(V) replaces the hard round() with a differentiable
 function, so gradients always flow correctly. No STE needed.
@@ -146,8 +156,11 @@ class AdaroundOptimizer:
 
         w_q_i = (floor(w_i/scale) + h(V_i)) * scale
 
-    At convergence, h(V) ≈ 0 (round down) or h(V) ≈ 1 (round up).
-    The loss MSE(w_q, w) + λR(h) is fully differentiable.
+    Trained against per-layer **output reconstruction**:
+        Loss_recon(layer) = || layer(X; w_q) - layer(X; w) ||²
+    where X is calibration input collected via forward hooks. A small
+    rounding regulariser pushes h toward {0, 1} so the final hard
+    rounding incurs no extra distortion.
     """
 
     def __init__(
@@ -155,16 +168,22 @@ class AdaroundOptimizer:
         model: nn.Module,
         bitwidth_config: Dict[str, int],
         config: QuantizationConfig,
+        calib_loader: Optional[DataLoader] = None,
     ) -> None:
         """
         Args:
             model: Model with FP32 weights (will be modified in-place).
             bitwidth_config: {param_name -> bitwidth (4 or 8)}.
             config: Framework configuration (uses adaround_* hyperparameters).
+            calib_loader: DataLoader used to collect per-layer activations
+                for the layer-output reconstruction objective. Required
+                for the strong objective; if ``None`` Adaround degrades
+                to the legacy weight-MSE objective with a clear warning.
         """
         self.model = model
         self.bitwidth_config = bitwidth_config
         self.config = config
+        self.calib_loader = calib_loader
         self.device = self._resolve_device(config.hyperparams.device)
 
         self.model.to(self.device)
@@ -182,10 +201,25 @@ class AdaroundOptimizer:
         # Original FP32 weights
         self._original_weights: Dict[str, torch.Tensor] = {}
 
-        # Target param names (only weight params)
-        self._target_params: List[str] = [
-            name for name in bitwidth_config if "weight" in name
+        # Target param names (only quantized weight params) and their
+        # owning module. Prioritise low-bit tensors (INT4) where learned
+        # rounding matters most; if none exist, fall back to all quantized
+        # weights (<32-bit).
+        quantized_weights = [
+            name for name in bitwidth_config
+            if "weight" in name and int(bitwidth_config[name]) < 32
         ]
+        low_bit_weights = [
+            name for name in quantized_weights
+            if int(bitwidth_config[name]) < 8
+        ]
+        self._target_params: List[str] = (
+            low_bit_weights if low_bit_weights else quantized_weights
+        )
+        self._owner_modules: Dict[str, nn.Module] = {}
+        # Cached calibration inputs per layer (filled by collect_activations).
+        self._layer_inputs: Dict[str, torch.Tensor] = {}
+        self._objective_components: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Step 1: Initialize
@@ -247,8 +281,119 @@ class AdaroundOptimizer:
         )
 
     # ------------------------------------------------------------------
+    # Step 1.5: Collect calibration activations per layer
+    # ------------------------------------------------------------------
+
+    def _resolve_owner_modules(self) -> None:
+        """Map each target weight parameter to its owning Conv2d/Linear.
+
+        The owner name is the parameter name with the trailing ``.weight``
+        stripped — generic across architectures because we only rely on
+        the standard PyTorch parameter naming convention.
+        """
+        name_to_module = dict(self.model.named_modules())
+        for pname in self._target_params:
+            owner_name = pname.rsplit(".", 1)[0]
+            module = name_to_module.get(owner_name)
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                self._owner_modules[pname] = module
+
+    def collect_activations(
+        self,
+        max_batches: Optional[int] = None,
+        max_samples_per_layer: int = 1024,
+    ) -> None:
+        """Collect a bounded pool of calibration inputs for each target layer.
+
+        Inputs are gathered via forward hooks on the owner module of each
+        target weight. The pool is capped per-layer so memory stays
+        constant regardless of dataset size.
+        """
+        if self.calib_loader is None:
+            return
+        if not self._owner_modules:
+            self._resolve_owner_modules()
+        if not self._owner_modules:
+            logger.warning(
+                "Adaround: no Conv2d/Linear owners found for the bitwidth "
+                "config; activation reconstruction will be skipped."
+            )
+            return
+
+        hp = self.config.hyperparams
+        n_batches = int(max_batches if max_batches is not None
+                        else hp.calibration_batches)
+
+        # Buffers keyed by parameter name (so multiple weights inside the
+        # same module are still keyed independently downstream).
+        buffers: Dict[str, List[torch.Tensor]] = {n: [] for n in self._owner_modules}
+        taken: Dict[str, int] = {n: 0 for n in self._owner_modules}
+
+        # Reverse index: module → list of param names that share this module.
+        module_to_params: Dict[int, List[str]] = {}
+        for pname, m in self._owner_modules.items():
+            module_to_params.setdefault(id(m), []).append(pname)
+
+        hooks = []
+        for pname, module in self._owner_modules.items():
+            param_names = module_to_params[id(module)]
+
+            def _hook_factory(names: List[str]):
+                def _hook(_mod, inputs, _output):
+                    if not inputs:
+                        return
+                    x = inputs[0].detach()
+                    for n in names:
+                        if taken[n] >= max_samples_per_layer:
+                            continue
+                        flat = x[: max_samples_per_layer - taken[n]]
+                        buffers[n].append(flat.cpu())
+                        taken[n] += flat.shape[0]
+                return _hook
+
+            hooks.append(module.register_forward_hook(_hook_factory(param_names)))
+
+        try:
+            self.model.eval()
+            self.model.to(self.device)
+            with torch.no_grad():
+                for i, batch in enumerate(self.calib_loader):
+                    if i >= n_batches:
+                        break
+                    images = batch[0].to(self.device)
+                    self.model(images)
+        finally:
+            for h in hooks:
+                h.remove()
+
+        for pname, chunks in buffers.items():
+            if chunks:
+                self._layer_inputs[pname] = torch.cat(chunks, dim=0)
+
+        logger.info(
+            "Adaround: collected calibration inputs for %d/%d target layers",
+            len(self._layer_inputs), len(self._target_params),
+        )
+
+    # ------------------------------------------------------------------
     # Step 2: Optimize
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _layer_forward(
+        module: nn.Module, x: torch.Tensor, weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run a single Conv2d/Linear forward with an externally-supplied
+        weight tensor (so gradients flow into V via w_q_soft = f(V))."""
+        if isinstance(module, nn.Conv2d):
+            return torch.nn.functional.conv2d(
+                x, weight, bias=module.bias,
+                stride=module.stride, padding=module.padding,
+                dilation=module.dilation, groups=module.groups,
+            )
+        if isinstance(module, nn.Linear):
+            return torch.nn.functional.linear(x, weight, module.bias)
+        raise TypeError(f"Unsupported module type for Adaround: {type(module)!r}")
 
     def optimize(
         self,
@@ -257,14 +402,17 @@ class AdaroundOptimizer:
         lambda_reg: Optional[float] = None,
     ) -> Dict[str, List[float]]:
         """
-        Train V parameters to minimise MSE + regularization.
+        Train V parameters to minimise per-layer output reconstruction
+        plus the rounding regulariser.
 
-        Loss = MSE(w_q_soft, w_original) + λ * R(h(V))
+        Loss(layer) = || layer(X; w_q) - layer(X; w) ||² + λ · R(h(V))
 
-        where w_q_soft = (z_floor + h(V)) * scale.
+        The reconstruction term is what makes Adaround non-trivial:
+        a pure weight-MSE term degenerates to round-to-nearest because
+        ``h = frac`` is the unique optimum.
 
         Returns:
-            Training history dict.
+            Training history dict with epoch-aggregated components.
         """
         epochs = num_epochs or self.config.hyperparams.adaround_epochs
         learning_rate = lr or self.config.hyperparams.adaround_lr
@@ -272,24 +420,44 @@ class AdaroundOptimizer:
 
         if not self._v_params:
             logger.warning("No V parameters initialized. Call initialize() first.")
-            return {"epoch_losses": [], "mse_losses": [], "reg_losses": []}
+            return {"epoch_losses": [], "recon_losses": [],
+                    "weight_mse_losses": [], "reg_losses": []}
 
-        optimizer = torch.optim.Adam(list(self._v_params.values()), lr=learning_rate)
+        # Make sure activations are available; if calib_loader was supplied
+        # but collect_activations() has not been called yet, do it now.
+        if self.calib_loader is not None and not self._layer_inputs:
+            self.collect_activations()
+
+        use_recon = bool(self._layer_inputs)
+        if not use_recon:
+            logger.warning(
+                "Adaround: no calibration activations available; falling "
+                "back to weight-MSE objective. Pass a calib_loader to "
+                "AdaroundOptimizer for the proper output-reconstruction "
+                "objective."
+            )
+
+        optimizer = torch.optim.Adam(
+            list(self._v_params.values()), lr=learning_rate,
+        )
 
         history: Dict[str, List[float]] = {
             "epoch_losses": [],
-            "mse_losses": [],
+            "recon_losses": [],
+            "weight_mse_losses": [],
             "reg_losses": [],
         }
 
         logger.info(
-            "Training V (%d epochs, lr=%.6f, lambda=%.4f) ...",
+            "Training V (%d epochs, lr=%.6f, lambda=%.4f, objective=%s) ...",
             epochs, learning_rate, lam,
+            "layer_output_reconstruction" if use_recon else "weight_mse",
         )
 
         for epoch in range(1, epochs + 1):
             epoch_loss = 0.0
-            epoch_mse = 0.0
+            epoch_recon = 0.0
+            epoch_w_mse = 0.0
             epoch_reg = 0.0
 
             optimizer.zero_grad()
@@ -308,23 +476,33 @@ class AdaroundOptimizer:
 
                 # Differentiable rounding: h(V) ∈ [0, 1]
                 h = _stretched_sigmoid(v)
-
-                # Soft quantized weight
                 z_soft = z_floor + h
                 z_clamped = torch.clamp(z_soft, qmin, qmax)
                 w_q_soft = z_clamped * scale
 
-                # MSE loss
-                loss_mse = (w_q_soft - original_w).pow(2).mean()
+                # Always track weight MSE for diagnostics — but only use
+                # it as the objective when no activations are available.
+                weight_mse = (w_q_soft - original_w).pow(2).mean()
 
-                # Regularizer: push h toward 0 or 1
+                if use_recon and name in self._layer_inputs:
+                    module = self._owner_modules[name]
+                    x = self._layer_inputs[name].to(self.device)
+                    with torch.no_grad():
+                        y_ref = self._layer_forward(module, x, original_w)
+                    y_q = self._layer_forward(module, x, w_q_soft)
+                    loss_recon = (y_q - y_ref).pow(2).mean()
+                    main_loss = loss_recon
+                else:
+                    loss_recon = weight_mse.detach()
+                    main_loss = weight_mse
+
                 loss_reg = _rounding_regularizer(h)
-
-                loss = loss_mse + lam * loss_reg
+                loss = main_loss + lam * loss_reg
 
                 epoch_loss += loss.item()
-                epoch_mse += loss_mse.item()
-                epoch_reg += loss_reg.item()
+                epoch_recon += float(loss_recon.item())
+                epoch_w_mse += float(weight_mse.item())
+                epoch_reg += float(loss_reg.item())
 
                 loss.backward()
 
@@ -332,17 +510,34 @@ class AdaroundOptimizer:
 
             n_params = max(len(self._target_params), 1)
             history["epoch_losses"].append(epoch_loss / n_params)
-            history["mse_losses"].append(epoch_mse / n_params)
+            history["recon_losses"].append(epoch_recon / n_params)
+            history["weight_mse_losses"].append(epoch_w_mse / n_params)
             history["reg_losses"].append(epoch_reg / n_params)
 
             if epoch % max(1, epochs // 10) == 0 or epoch == 1:
                 logger.info(
-                    "  Epoch %d/%d: loss=%.6f (mse=%.6f, reg=%.6f)",
+                    "  Epoch %d/%d: total=%.6f recon=%.6f w_mse=%.6f reg=%.6f",
                     epoch, epochs,
                     history["epoch_losses"][-1],
-                    history["mse_losses"][-1],
+                    history["recon_losses"][-1],
+                    history["weight_mse_losses"][-1],
                     history["reg_losses"][-1],
                 )
+
+        # Stash the final epoch components for the AdaroundResult report.
+        if history["epoch_losses"]:
+            self._objective_components = {
+                "final_total": history["epoch_losses"][-1],
+                "final_recon": history["recon_losses"][-1],
+                "final_weight_mse": history["weight_mse_losses"][-1],
+                "final_reg": history["reg_losses"][-1],
+                "objective": (
+                    "layer_output_reconstruction" if use_recon
+                    else "weight_mse_fallback"
+                ),
+                "epochs": int(epochs),
+                "lambda_reg": float(lam),
+            }
 
         logger.info(
             "  Training complete. Final loss: %.6f",
@@ -430,19 +625,40 @@ class AdaroundOptimizer:
 
         t_start = time.time()
 
-        # MSE before (baseline: round-to-nearest)
+        # Resolve owner modules first so we can compute the layer-output
+        # reconstruction baseline before optimisation modifies any weight.
+        self._resolve_owner_modules()
+
+        # Snapshot the FP32 weights NOW so the recon-before call below
+        # can read them. ``initialize()`` will populate the same dict
+        # again later — that's fine, the values are identical.
+        self._original_weights = self._get_original_weights_from_model()
+
+        # MSE before (baseline: round-to-nearest, weight-space)
         mse_before = _compute_mse(
-            self.model, self._get_original_weights_from_model(),
-            self.bitwidth_config,
+            self.model, self._original_weights, self.bitwidth_config,
         )
         logger.info("  MSE before Adaround (round-to-nearest): %.8f", mse_before)
+
+        # Collect activations once and reuse them for both training and
+        # the output-reconstruction sanity metrics.
+        self.collect_activations()
+
+        recon_before = self._compute_output_reconstruction(
+            use_round_to_nearest=True,
+        )
+        if recon_before is not None:
+            logger.info(
+                "  Layer-output recon error before (round-to-nearest): %.8f",
+                recon_before,
+            )
 
         # Step 1-3
         self.initialize()
         self.optimize()
         self.apply()
 
-        # MSE after (with learned rounding)
+        # MSE after (with learned rounding) — weight-space
         mse_after_weights: Dict[str, torch.Tensor] = {}
         for name, param in self.model.named_parameters():
             if name in self.bitwidth_config and "weight" in name:
@@ -461,17 +677,36 @@ class AdaroundOptimizer:
 
         logger.info("  MSE after Adaround (learned rounding): %.8f", mse_after)
 
+        # Output-reconstruction error after — using the *current* model
+        # weights (which apply() already wrote in place).
+        recon_after = self._compute_output_reconstruction(
+            use_round_to_nearest=False,
+        )
+        if recon_after is not None:
+            logger.info(
+                "  Layer-output recon error after (Adaround):           %.8f",
+                recon_after,
+            )
+
         mse_reduction = (
             (mse_before - mse_after) / mse_before * 100.0 if mse_before > 0 else 0.0
         )
+        recon_reduction = None
+        if recon_before and recon_after is not None and recon_before > 0:
+            recon_reduction = (recon_before - recon_after) / recon_before * 100.0
 
         alpha_stats = self.compute_alpha_stats()
         t_elapsed = time.time() - t_start
 
         logger.info("-" * 70)
         logger.info("Adaround Results:")
-        logger.info("  MSE reduction: %.1f%% (%.8f -> %.8f)",
+        logger.info("  Weight-MSE reduction: %.1f%% (%.8f -> %.8f)",
                      mse_reduction, mse_before, mse_after)
+        if recon_reduction is not None:
+            logger.info(
+                "  Output-recon reduction: %.1f%% (%.8f -> %.8f)",
+                recon_reduction, recon_before, recon_after,
+            )
         logger.info("  Time: %.1f seconds", t_elapsed)
         logger.info("  Rounding stats (sample):")
         for name, s in list(alpha_stats.items())[:3]:
@@ -483,7 +718,7 @@ class AdaroundOptimizer:
             )
         logger.info("=" * 70)
 
-        return AdaroundResult(
+        result = AdaroundResult(
             model=self.model,
             alpha_stats=alpha_stats,
             mse_before=mse_before,
@@ -491,6 +726,48 @@ class AdaroundOptimizer:
             mse_reduction=mse_reduction,
             time_seconds=t_elapsed,
         )
+        # Attach the activation-reconstruction diagnostics + objective
+        # components. AdaroundResult is a TypedDict — extra keys are
+        # allowed at runtime and surfaced in the phase-1d checkpoint.
+        result["objective_components"] = self._objective_components  # type: ignore[typeddict-item]
+        result["recon_before"] = recon_before  # type: ignore[typeddict-item]
+        result["recon_after"] = recon_after  # type: ignore[typeddict-item]
+        result["recon_reduction"] = recon_reduction  # type: ignore[typeddict-item]
+        return result
+
+    def _compute_output_reconstruction(
+        self, use_round_to_nearest: bool,
+    ) -> Optional[float]:
+        """Mean per-layer ``||layer(X; w_q) - layer(X; w)||²`` across targets.
+
+        Returns ``None`` if no calibration inputs were captured (which
+        happens when the caller did not supply a ``calib_loader``). When
+        ``use_round_to_nearest`` is True, ``w_q`` is the round-to-nearest
+        fake-quantized weight; otherwise the *current* (post-Adaround)
+        param tensor in the model is used.
+        """
+        if not self._layer_inputs or not self._owner_modules:
+            return None
+        total = 0.0
+        count = 0
+        with torch.no_grad():
+            for pname in self._target_params:
+                if pname not in self._layer_inputs:
+                    continue
+                module = self._owner_modules[pname]
+                x = self._layer_inputs[pname].to(self.device)
+                w_orig = self._original_weights[pname]
+                if use_round_to_nearest:
+                    bw = self.bitwidth_config[pname]
+                    w_q = _fake_quantize(w_orig, bw)
+                else:
+                    # Pull the current weight from the model (post-apply).
+                    w_q = dict(module.named_parameters())["weight"].data
+                y_ref = self._layer_forward(module, x, w_orig)
+                y_q = self._layer_forward(module, x, w_q)
+                total += float((y_q - y_ref).pow(2).mean().item())
+                count += 1
+        return total / max(count, 1) if count else None
 
     # ------------------------------------------------------------------
     # Helpers

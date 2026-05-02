@@ -138,13 +138,17 @@ class ParetoAnalysisResult(TypedDict):
     summary_report: str               # Markdown format
 
 
-class XAIResult(TypedDict):
+class XAIResult(TypedDict, total=False):
     """Output of Phase 3 XAI explainability analysis."""
     grad_cam_paths: Dict[str, List[str]]  # {model_id: [img_paths]}
     shap_paths: Dict[str, List[str]]      # {model_id: [html/png paths]}
     comparison_grid: str                  # Path to combined grid image
     consistency_scores: Dict[str, float]  # {model_id: Pearson correlation vs FP32}
     report: str                           # Markdown summary
+    # Per-(technique, sample) predictions surfaced by the comparison
+    # matrix and per-image captions. Each entry is a dict with
+    # pred_idx, pred_name, confidence, gt_idx, gt_name, correct.
+    predictions: Dict[str, List[Dict[str, Any]]]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -234,7 +238,7 @@ class HyperparameterSet:
     xai_plot_dpi: int = 150               # Plot resolution
 
     # Evaluation / Metrics
-    eval_primary_accuracy: str = "top5"   # 'top1' or 'top5' — display primary
+    eval_primary_accuracy: str = "top1"   # Public reporting stays top-1 only
     nsga_accuracy_objective: str = "top1" # 'top1' or 'top5' — NSGA-II objective
     latency_warmup_runs: int = 10         # Warmup passes before timing
     latency_measure_runs: int = 50        # Timed passes for statistics
@@ -262,7 +266,7 @@ class QuantizationConfig:
 
     # ── Output ──
     output_dir: str = "./artifacts"
-    mlflow_tracking_uri: str = "./mlruns"
+    mlflow_tracking_uri: str = "sqlite:///mlflow.db"
     experiment_name: str = "neuroquant_v2"
 
     # ── Methods to run ──
@@ -525,4 +529,3 @@ class QuantizationConfig:
             raise ValueError(
                 "Configuration validation failed:\n  " + "\n  ".join(errors)
             )
-

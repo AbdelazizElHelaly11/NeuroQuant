@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"C:\\\\Users\\\\hzezo\\\\miniconda3\\\\python.exe\" test_xai_outputs.py)",
+      "Bash(\"C:\\\\Users\\\\hzezo\\\\miniconda3\\\\python.exe\" test_ptq_wiring.py)",
+      "Bash(\"C:\\\\Users\\\\hzezo\\\\miniconda3\\\\python.exe\" test_metrics.py)",
+      "Bash(\"C:\\\\Users\\\\hzezo\\\\miniconda3\\\\python.exe\" test_genericity.py)"
+    ]
+  }
+}

@@ -9,12 +9,14 @@ Key components:
     2. SHAPExplainer: gradient-based feature importance (optional, graceful)
     3. XAIGenerator: orchestrates multi-model comparison + consistency scoring
 
-Enhancements over the spec:
-    - Auto-detection of target layer (finds last Conv2d before pooling)
-    - Graceful degradation: SHAP is optional; Grad-CAM always works
-    - Consistency scoring via Pearson correlation of flattened heatmaps
-    - Dark-themed comparison grid for publication quality
-    - Handles nn.Sequential models (no hardcoded layer names)
+Output enrichments (added in v2.0):
+    - Every per-image figure carries a caption with model name, predicted
+      class (name + confidence) and ground-truth class. ✓ / ✗ correctness
+      indicator if a label is supplied.
+    - The comparison_matrix.png is a fully-labelled grid: rows are models,
+      columns are sample images with their GT label, and each cell shows
+      the technique's prediction inline.
+    - Light publication theme via ``visualization.style``.
 """
 
 from __future__ import annotations
@@ -384,26 +386,30 @@ class XAIGenerator:
     Generates explainability visualisations for quantization analysis.
 
     Orchestrates Grad-CAM + SHAP across FP32 baseline and quantized
-    models, computing consistency scores and generating a comparison grid.
+    models, computing consistency scores and generating a comparison
+    matrix that surfaces each technique's prediction per sample image.
 
     Usage:
         gen = XAIGenerator(config)
         result = gen.run(
             fp32_model=model,
-            quantized_models={"INT8": model_int8, "INT4": model_int4},
-            test_images=images,    # [N, C, H, W]
-            test_labels=labels,    # [N]
+            quantized_models={"PTQ_best": ptq, "GPTQ": gptq},
+            test_images=images,            # [N, C, H, W]
+            test_labels=labels,            # [N]
+            class_names=["airplane", ...], # optional; falls back to indices
             output_dir="artifacts/xai",
         )
     """
 
-    # Dark theme colour palette
-    COLORS = {
-        "bg": "#1e1e2e",
-        "panel": "#2d2d3d",
-        "text": "#e0e0e0",
-        "grid": "#424242",
-    }
+    # Light publication theme — concrete colours kept here for non-axes
+    # decorations (correct/incorrect badges, header strips). Global
+    # rcParams come from visualization.style.apply_publication_style.
+    BADGE_OK = "#2e7d32"      # green (✓)
+    BADGE_BAD = "#c62828"     # red (✗)
+    HEADER_BG = "#eceff1"
+    HEADER_FG = "#1f3a93"
+    CAPTION_BG = "#ffffff"
+    CAPTION_EDGE = "#bdbdbd"
 
     def __init__(
         self,
@@ -425,6 +431,7 @@ class XAIGenerator:
         output_dir: str = "./artifacts/xai",
         target_layer_name: Optional[str] = None,
         background_data: Optional[torch.Tensor] = None,
+        class_names: Optional[List[str]] = None,
     ) -> XAIResult:
         """
         Run the full XAI pipeline.
@@ -460,9 +467,17 @@ class XAIGenerator:
         all_models = {"FP32_baseline": fp32_model}
         all_models.update(quantized_models)
 
+        # Resolve a class-name lookup. Falls back to "class N" when the
+        # caller hasn't supplied names (e.g. synthetic datasets).
+        class_lookup = self._build_class_name_lookup(
+            class_names, num_classes=int(self.config.num_classes),
+        )
+
         logger.info("  Models: %d (%s)", len(all_models),
                      ", ".join(all_models.keys()))
         logger.info("  Images: %d", num_images)
+        logger.info("  Class names: %s",
+                    "supplied" if class_names else "fallback to indices")
 
         # Auto-detect target layer from FP32 model
         if target_layer_name is None:
@@ -476,19 +491,20 @@ class XAIGenerator:
         if background_data is None:
             background_data = test_images[:min(50, len(test_images))]
 
-        # ── Generate Grad-CAM heatmaps ──
-        logger.info("  Generating Grad-CAM heatmaps ...")
+        # ── Generate Grad-CAM heatmaps + record predictions ──
+        logger.info("  Generating Grad-CAM heatmaps + predictions ...")
         all_heatmaps: Dict[str, List[np.ndarray]] = {}
         grad_cam_paths: Dict[str, List[str]] = {}
+        # predictions[model_id][i] = {pred_idx, pred_name, confidence,
+        #                              gt_idx, gt_name, correct}
+        predictions: Dict[str, List[Dict[str, Any]]] = {}
 
         for model_id, model in all_models.items():
             model.to(self.device)
             model.eval()
 
-            # Find target layer in this model
             target_module = find_layer_by_name(model, layer_name)
             if target_module is None:
-                # Try auto-detect for this model
                 try:
                     _, target_module = auto_detect_target_layer(model)
                 except ValueError:
@@ -498,25 +514,49 @@ class XAIGenerator:
             grad_cam = GradCAMExplainer(model, self.device)
             heatmaps: List[np.ndarray] = []
             paths: List[str] = []
+            preds: List[Dict[str, Any]] = []
 
             for i in range(num_images):
                 img = test_images[i:i+1]
-                heatmap = grad_cam.compute(img, target_module,
-                                            target_class=test_labels[i].item())
+                gt_idx = int(test_labels[i].item())
+
+                # Capture model prediction + confidence BEFORE the Grad-CAM
+                # backward pass so the recorded probabilities reflect the
+                # untouched forward output.
+                pred_idx, confidence = self._predict(model, img)
+                pred_meta = {
+                    "pred_idx": pred_idx,
+                    "pred_name": class_lookup(pred_idx),
+                    "confidence": confidence,
+                    "gt_idx": gt_idx,
+                    "gt_name": class_lookup(gt_idx),
+                    "correct": pred_idx == gt_idx,
+                }
+                preds.append(pred_meta)
+
+                heatmap = grad_cam.compute(
+                    img, target_module, target_class=gt_idx,
+                )
                 heatmaps.append(heatmap)
 
-                # Save individual heatmap
                 if HAS_MATPLOTLIB:
                     img_np = self._tensor_to_image(img)
                     overlay = overlay_heatmap(img_np, heatmap, alpha=alpha)
                     path = grad_cam_dir / f"{model_id}_img{i}.png"
-                    self._save_image(overlay, path, dpi=dpi,
-                                     title=f"{model_id} - Image {i}")
+                    self._save_image_with_prediction(
+                        overlay, path, dpi=dpi,
+                        model_id=model_id, image_idx=i, meta=pred_meta,
+                    )
                     paths.append(str(path))
 
             all_heatmaps[model_id] = heatmaps
             grad_cam_paths[model_id] = paths
-            logger.info("    %s: %d heatmaps generated", model_id, len(heatmaps))
+            predictions[model_id] = preds
+            logger.info(
+                "    %s: %d heatmaps · %d/%d correct",
+                model_id, len(heatmaps),
+                sum(1 for p in preds if p["correct"]), len(preds),
+            )
 
         # ── Generate SHAP attributions ──
         logger.info("  Generating SHAP/gradient attributions ...")
@@ -529,6 +569,7 @@ class XAIGenerator:
             shap_exp = SHAPExplainer(model, self.device)
             paths: List[str] = []
 
+            preds_for_model = predictions.get(model_id, [])
             for i in range(num_images):
                 img = test_images[i:i+1]
                 attr = shap_exp.compute(img, background_data,
@@ -536,8 +577,17 @@ class XAIGenerator:
 
                 if attr is not None and HAS_MATPLOTLIB:
                     path = shap_dir / f"{model_id}_img{i}_attr.png"
+                    if i < len(preds_for_model):
+                        p = preds_for_model[i]
+                        title = (
+                            f"{model_id} · sample #{i}\n"
+                            f"pred: {p['pred_name']} ({p['confidence']*100:.1f}%) "
+                            f"· GT: {p['gt_name']}"
+                        )
+                    else:
+                        title = f"{model_id} · sample #{i}"
                     self._save_attribution_plot(attr, path, dpi=dpi,
-                                                 title=f"{model_id} - Image {i}")
+                                                title=title)
                     paths.append(str(path))
 
             shap_paths[model_id] = paths
@@ -568,27 +618,39 @@ class XAIGenerator:
         grid_path = ""
         if HAS_MATPLOTLIB and all_heatmaps:
             grid_path = str(out_dir / "comparison_matrix.png")
-            self._generate_comparison_grid(
-                all_heatmaps, test_images, num_images, grid_path,
-                alpha=alpha, dpi=dpi,
+            self._generate_comparison_matrix(
+                all_heatmaps=all_heatmaps,
+                predictions=predictions,
+                test_images=test_images,
+                test_labels=test_labels,
+                class_lookup=class_lookup,
+                num_images=num_images,
+                output_path=grid_path,
+                alpha=alpha,
+                dpi=dpi,
             )
-            logger.info("  Comparison grid saved: comparison_matrix.png")
+            logger.info("  Comparison matrix saved: comparison_matrix.png")
 
         # ── Generate report ──
         report = self._generate_report(
             all_models, num_images, consistency_scores, grad_cam_paths,
-            shap_paths,
+            shap_paths, predictions,
         )
 
         logger.info("=" * 70)
 
-        return XAIResult(
-            grad_cam_paths=grad_cam_paths,
-            shap_paths=shap_paths,
-            comparison_grid=grid_path,
-            consistency_scores=consistency_scores,
-            report=report,
-        )
+        # XAIResult includes per-(technique, sample) predictions so
+        # callers (and the resume restorer) can surface model outputs
+        # without re-running inference.
+        result: XAIResult = {
+            "grad_cam_paths": grad_cam_paths,
+            "shap_paths": shap_paths,
+            "comparison_grid": grid_path,
+            "consistency_scores": consistency_scores,
+            "report": report,
+            "predictions": predictions,
+        }
+        return result
 
     # ------------------------------------------------------------------
     # Visualisation Helpers
@@ -614,21 +676,48 @@ class XAIGenerator:
             img = np.zeros_like(img)
         return np.clip(img, 0, 1)
 
-    def _save_image(
+    def _save_image_with_prediction(
         self,
         image: np.ndarray,
         path: Path,
-        dpi: int = 150,
-        title: str = "",
+        dpi: int,
+        model_id: str,
+        image_idx: int,
+        meta: Dict[str, Any],
     ) -> None:
-        """Save an RGB image as PNG."""
-        fig, ax = plt.subplots(figsize=(4, 4))
-        fig.patch.set_facecolor(self.COLORS["bg"])
+        """Save a Grad-CAM overlay with a fully-labelled caption underneath.
+
+        The caption shows the technique name, the predicted class and its
+        confidence, and the ground-truth label. A green ✓ / red ✗ badge
+        encodes correctness at a glance.
+        """
+        from visualization.style import apply_publication_style
+        apply_publication_style()
+
+        fig, ax = plt.subplots(figsize=(4.4, 4.7))
         ax.imshow(image)
-        ax.set_title(title, fontsize=9, color=self.COLORS["text"], pad=4)
-        ax.axis("off")
-        fig.savefig(path, dpi=dpi, bbox_inches="tight",
-                    facecolor=self.COLORS["bg"])
+        ax.set_xticks([]); ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        ok = bool(meta["correct"])
+        badge = "✓" if ok else "✗"
+        badge_color = self.BADGE_OK if ok else self.BADGE_BAD
+        title = (
+            f"{model_id}  ·  sample #{image_idx}\n"
+            f"pred: {meta['pred_name']}  ({meta['confidence'] * 100:.1f}%)  "
+            f"{badge}\n"
+            f"ground truth: {meta['gt_name']}"
+        )
+        ax.set_title(title, fontsize=10, pad=6, loc="center")
+        # Coloured strip below the image makes correctness scannable.
+        ax.text(
+            0.5, -0.06, badge,
+            transform=ax.transAxes, ha="center", va="top",
+            fontsize=20, color=badge_color, fontweight="bold",
+        )
+        fig.tight_layout()
+        fig.savefig(path, dpi=dpi)
         plt.close(fig)
 
     def _save_attribution_plot(
@@ -639,88 +728,179 @@ class XAIGenerator:
         title: str = "",
     ) -> None:
         """Save a SHAP/gradient attribution as a diverging heatmap."""
-        # attr shape: [C, H, W] -> mean across channels
+        from visualization.style import apply_publication_style
+        apply_publication_style()
+
         if attr.ndim == 3:
             attr_map = attr.mean(axis=0)  # [H, W]
         else:
             attr_map = attr
 
-        fig, ax = plt.subplots(figsize=(4, 4))
-        fig.patch.set_facecolor(self.COLORS["bg"])
+        fig, ax = plt.subplots(figsize=(4, 4.3))
         vmax = max(abs(attr_map.min()), abs(attr_map.max()), 1e-8)
-        ax.imshow(attr_map, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
-        ax.set_title(title, fontsize=9, color=self.COLORS["text"], pad=4)
-        ax.axis("off")
-        fig.savefig(path, dpi=dpi, bbox_inches="tight",
-                    facecolor=self.COLORS["bg"])
+        im = ax.imshow(attr_map, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+        ax.set_xticks([]); ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.set_title(title, fontsize=10, pad=6)
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.ax.tick_params(labelsize=8)
+        fig.tight_layout()
+        fig.savefig(path, dpi=dpi)
         plt.close(fig)
 
-    def _generate_comparison_grid(
+    def _generate_comparison_matrix(
         self,
         all_heatmaps: Dict[str, List[np.ndarray]],
+        predictions: Dict[str, List[Dict[str, Any]]],
         test_images: torch.Tensor,
+        test_labels: torch.Tensor,
+        class_lookup,
         num_images: int,
         output_path: str,
         alpha: float = 0.4,
         dpi: int = 150,
     ) -> None:
+        """Render the technique × sample comparison matrix.
+
+        Layout
+        ------
+        Row 0       : sample image previews labelled "img_i / GT: <class>"
+        Rows 1..M   : one row per technique (FP32, PTQ_best, …)
+        Each cell   : Grad-CAM overlay for that (technique, sample)
+                       with a caption "pred: <class> (conf%) ✓/✗"
+        Leftmost    : technique row labels rendered in a header strip on
+                      a tinted background so they are unambiguous.
         """
-        Generate NxM grid: rows=models, cols=images.
-        Each cell shows Grad-CAM overlay.
-        """
+        from visualization.style import apply_publication_style
+        apply_publication_style()
+
         model_ids = list(all_heatmaps.keys())
         n_models = len(model_ids)
         n_imgs = min(num_images, max(len(hm) for hm in all_heatmaps.values()))
-
         if n_models == 0 or n_imgs == 0:
             return
 
-        fig, axes = plt.subplots(
-            n_models, n_imgs,
-            figsize=(3 * n_imgs, 3 * n_models),
+        # Total grid: 1 header row (samples) + n_models rows
+        # Total cols: 1 header col (model names) + n_imgs cols
+        n_rows = n_models + 1
+        n_cols = n_imgs + 1
+
+        # Each cell ~3.0in wide, 3.4in tall (extra height for captions).
+        fig_w = 1.6 + 2.8 * n_imgs
+        fig_h = 1.4 + 3.0 * n_models
+        fig = plt.figure(figsize=(fig_w, fig_h))
+        gs = fig.add_gridspec(
+            n_rows, n_cols,
+            width_ratios=[0.9] + [1.0] * n_imgs,
+            height_ratios=[0.85] + [1.0] * n_models,
+            wspace=0.18, hspace=0.30,
         )
-        fig.patch.set_facecolor(self.COLORS["bg"])
 
-        # Handle single row/col
-        if n_models == 1:
-            axes = [axes]
-        if n_imgs == 1:
-            axes = [[ax] for ax in axes]
+        # ── (0, 0): empty corner ─────────────────────────────────────
+        corner = fig.add_subplot(gs[0, 0])
+        corner.axis("off")
+        corner.text(
+            0.5, 0.5,
+            "Technique  ↓\nSample  →",
+            transform=corner.transAxes, ha="center", va="center",
+            fontsize=10, fontweight="bold", color="#444444",
+        )
 
-        for row, model_id in enumerate(model_ids):
+        # ── Top header row: sample previews + GT ─────────────────────
+        for j in range(n_imgs):
+            ax = fig.add_subplot(gs[0, j + 1])
+            preview = self._tensor_to_image(test_images[j:j + 1])
+            ax.imshow(preview)
+            ax.set_xticks([]); ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            gt_idx = int(test_labels[j].item())
+            ax.set_title(
+                f"sample #{j}\nGT: {class_lookup(gt_idx)}",
+                fontsize=10, fontweight="bold", pad=4,
+                color=self.HEADER_FG,
+            )
+            # subtle background stripe to mark this as a header
+            ax.set_facecolor(self.HEADER_BG)
+
+        # ── Left column header strip: technique names ────────────────
+        for i, model_id in enumerate(model_ids):
+            ax = fig.add_subplot(gs[i + 1, 0])
+            ax.axis("off")
+            # tinted rectangle so the header is visually distinct
+            ax.add_patch(
+                plt.Rectangle(
+                    (0.02, 0.05), 0.96, 0.90,
+                    transform=ax.transAxes,
+                    facecolor=self.HEADER_BG, edgecolor="#cfd8dc",
+                    linewidth=0.8,
+                )
+            )
+            ax.text(
+                0.5, 0.55, model_id,
+                transform=ax.transAxes, ha="center", va="center",
+                fontsize=11, fontweight="bold",
+                color=self.HEADER_FG, wrap=True,
+            )
+            preds = predictions.get(model_id, [])
+            n_correct = sum(1 for p in preds if p.get("correct"))
+            ax.text(
+                0.5, 0.30,
+                f"{n_correct}/{len(preds)} correct",
+                transform=ax.transAxes, ha="center", va="center",
+                fontsize=9, color="#555555",
+            )
+
+        # ── Inner cells: heatmap + per-cell prediction ──────────────
+        for i, model_id in enumerate(model_ids):
             heatmaps = all_heatmaps[model_id]
-            for col in range(n_imgs):
-                ax = axes[row][col] if isinstance(axes[row], (list, np.ndarray)) else axes[row]
-
-                if col < len(heatmaps):
-                    img_np = self._tensor_to_image(test_images[col:col+1])
-                    overlay_img = overlay_heatmap(img_np, heatmaps[col], alpha=alpha)
-                    ax.imshow(overlay_img)
+            preds = predictions.get(model_id, [])
+            for j in range(n_imgs):
+                ax = fig.add_subplot(gs[i + 1, j + 1])
+                if j < len(heatmaps):
+                    img_np = self._tensor_to_image(test_images[j:j + 1])
+                    overlay = overlay_heatmap(img_np, heatmaps[j], alpha=alpha)
+                    ax.imshow(overlay)
                 else:
-                    ax.set_facecolor(self.COLORS["panel"])
+                    ax.set_facecolor("#f5f5f5")
+                ax.set_xticks([]); ax.set_yticks([])
+                for spine in ax.spines.values():
+                    spine.set_visible(False)
 
-                ax.axis("off")
-
-                # Row labels (model names)
-                if col == 0:
-                    ax.set_ylabel(model_id, fontsize=9, color=self.COLORS["text"],
-                                  rotation=0, labelpad=60, ha="right", va="center")
-
-                # Column labels (image indices)
-                if row == 0:
-                    ax.set_title(f"Image {col}", fontsize=9,
-                                 color=self.COLORS["text"], pad=8)
+                if j < len(preds):
+                    p = preds[j]
+                    ok = bool(p["correct"])
+                    badge = "✓" if ok else "✗"
+                    badge_color = self.BADGE_OK if ok else self.BADGE_BAD
+                    caption = (
+                        f"pred: {p['pred_name']}  "
+                        f"({p['confidence'] * 100:.1f}%)  {badge}"
+                    )
+                    ax.text(
+                        0.5, -0.08, caption,
+                        transform=ax.transAxes,
+                        ha="center", va="top",
+                        fontsize=9, color=badge_color,
+                        bbox=dict(
+                            boxstyle="round,pad=0.25",
+                            fc=self.CAPTION_BG,
+                            ec=self.CAPTION_EDGE,
+                            alpha=0.95,
+                        ),
+                    )
 
         fig.suptitle(
-            "Grad-CAM Comparison Across Quantization Strategies",
-            fontsize=13, fontweight="bold", color=self.COLORS["text"],
-            y=1.02,
+            "Grad-CAM comparison: technique × sample\n"
+            "rows = quantization technique · columns = sample image · "
+            "cell caption = prediction (confidence)",
+            fontsize=12, fontweight="bold", y=0.995,
         )
-
-        fig.tight_layout()
-        fig.savefig(output_path, dpi=dpi, bbox_inches="tight",
-                    facecolor=self.COLORS["bg"])
+        fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
         plt.close(fig)
+
+    # Keep the old name as an alias so external callers don't break.
+    _generate_comparison_grid = _generate_comparison_matrix
 
     # ------------------------------------------------------------------
     # Report
@@ -733,6 +913,7 @@ class XAIGenerator:
         consistency_scores: Dict[str, float],
         grad_cam_paths: Dict[str, List[str]],
         shap_paths: Dict[str, List[str]],
+        predictions: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ) -> str:
         """Generate markdown XAI analysis report."""
         lines = []
@@ -751,6 +932,41 @@ class XAIGenerator:
         lines.append(f"- Grad-CAM heatmaps: {total_gc}")
         lines.append(f"- SHAP/gradient attributions: {total_shap}")
         lines.append("")
+
+        if predictions:
+            lines.append("## Predictions per Sample")
+            lines.append("")
+            header = "| Technique | " + " | ".join(
+                f"sample #{i}" for i in range(num_images)
+            ) + " |"
+            sep = "|" + "---|" * (num_images + 1)
+            lines.append(header)
+            lines.append(sep)
+            for model_id, preds in predictions.items():
+                cells = []
+                for i in range(num_images):
+                    if i >= len(preds):
+                        cells.append("—")
+                        continue
+                    p = preds[i]
+                    badge = "✓" if p.get("correct") else "✗"
+                    cells.append(
+                        f"{p['pred_name']} ({p['confidence']*100:.0f}%) {badge}"
+                    )
+                lines.append(f"| {model_id} | " + " | ".join(cells) + " |")
+            lines.append("")
+
+            # Per-technique accuracy summary
+            lines.append("## Top-1 Accuracy on Explained Samples")
+            for model_id, preds in predictions.items():
+                if not preds:
+                    continue
+                correct = sum(1 for p in preds if p.get("correct"))
+                lines.append(
+                    f"- **{model_id}**: {correct}/{len(preds)} correct "
+                    f"({correct / max(len(preds), 1) * 100:.0f}%)"
+                )
+            lines.append("")
 
         if consistency_scores:
             lines.append("## Consistency Analysis (vs FP32 baseline)")
@@ -784,6 +1000,49 @@ class XAIGenerator:
                                   f"-- review for safety-critical use (r={score:.3f})")
 
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Prediction helpers
+    # ------------------------------------------------------------------
+
+    def _predict(
+        self, model: nn.Module, image: torch.Tensor,
+    ) -> Tuple[int, float]:
+        """Return ``(pred_idx, confidence)`` for a single image.
+
+        Confidence is the softmax probability of the predicted class.
+        Forward pass runs under ``torch.no_grad`` so the model state is
+        untouched before Grad-CAM's gradient pass.
+        """
+        model.eval()
+        img = image.to(self.device)
+        with torch.no_grad():
+            logits = model(img)
+            probs = F.softmax(logits, dim=1)
+            pred_idx = int(probs.argmax(dim=1).item())
+            confidence = float(probs[0, pred_idx].item())
+        return pred_idx, confidence
+
+    @staticmethod
+    def _build_class_name_lookup(
+        class_names: Optional[List[str]],
+        num_classes: int,
+    ):
+        """Return a callable ``idx -> name`` with safe fallback.
+
+        Falls back to ``"class N"`` whenever a name is missing or out of
+        range. Always returns a string so captions never break.
+        """
+        names = list(class_names) if class_names else []
+
+        def _lookup(idx: int) -> str:
+            if 0 <= idx < len(names):
+                return str(names[idx])
+            if 0 <= idx < num_classes:
+                return f"class {idx}"
+            return f"class ?{idx}"
+
+        return _lookup
 
     # ------------------------------------------------------------------
     # Utility

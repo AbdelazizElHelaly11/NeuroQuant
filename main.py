@@ -72,7 +72,10 @@ def build_data_loaders(config: QuantizationConfig):
     Build train/val/test/calibration DataLoaders from config.
 
     Returns:
-        (train_loader, val_loader, test_loader, calib_loader)
+        (train_loader, val_loader, test_loader, calib_loader, class_names)
+        ``class_names`` is the dataset's ``.classes`` list when available,
+        otherwise ``None``. Older callers that unpack 4 values continue
+        to work via slicing.
     """
     from data.data_loader import GenericDatasetLoader
 
@@ -84,6 +87,7 @@ def build_data_loaders(config: QuantizationConfig):
         loader.get_calibration_loader(
             num_batches=config.hyperparams.calibration_batches
         ),
+        loader.get_class_names(),
     )
 
 
@@ -170,6 +174,8 @@ class NeuroQuantPipeline:
         self.val_loader: Optional[DataLoader] = None
         self.test_loader: Optional[DataLoader] = None
         self.calib_loader: Optional[DataLoader] = None
+        # Dataset class names (optional, used by XAI captions).
+        self.class_names: Optional[List[str]] = None
 
         self.fp32_acc: float = 0.0
         self.fp32_ebops: float = 0.0
@@ -298,9 +304,9 @@ class NeuroQuantPipeline:
                      self.config.model_name,
                      f"{sum(p.numel() for p in self.model.parameters()):,}")
 
-        # Build data loaders
-        self.train_loader, self.val_loader, self.test_loader, self.calib_loader = \
-            build_data_loaders(self.config)
+        # Build data loaders + capture optional class names for XAI captions.
+        (self.train_loader, self.val_loader, self.test_loader,
+         self.calib_loader, self.class_names) = build_data_loaders(self.config)
 
         # Optional: Train baseline model
         if self.training_epochs > 0:
@@ -357,10 +363,13 @@ class NeuroQuantPipeline:
             "dataset": self.config.dataset_name,
             "num_params": sum(p.numel() for p in self.model.parameters()),
         })
+        # Public MLflow keys: Top-1 only. Top-5 is computed locally
+        # for internal diagnostics (kept in the phase-0 checkpoint
+        # JSON) but is NOT logged to MLflow as a public metric.
         self.tracker.log_metrics({
             "fp32_top1": self.fp32_acc,
-            "fp32_top5": self.fp32_top5,
             "fp32_ebops": self.fp32_ebops,
+            "fp32_size_mb": self.fp32_size_mb,
             "fp32_latency_mean_ms": self.fp32_latency["latency_mean_ms"],
             "fp32_latency_p50_ms": self.fp32_latency["latency_p50_ms"],
             "fp32_latency_p95_ms": self.fp32_latency["latency_p95_ms"],
@@ -368,9 +377,10 @@ class NeuroQuantPipeline:
         })
         self.tracker.end_run()
 
-        # Build summary row for final report table
+        # Build summary row for final report table — Top-1 only on the
+        # public surface (Top-5 stays in internal metrics if computed).
         self._add_summary_row(
-            "FP32", self.fp32_acc, self.fp32_top5,
+            "FP32", self.fp32_acc,
             self.fp32_latency["latency_mean_ms"],
             self.fp32_latency["throughput_fps"],
             self.fp32_ebops, self.fp32_size_mb,
@@ -378,12 +388,11 @@ class NeuroQuantPipeline:
 
         self.report_lines.append(
             f"[Phase 0] FP32 baseline: top1={self.fp32_acc:.2f}%, "
-            f"top5={self.fp32_top5:.2f}%, "
             f"latency={self.fp32_latency['latency_mean_ms']:.1f}ms, "
+            f"size={self.fp32_size_mb:.2f} MiB, "
             f"checkpoint={ckpt_path.name}"
         )
         self.results["fp32_acc"] = self.fp32_acc
-        self.results["fp32_top5"] = self.fp32_top5
 
         # Checkpoint
         self.ckpt.save_phase_full("phase_0_preparation", self.model, {
@@ -516,18 +525,28 @@ class NeuroQuantPipeline:
 
         methods_enabled = {m.value.lower() for m in self.config.methods}
         if self.best_config and ("ptq" in methods_enabled or not methods_enabled):
+            from utils.common import compute_quantized_size_mb
+
             ptq = PTQQuantizer(self.model, self.config)
             ptq.calibrate(
                 self.calib_loader,
                 num_batches=self.config.hyperparams.calibration_batches,
             )
             ptq_model = ptq.quantize_with_config(self.best_config)
+            dom_bw = self._dominant_bitwidth(self.best_config)
             ptq_res = ptq.evaluate(
-                ptq_model, self.val_loader,
-                bitwidth=self._dominant_bitwidth(self.best_config),
+                ptq_model, self.val_loader, bitwidth=dom_bw,
             )
-            ptq_res["config_id"] = "PTQ_best"
+            # Canonical, bitwidth-tagged name (no METHOD_METHOD duplication).
+            ptq_res["config_id"] = f"PTQ_INT{dom_bw}"
+            ptq_res["display_name"] = f"PTQ_INT{dom_bw}"
+            ptq_res["bitwidth"] = int(dom_bw)
             ptq_res["bitwidth_assignment"] = self.best_config
+            # Real model size in MiB from the actual bitwidth assignment
+            # rather than ebops/1e6 (which conflates units).
+            ptq_res["model_size_mb"] = compute_quantized_size_mb(
+                self.model, self.best_config,
+            )
 
             # Expose to downstream phases + report/summary.
             self.results["ptq_model"] = ptq_model
@@ -535,17 +554,17 @@ class NeuroQuantPipeline:
             self.method_results.append(ptq_res)
             lat = ptq_res.get("latency") or {}
             self._add_summary_row(
-                f"PTQ_{ptq_res['config_id']}",
+                ptq_res["display_name"],
                 ptq_res["accuracy"],
-                ptq_res.get("top5_accuracy", 0) or 0.0,
                 lat.get("latency_mean_ms", 0.0),
                 lat.get("throughput_fps", 0.0),
                 ptq_res["ebops"],
                 ptq_res["model_size_mb"],
             )
             self.report_lines.append(
-                f"[Phase 1c] PTQ best: acc={ptq_res['accuracy']:.2f}%, "
-                f"ebops={ptq_res['ebops']:.0f}"
+                f"[Phase 1c] {ptq_res['display_name']}: "
+                f"acc={ptq_res['accuracy']:.2f}%, "
+                f"size={ptq_res['model_size_mb']:.2f} MiB"
             )
 
         # Checkpoint
@@ -566,28 +585,57 @@ class NeuroQuantPipeline:
 
         adaround_model = copy.deepcopy(self.model)
         adaround_opt = AdaroundOptimizer(
-            adaround_model, self.best_config, self.config
+            adaround_model, self.best_config, self.config,
+            calib_loader=self.calib_loader,
         )
         self.adaround_result = adaround_opt.run()
 
-        self.tracker.log_metrics({
+        # Public MLflow metrics: weight MSE before/after + reduction,
+        # plus the *real* layer-output reconstruction reduction (when
+        # the calibration loader was supplied and recon_* were filled).
+        ml_metrics = {
             "adaround_mse_before": self.adaround_result["mse_before"],
             "adaround_mse_after": self.adaround_result["mse_after"],
             "adaround_mse_reduction": self.adaround_result["mse_reduction"],
-        })
+        }
+        if self.adaround_result.get("recon_before") is not None:
+            ml_metrics["adaround_recon_before"] = float(
+                self.adaround_result["recon_before"])
+        if self.adaround_result.get("recon_after") is not None:
+            ml_metrics["adaround_recon_after"] = float(
+                self.adaround_result["recon_after"])
+        if self.adaround_result.get("recon_reduction") is not None:
+            ml_metrics["adaround_recon_reduction"] = float(
+                self.adaround_result["recon_reduction"])
+        self.tracker.log_metrics(ml_metrics)
         self.tracker.end_run()
 
-        self.report_lines.append(
-            f"[Phase 1d] Adaround: MSE reduction={self.adaround_result['mse_reduction']:.1f}%"
-        )
+        recon_red = self.adaround_result.get("recon_reduction")
+        if recon_red is not None:
+            self.report_lines.append(
+                f"[Phase 1d] Adaround: weight-MSE redux="
+                f"{self.adaround_result['mse_reduction']:.1f}%, "
+                f"output-recon redux={recon_red:.1f}%"
+            )
+        else:
+            self.report_lines.append(
+                f"[Phase 1d] Adaround: weight-MSE redux="
+                f"{self.adaround_result['mse_reduction']:.1f}% "
+                f"(weight-only objective; no calib loader)"
+            )
 
-        # Checkpoint: save the adaround model (.pth with metadata envelope)
-        # and a companion JSON so resume can restore the full result dict
-        # even when only metadata fields are needed.
+        # Checkpoint metadata also captures the reconstruction diagnostics
+        # and objective components so they survive resume.
         adaround_meta = {
             "mse_before": self.adaround_result["mse_before"],
             "mse_after": self.adaround_result["mse_after"],
             "mse_reduction": self.adaround_result["mse_reduction"],
+            "recon_before": self.adaround_result.get("recon_before"),
+            "recon_after": self.adaround_result.get("recon_after"),
+            "recon_reduction": self.adaround_result.get("recon_reduction"),
+            "objective_components": self.adaround_result.get(
+                "objective_components", {},
+            ),
             "time_seconds": self.adaround_result.get("time_seconds", 0.0),
         }
         adaround_m = self.adaround_result.get("model")
@@ -671,7 +719,9 @@ class NeuroQuantPipeline:
         ]
 
         produced_models: Dict[str, nn.Module] = {}
+        produced_models_by_id: Dict[str, nn.Module] = {}
         new_results: List[Dict[str, Any]] = []
+        from utils.common import compute_quantized_size_mb
 
         for i, (key, label, bw, cls) in enumerate(plan, 1):
             if methods_enabled and key not in methods_enabled:
@@ -684,36 +734,45 @@ class NeuroQuantPipeline:
                     num_batches=hp.calibration_batches,
                 )
                 res = quantizer.evaluate(q_model, self.val_loader, bitwidth=bw)
+                # Canonical, bitwidth-tagged identity. ``display_name``
+                # is the public label used everywhere (summary table,
+                # Pareto plot, XAI rows). It deliberately does NOT
+                # double-prefix with the method family.
                 res["config_id"] = f"{label}_INT{bw}"
+                res["display_name"] = f"{label}_INT{bw}"
+                res["bitwidth"] = int(bw)
+                # Real model size from the bitwidth assignment; the
+                # quantizer may not have populated this consistently.
+                bw_assignment = res.get("bitwidth_assignment", {}) or {
+                    n: bw for n, _ in self.model.named_parameters()
+                    if "weight" in n
+                }
+                res["bitwidth_assignment"] = bw_assignment
+                res["model_size_mb"] = compute_quantized_size_mb(
+                    self.model, bw_assignment,
+                )
                 self.method_results.append(res)
                 new_results.append(res)
-                # Keep the first model per method family for phase 3 comparison.
                 produced_models.setdefault(key, q_model)
-                # Additionally expose a bitwidth-tagged slot so phase 3 can
-                # pick the preferred variant without re-quantization.
-                produced_models[f"{key}_int{bw}"] = q_model
+                produced_models_by_id[res["display_name"]] = q_model
                 logger.info("    %s INT%d: acc=%.2f%%", label, bw, res["accuracy"])
             except Exception as e:
                 logger.warning("    %s INT%d FAILED: %s", label, bw, e)
 
-        # Log all new results plus add their rows to the summary table.
+        # Log results to MLflow with bitwidth-tagged keys; Top-5 is NOT
+        # surfaced (kept internal only).
         for res in new_results:
-            method = res['method']
-            # config_id is set above as "METHOD_INT<bw>" — embed it as a tag
-            # for the MLflow metric keys so multiple bitwidths per method
-            # don't collide.
-            tag = res.get("config_id", method)
+            tag = res["display_name"]
             self.tracker.log_metrics({
                 f"{tag}_top1": res["accuracy"],
-                f"{tag}_top5": res.get("top5_accuracy", 0) or 0,
                 f"{tag}_ebops": res["ebops"],
+                f"{tag}_size_mb": res["model_size_mb"],
                 f"{tag}_latency_ms": res.get("latency_ms", 0) or 0,
             })
             lat = res.get("latency") or {}
             self._add_summary_row(
-                f"{method}_{res['config_id']}",
+                res["display_name"],
                 res["accuracy"],
-                res.get("top5_accuracy", 0) or 0.0,
                 lat.get("latency_mean_ms", 0) or 0.0,
                 lat.get("throughput_fps", 0) or 0.0,
                 res["ebops"],
@@ -733,7 +792,11 @@ class NeuroQuantPipeline:
             f"[Phase 1f] {_best('GPTQ')}, {_best('AWQ')}, {_best('SmoothQuant')}"
         )
 
-        # Store representative models for Phase 3.
+        # Store every bitwidth-tagged model for Phase 3 (XAI shows all
+        # of them as separate rows). Family-level keys remain as the
+        # default "first INT8 if present, else first INT4" so downstream
+        # consumers that only want one rep keep working.
+        self.results["phase_1f_models"] = dict(produced_models_by_id)
         if "gptq" in produced_models:
             self.results["gptq_model"] = produced_models["gptq"]
         if "awq" in produced_models:
@@ -769,38 +832,42 @@ class NeuroQuantPipeline:
         self.tracker.start_run("phase_2_pareto", {"phase": "2"})
 
         from visualization.pareto_analysis import ParetoAnalyzer
+        from utils.common import compute_quantized_size_mb
 
-        # Merge NSGA-II solutions + Phase 1f results + PTQ + QAT into
-        # a single solution pool. NSGA-II solutions already live in
-        # self.pareto_front["solutions"]; PTQ/1f results live in
-        # self.method_results (appended by phases 1c and 1f); QAT is
-        # synthesised here from self.qat_result if present.
-        all_solutions = list(self.pareto_front.get("solutions", []))
+        # Public Pareto pool is built ONLY from real, evaluated methods:
+        # PTQ_best (phase 1c), QAT (phase 1e), and the phase 1f
+        # variants. NSGA-II solutions remain available in
+        # self.pareto_front (and the phase 1c checkpoint) for
+        # reproducibility/debug, but they are deliberately excluded from
+        # the public final Pareto so users see only methods that were
+        # actually instantiated and evaluated end-to-end.
+        all_solutions: List[ParetoSolution] = []
 
-        # QAT entry — treated as a point solution for the merged Pareto.
+        # QAT entry — synthesise from the in-memory result.
         if self.qat_result:
             qat_acc = float(self.qat_result.get("final_val_acc", 0.0) or 0.0)
-            # Re-use NSGA best_config as QAT's effective bitwidth map and
-            # derive ebops from it; fall back to FP32 if not available.
             qat_bw = self.best_config or {}
             qat_ebops = self._ebops_from_bitwidth(qat_bw)
             qat_red = (
                 (self.fp32_ebops - qat_ebops) / max(self.fp32_ebops, 1) * 100
             )
-            # Prefer a real measured latency if the QAT result carries one;
-            # otherwise leave None so downstream aggregation ignores it.
             qat_lat = self.qat_result.get("latency_mean_ms")
             if qat_lat is None:
                 qat_lat_dict = self.qat_result.get("latency") or {}
                 qat_lat = qat_lat_dict.get("latency_mean_ms")
+            qat_dom_bw = self._dominant_bitwidth(qat_bw) if qat_bw else 8
+            qat_size_mb = (
+                compute_quantized_size_mb(self.model, qat_bw)
+                if qat_bw else 0.0
+            )
             all_solutions.append(ParetoSolution(
-                solution_id="QAT_warmstart",
+                solution_id=f"QAT_INT{qat_dom_bw}",
                 method="QAT",
                 accuracy=qat_acc,
                 accuracy_loss=self.fp32_acc - qat_acc,
                 ebops=qat_ebops,
                 ebops_reduction=qat_red,
-                model_size_mb=qat_ebops / 1e6,
+                model_size_mb=qat_size_mb,
                 latency_mean_ms=qat_lat,
                 bitwidth_assignment=qat_bw,
                 rank=1,
@@ -813,23 +880,24 @@ class NeuroQuantPipeline:
                 (self.fp32_ebops - res["ebops"])
                 / max(self.fp32_ebops, 1) * 100
             )
-            # Prefer the structured latency dict; fall back to the flat
-            # latency_ms field. Leave None if neither is populated so the
-            # downstream aggregation can safely skip missing values.
             res_lat = None
             lat_dict = res.get("latency") or {}
             if "latency_mean_ms" in lat_dict:
                 res_lat = lat_dict.get("latency_mean_ms")
             elif res.get("latency_ms") is not None:
                 res_lat = res.get("latency_ms")
+            display = res.get("display_name") or res.get("config_id", res["method"])
             sol = ParetoSolution(
-                solution_id=f"{res['method']}_{res['config_id']}",
+                solution_id=display,
                 method=res["method"],
                 accuracy=res["accuracy"],
                 accuracy_loss=self.fp32_acc - res["accuracy"],
                 ebops=res["ebops"],
                 ebops_reduction=ebops_red,
-                model_size_mb=res["ebops"] / 1e6,
+                model_size_mb=res.get("model_size_mb")
+                    or compute_quantized_size_mb(
+                        self.model, res.get("bitwidth_assignment", {}),
+                    ),
                 latency_mean_ms=res_lat,
                 bitwidth_assignment=res.get("bitwidth_assignment", {}),
                 rank=1,
@@ -838,12 +906,24 @@ class NeuroQuantPipeline:
             )
             all_solutions.append(sol)
 
-        # Build merged ParetoFront
+        # Hard guard: drop any leaked NSGA-internal entries
+        # (e.g. ``nsga_gen12_r1``) before they reach plots/tables.
+        public_candidates = [
+            s for s in all_solutions
+            if not str(s.get("solution_id", "")).startswith("nsga_")
+        ]
+        all_solutions = self._filter_non_dominated_solutions(public_candidates)
+        if len(all_solutions) < len(public_candidates):
+            logger.info(
+                "  Public Pareto filter: kept %d non-dominated of %d candidates",
+                len(all_solutions), len(public_candidates),
+            )
+
         merged_front = ParetoFront(
             solutions=all_solutions,
             generation=self.pareto_front.get("generation", 0),
             evaluations=self.pareto_front.get("evaluations", 0),
-            convergence_reason="merged",
+            convergence_reason="public_methods_only",
         )
 
         pareto_dir = self.output_dir / "pareto"
@@ -858,6 +938,7 @@ class NeuroQuantPipeline:
         hv = self.pareto_analysis["metrics"].get("hypervolume", 0)
         metrics_to_log = {
             "total_solutions": len(all_solutions),
+            "public_candidates": len(public_candidates),
             "hypervolume": hv,
         }
         # Optional third Pareto axis: mean latency across solutions. Kept
@@ -879,7 +960,8 @@ class NeuroQuantPipeline:
         self.tracker.end_run()
 
         self.report_lines.append(
-            f"[Phase 2] Pareto: {len(all_solutions)} total solutions, "
+            f"[Phase 2] Pareto: {len(all_solutions)} non-dominated / "
+            f"{len(public_candidates)} candidates, "
             f"HV={hv:.2f}"
         )
         self.results["hypervolume"] = hv
@@ -889,6 +971,7 @@ class NeuroQuantPipeline:
             "pareto_analysis": self.pareto_analysis,
             "hypervolume": hv,
             "total_solutions": len(all_solutions),
+            "public_candidates": len(public_candidates),
         })
 
     # ==================================================================
@@ -915,20 +998,41 @@ class NeuroQuantPipeline:
         xai_dir = self.output_dir / "xai"
         xai_gen = XAIGenerator(self.config, device=self.device)
 
-        # Build quantized models dict: include PTQ best, QAT fine-tuned,
-        # and each phase‑1f family representative that was produced.
+        # Build the public technique × sample matrix. Each row uses a
+        # canonical, bitwidth-tagged label (e.g. ``GPTQ_INT8``,
+        # ``AWQ_INT4``, ``SmoothQuant_INT8``) — never the raw family
+        # name and never NSGA internal ``nsga_*`` IDs.
         quant_models: Dict[str, nn.Module] = {}
-        if "ptq_model" in self.results:
-            quant_models["PTQ_best"] = self.results["ptq_model"]
+
+        # PTQ best (display_name set in phase 1c, e.g. PTQ_INT8)
+        ptq_res = self.results.get("ptq_best_result") or {}
+        ptq_model_obj = self.results.get("ptq_model")
+        if isinstance(ptq_model_obj, nn.Module):
+            ptq_label = ptq_res.get("display_name") or "PTQ_INT8"
+            quant_models[ptq_label] = ptq_model_obj
+
+        # QAT fine-tuned (label includes the dominant bitwidth from
+        # best_config so it's never just "QAT_warmstart").
         qat_m = self.qat_result.get("model") if self.qat_result else None
         if isinstance(qat_m, nn.Module):
-            quant_models["QAT_warmstart"] = qat_m
-        if "gptq_model" in self.results:
-            quant_models["GPTQ"] = self.results["gptq_model"]
-        if "awq_model" in self.results:
-            quant_models["AWQ"] = self.results["awq_model"]
-        if "sq_model" in self.results:
-            quant_models["SmoothQuant"] = self.results["sq_model"]
+            qat_dom = self._dominant_bitwidth(self.best_config or {}) \
+                if self.best_config else 8
+            quant_models[f"QAT_INT{qat_dom}"] = qat_m
+
+        # Every bitwidth-tagged model produced in phase 1f. Falls back
+        # to the legacy family-level slots when the new map is missing
+        # (e.g. on a pre-upgrade resume).
+        phase1f_models = self.results.get("phase_1f_models") or {}
+        for label, m in phase1f_models.items():
+            if isinstance(m, nn.Module):
+                quant_models[label] = m
+        if not phase1f_models:
+            if "gptq_model" in self.results:
+                quant_models["GPTQ_INT8"] = self.results["gptq_model"]
+            if "awq_model" in self.results:
+                quant_models["AWQ_INT4"] = self.results["awq_model"]
+            if "sq_model" in self.results:
+                quant_models["SmoothQuant_INT8"] = self.results["sq_model"]
 
         xai_result = xai_gen.run(
             fp32_model=self.model,
@@ -936,6 +1040,7 @@ class NeuroQuantPipeline:
             test_images=test_images,
             test_labels=test_labels,
             output_dir=str(xai_dir),
+            class_names=self.class_names,
         )
 
         n_heatmaps = sum(
@@ -958,6 +1063,7 @@ class NeuroQuantPipeline:
             "shap_paths": xai_result.get("shap_paths", {}),
             "comparison_grid": xai_result.get("comparison_grid", ""),
             "consistency_scores": xai_result.get("consistency_scores", {}),
+            "predictions": xai_result.get("predictions", {}),
             "n_heatmaps": n_heatmaps,
             "xai_dir": str(xai_dir),
         })
@@ -1043,9 +1149,11 @@ class NeuroQuantPipeline:
         self.ckpt.load_phase_model("phase_0_preparation", self.model)
         self.model.to(self.device)
 
-        # Data loaders are not serialised; rebuild from config.
+        # Data loaders are not serialised; rebuild from config and grab
+        # the dataset class-name list for downstream XAI captions.
         (self.train_loader, self.val_loader,
-         self.test_loader, self.calib_loader) = build_data_loaders(self.config)
+         self.test_loader, self.calib_loader,
+         self.class_names) = build_data_loaders(self.config)
 
         data = self.ckpt.load_phase_json("phase_0_preparation")
         self.fp32_acc = float(data.get("fp32_acc", 0.0))
@@ -1058,8 +1166,9 @@ class NeuroQuantPipeline:
         self.results["fp32_top5"] = self.fp32_top5
 
         # Recreate the FP32 row in the summary table for the final report.
+        # Top-1 only on the public surface.
         self._add_summary_row(
-            "FP32", self.fp32_acc, self.fp32_top5,
+            "FP32", self.fp32_acc,
             self.fp32_latency.get("latency_mean_ms", 0.0),
             self.fp32_latency.get("throughput_fps", 0.0),
             self.fp32_ebops, self.fp32_size_mb,
@@ -1183,12 +1292,17 @@ class NeuroQuantPipeline:
                 self.results["sq_model"] = sq_model
 
         # Rebuild the summary-table rows produced on the original run.
+        # Use the canonical display_name (no METHOD_METHOD duplication)
+        # and Top-1 only.
         for res in self.method_results:
             lat = res.get("latency") or {}
+            display = (
+                res.get("display_name")
+                or res.get("config_id", res.get("method", "?"))
+            )
             self._add_summary_row(
-                f"{res.get('method', '?')}_{res.get('config_id', '?')}",
+                display,
                 res.get("accuracy", 0.0),
-                res.get("top5_accuracy", 0) or 0.0,
                 lat.get("latency_mean_ms", 0.0),
                 lat.get("throughput_fps", 0.0),
                 res.get("ebops", 0.0),
@@ -1274,6 +1388,33 @@ class NeuroQuantPipeline:
     # Report & Utilities
     # ==================================================================
 
+    @staticmethod
+    def _filter_non_dominated_solutions(
+        solutions: List[ParetoSolution],
+    ) -> List[ParetoSolution]:
+        """Return only non-dominated solutions (minimize loss + ebops)."""
+        if not solutions:
+            return []
+
+        kept: List[ParetoSolution] = []
+        for i, sol_i in enumerate(solutions):
+            dominated = False
+            li = float(sol_i.get("accuracy_loss", float("inf")))
+            ei = float(sol_i.get("ebops", float("inf")))
+            for j, sol_j in enumerate(solutions):
+                if i == j:
+                    continue
+                lj = float(sol_j.get("accuracy_loss", float("inf")))
+                ej = float(sol_j.get("ebops", float("inf")))
+                if (lj <= li and ej <= ei) and (lj < li or ej < ei):
+                    dominated = True
+                    break
+            if not dominated:
+                kept.append(sol_i)
+
+        # Stable user-facing order: best accuracy first.
+        return sorted(kept, key=lambda s: float(s.get("accuracy_loss", 0.0)))
+
     def _ebops_from_bitwidth(self, bitwidth_assignment: Dict[str, int]) -> float:
         """Compute EBops ≈ sum(numel * bitwidth) / 8 from an assignment.
 
@@ -1299,15 +1440,20 @@ class NeuroQuantPipeline:
         return max(counts.items(), key=lambda kv: kv[1])[0]
 
     def _add_summary_row(
-        self, method: str, top1: float, top5: float,
+        self, method: str, top1: float,
         latency_ms: float, throughput: float,
         ebops: float, size_mb: float,
     ) -> None:
-        """Add a row to the summary table for the final report."""
+        """Add a row to the public summary table.
+
+        Top-5 is intentionally NOT a column on the public report — only
+        Top-1 is surfaced. Top-5 may still be computed internally but is
+        excluded from the user-facing result contract.
+        """
         if not hasattr(self, '_summary_rows'):
             self._summary_rows = []
         self._summary_rows.append({
-            "method": method, "top1": top1, "top5": top5,
+            "method": method, "top1": top1,
             "latency_ms": latency_ms, "throughput": throughput,
             "ebops": ebops, "size_mb": size_mb,
         })
@@ -1323,25 +1469,27 @@ class NeuroQuantPipeline:
         print(f"  Device:         {self.device}")
         print(f"  Total Runtime:  {elapsed:.1f}s ({elapsed / 60:.1f} min)")
         print(f"  Phases Passed:  {self.phases_passed}/{phases_total}")
-        primary = getattr(
-            self.config.hyperparams, "eval_primary_accuracy", "top1"
-        )
-        print(f"  Primary Acc:    {primary}")
+        # Public contract: top-1 is the only surfaced accuracy metric.
+        print("  Primary Acc:    top1")
         print()
         for line in self.report_lines:
             marker = "[OK]" if not line.startswith("[ERROR]") else "[FAIL]"
             print(f"  {marker} {line}")
 
-        # Summary table
+        # Public summary table — Top-1 only, Size(MiB) is a first-class
+        # column so the accuracy/size/EBops trade-off is visible.
         rows = getattr(self, '_summary_rows', [])
         if rows:
             print()
-            hdr = f"  {'Method':<22} {'Top-1':>7} {'Top-5':>7} {'Lat(ms)':>9} {'FPS':>9} {'EBops':>12} {'Size(MB)':>10}"
+            hdr = (
+                f"  {'Method':<22} {'Top-1':>7} {'Lat(ms)':>9} "
+                f"{'FPS':>9} {'EBops':>12} {'Size(MiB)':>10}"
+            )
             print(hdr)
             print("  " + "-" * (len(hdr) - 2))
             for r in rows:
                 print(
-                    f"  {r['method']:<22} {r['top1']:>6.2f}% {r['top5']:>6.2f}% "
+                    f"  {r['method']:<22} {r['top1']:>6.2f}% "
                     f"{r['latency_ms']:>8.2f} {r['throughput']:>8.1f} "
                     f"{r['ebops']:>12.0f} {r['size_mb']:>9.2f}"
                 )

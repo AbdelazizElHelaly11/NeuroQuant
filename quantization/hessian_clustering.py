@@ -478,7 +478,10 @@ class LayerClusterer:
     def _build_cluster_assignments(self) -> List[ClusterAssignment]:
         """
         Build structured ClusterAssignment objects from the raw cluster dicts.
-        Groups layers within each tier and computes mean sensitivity.
+
+        Within each tier (HIGH/MEDIUM/LOW), split by layer type so NSGA-II
+        can search a richer and more architecture-sensitive space than a
+        single global MEDIUM and LOW cluster.
         """
         assignments: List[ClusterAssignment] = []
         cluster_id = 0
@@ -488,34 +491,43 @@ class LayerClusterer:
             if not layer_names:
                 continue
 
-            # Determine allowed bitwidths per tier
-            if tier_name == "HIGH":
-                allowed = [8]  # Force INT8 — too sensitive
-            elif tier_name == "MEDIUM":
-                allowed = [4, 8]  # NSGA-II searches
-            else:  # LOW
-                allowed = [4, 8]  # NSGA-II searches (INT4 preferred)
+            # Split tier bucket by layer type (Conv2d/Linear/BatchNorm/Bias/Other).
+            by_type: Dict[str, List[str]] = {}
+            for name in layer_names:
+                entry = self.hessian_results.get(name, {})
+                layer_type = str(entry.get("layer_type", "Other"))
+                by_type.setdefault(layer_type, []).append(name)
 
-            # Compute mean sensitivity for this cluster
-            sensitivities = [
-                self.hessian_results[name]["hessian_diag"]
-                for name in layer_names
-                if name in self.hessian_results
-            ]
-            mean_sens = (
-                sum(sensitivities) / len(sensitivities) if sensitivities else 0.0
-            )
+            for _layer_type, names_in_type in sorted(by_type.items()):
+                if not names_in_type:
+                    continue
 
-            assignments.append(
-                ClusterAssignment(
-                    cluster_id=cluster_id,
-                    tier=tier_name,
-                    layer_names=layer_names,
-                    allowed_bitwidths=allowed,
-                    mean_sensitivity=mean_sens,
+                # Determine allowed bitwidths per tier
+                if tier_name == "HIGH":
+                    allowed = [8]  # Force INT8 — too sensitive
+                else:
+                    allowed = [4, 8]  # Searchable cluster
+
+                # Compute mean sensitivity for this cluster
+                sensitivities = [
+                    self.hessian_results[name]["hessian_diag"]
+                    for name in names_in_type
+                    if name in self.hessian_results
+                ]
+                mean_sens = (
+                    sum(sensitivities) / len(sensitivities) if sensitivities else 0.0
                 )
-            )
-            cluster_id += 1
+
+                assignments.append(
+                    ClusterAssignment(
+                        cluster_id=cluster_id,
+                        tier=tier_name,
+                        layer_names=names_in_type,
+                        allowed_bitwidths=allowed,
+                        mean_sensitivity=mean_sens,
+                    )
+                )
+                cluster_id += 1
 
         return assignments
 

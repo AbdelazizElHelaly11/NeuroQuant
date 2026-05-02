@@ -47,6 +47,14 @@ class MLflowTracker:
         if self._active:
             tracking_uri = getattr(config, "mlflow_tracking_uri", "./mlruns")
             experiment_name = getattr(config, "experiment_name", "neuroquant_v2")
+            if tracking_uri in {"./mlruns", "mlruns"}:
+                # MLflow's legacy file backend emits a deprecation warning.
+                # Auto-upgrade the old default to a local SQLite backend.
+                tracking_uri = "sqlite:///mlflow.db"
+                logger.info(
+                    "MLflow tracking URI upgraded to %s (file backend deprecated).",
+                    tracking_uri,
+                )
             mlflow.set_tracking_uri(tracking_uri)
             mlflow.set_experiment(experiment_name)
             logger.info("MLflow tracking: uri=%s, experiment=%s",

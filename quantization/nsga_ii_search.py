@@ -14,12 +14,13 @@ Key design decisions:
 
 Objectives (both minimised):
     1. Accuracy loss = FP32_accuracy - quantized_accuracy
-    2. EBops = sum(params x bitwidth) / 8
+    2. Model size (MiB) = sum(params x bitwidth) / 8 / (1024²)
 """
 
 from __future__ import annotations
 
 import copy
+import itertools
 import logging
 import random
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,6 +36,7 @@ from config import (
     ParetoSolution,
     QuantizationConfig,
 )
+from utils.common import model_size_mb_from_bytes
 
 logger = logging.getLogger("neuroquant")
 
@@ -143,8 +145,10 @@ class NSGAIIClusterSearch:
             for pname in ca["layer_names"]:
                 self._fixed_config[pname] = 8
 
-        # Precompute FP32 EBops for reduction calculation
+        # Precompute FP32 EBops (bytes) for reduction calculation, and
+        # the equivalent public objective in MiB.
         self._fp32_ebops = self._compute_ebops_for_config({})  # empty = FP32
+        self._fp32_size_mb = model_size_mb_from_bytes(self._fp32_ebops)
 
         # Track evolution history
         self._pareto_size_history: List[int] = []
@@ -231,7 +235,7 @@ class NSGAIIClusterSearch:
             fp32_accuracy: Baseline FP32 accuracy (%).
 
         Returns:
-            (accuracy_loss, ebops) — both to be minimised.
+            (accuracy_loss, model_size_mb) — both to be minimised.
         """
         config = self.individual_to_config(individual)
 
@@ -245,15 +249,16 @@ class NSGAIIClusterSearch:
             accuracy = self._evaluate_accuracy(model_copy, val_loader)
             accuracy_loss = fp32_accuracy - accuracy
 
-            # Compute EBops
+            # Compute objective #2: model size in MiB
             ebops = self._compute_ebops_for_config(config)
+            model_size_mb = model_size_mb_from_bytes(ebops)
 
             # Clean up
             del model_copy
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
-            return accuracy_loss, ebops
+            return accuracy_loss, model_size_mb
 
         except Exception as e:
             logger.warning("Evaluation failed for individual: %s", e)
@@ -297,7 +302,7 @@ class NSGAIIClusterSearch:
         """
         Perform fast non-dominated sorting (Deb et al. 2002).
 
-        Both objectives are minimised: (accuracy_loss, ebops).
+        Both objectives are minimised: (accuracy_loss, model_size_mb).
 
         Args:
             objectives: List of (obj1, obj2) tuples.
@@ -495,29 +500,41 @@ class NSGAIIClusterSearch:
         logger.info("=" * 70)
         logger.info("Phase 1c: NSGA-II Multi-Objective Cluster-Level Search")
         logger.info("=" * 70)
+        search_space_size = max(1, 2 ** self.num_genes)
+        if search_space_size < pop_size:
+            logger.info(
+                "  Population capped by finite search space: %d -> %d",
+                pop_size, search_space_size,
+            )
+            pop_size = search_space_size
         logger.info(
             "  Search space: 2^%d = %d configs  |  Pop: %d  |  Gens: %d",
-            self.num_genes, 2 ** self.num_genes, pop_size, max_gen,
+            self.num_genes, search_space_size, pop_size, max_gen,
         )
-        logger.info("  FP32 baseline: %.2f%% accuracy, %.2f MB EBops",
-                     fp32_accuracy, self._fp32_ebops / 1e6)
+        logger.info("  FP32 baseline: %.2f%% accuracy, %.2f MiB model size",
+                     fp32_accuracy, self._fp32_size_mb)
         logger.info("=" * 70)
+
+        # When the full configuration space fits in one population, evaluate
+        # it exactly instead of running a stochastic evolutionary loop.
+        if search_space_size <= pop_size:
+            return self._search_exhaustive(val_loader, fp32_accuracy)
 
         # ── Generation 0: Initialize population ──
         logger.info("Generation 0: Initializing population ...")
 
-        # Population: list of (individual, accuracy_loss, ebops)
+        # Population: list of (individual, accuracy_loss, model_size_mb)
         population: List[Tuple[List[int], float, float]] = []
 
         # Add elite seed
         elite_individual = self.config_to_individual(seed_config)
-        loss, ebops = self.evaluate_individual(
+        loss, size_mb = self.evaluate_individual(
             elite_individual, val_loader, fp32_accuracy
         )
-        population.append((elite_individual, loss, ebops))
+        population.append((elite_individual, loss, size_mb))
         logger.info(
-            "  Elite seed: acc_loss=%.2f%%, EBops=%.2f",
-            loss, ebops,
+            "  Elite seed: acc_loss=%.2f%%, size=%.2f MiB",
+            loss, size_mb,
         )
 
         # Fill with random individuals (avoid duplicates)
@@ -567,7 +584,7 @@ class NSGAIIClusterSearch:
                 if fronts and fronts[0]:
                     best_idx = min(fronts[0], key=lambda i: objectives[i][0])
                     logger.info(
-                        "  Gen %d/%d: Pareto=%d, best_loss=%.2f%%, best_ebops=%.2f",
+                        "  Gen %d/%d: Pareto=%d, best_loss=%.2f%%, best_size=%.2f MiB",
                         gen, max_gen, pareto_size,
                         objectives[best_idx][0], objectives[best_idx][1],
                     )
@@ -640,8 +657,9 @@ class NSGAIIClusterSearch:
         pareto_indices = final_fronts[0] if final_fronts else []
 
         for rank_idx, pop_idx in enumerate(pareto_indices):
-            individual, acc_loss, ebops = population[pop_idx]
+            individual, acc_loss, model_size_mb = population[pop_idx]
             config = self.individual_to_config(individual)
+            ebops = self._compute_ebops_for_config(config)
 
             ebops_reduction = (
                 (self._fp32_ebops - ebops) / self._fp32_ebops * 100.0
@@ -656,7 +674,7 @@ class NSGAIIClusterSearch:
                 accuracy_loss=acc_loss,
                 ebops=ebops,
                 ebops_reduction=ebops_reduction,
-                model_size_mb=ebops / 1e6,
+                model_size_mb=model_size_mb,
                 bitwidth_assignment=config,
                 rank=1,
                 crowding_distance=final_cd.get(pop_idx, 0.0),
@@ -696,6 +714,72 @@ class NSGAIIClusterSearch:
             )
         logger.info("=" * 70)
 
+        return result
+
+    def _search_exhaustive(
+        self, val_loader: DataLoader, fp32_accuracy: float,
+    ) -> ParetoFront:
+        """Evaluate all possible individuals exactly (small search spaces)."""
+        logger.info(
+            "Exhaustive mode: evaluating all 2^%d = %d configurations",
+            self.num_genes, max(1, 2 ** self.num_genes),
+        )
+
+        if self.num_genes <= 0:
+            individuals: List[List[int]] = [[]]
+        else:
+            individuals = [list(bits) for bits in itertools.product([0, 1], repeat=self.num_genes)]
+
+        population: List[Tuple[List[int], float, float]] = []
+        for ind in individuals:
+            acc_loss, size_mb = self.evaluate_individual(ind, val_loader, fp32_accuracy)
+            population.append((ind, acc_loss, size_mb))
+
+        objectives = [(x[1], x[2]) for x in population]
+        fronts = self._non_dominated_sort(objectives)
+        pareto_indices = fronts[0] if fronts else []
+        cd = self._crowding_distance(objectives, pareto_indices) if pareto_indices else {}
+
+        pareto_solutions: List[ParetoSolution] = []
+        for rank_idx, idx in enumerate(pareto_indices):
+            individual, acc_loss, model_size_mb = population[idx]
+            config = self.individual_to_config(individual)
+            ebops = self._compute_ebops_for_config(config)
+            ebops_reduction = (
+                (self._fp32_ebops - ebops) / self._fp32_ebops * 100.0
+                if self._fp32_ebops > 0
+                else 0.0
+            )
+            pareto_solutions.append(
+                ParetoSolution(
+                    solution_id=f"nsga_exhaustive_r{rank_idx + 1}",
+                    method="PTQ",
+                    accuracy=fp32_accuracy - acc_loss,
+                    accuracy_loss=acc_loss,
+                    ebops=ebops,
+                    ebops_reduction=ebops_reduction,
+                    model_size_mb=model_size_mb,
+                    bitwidth_assignment=config,
+                    rank=1,
+                    crowding_distance=cd.get(idx, 0.0),
+                    is_dominated=False,
+                )
+            )
+
+        pareto_solutions.sort(key=lambda s: s["accuracy_loss"])
+        self._last_pareto = pareto_solutions
+
+        result = ParetoFront(
+            solutions=pareto_solutions,
+            generation=1,
+            evaluations=len(population),
+            convergence_reason="exhaustive",
+        )
+
+        logger.info(
+            "Exhaustive NSGA-II complete: %d Pareto solutions from %d evaluations",
+            len(pareto_solutions), len(population),
+        )
         return result
 
     # ------------------------------------------------------------------

@@ -71,7 +71,7 @@ def count_parameters(model: nn.Module) -> int:
 
 
 def compute_model_size_mb(model: nn.Module) -> float:
-    """Compute model size in megabytes (FP32 parameter storage)."""
+    """Compute model size in MiB from the actual parameter dtypes (FP32)."""
     total_bytes = sum(
         p.numel() * p.element_size() for p in model.parameters()
     )
@@ -96,6 +96,26 @@ def compute_ebops(
         bw = bitwidth_assignment.get(name, 32)  # Default FP32
         total += param.numel() * bw / 8.0
     return total
+
+
+def compute_quantized_size_mb(
+    model: nn.Module,
+    bitwidth_assignment: Dict[str, int],
+) -> float:
+    """Compute the on-disk model size in MiB under a bitwidth assignment.
+
+    Sums ``numel × bitwidth / 8`` across all parameters (defaulting to
+    32 bits for params not in the assignment) and converts to MiB
+    (binary megabytes, ``1024 * 1024``). This is the canonical model
+    size used as a Pareto objective and reported in the public outputs.
+    """
+    total_bytes = compute_ebops(model, bitwidth_assignment)
+    return total_bytes / (1024 * 1024)
+
+
+def model_size_mb_from_bytes(total_bytes: float) -> float:
+    """Convenience wrapper: convert a byte count to MiB consistently."""
+    return float(total_bytes) / (1024 * 1024)
 
 
 def save_checkpoint(

@@ -20,7 +20,7 @@ Plots generated:
 Enhancements over the spec:
     - Correct incremental hypervolume calculation (spec double-counts)
     - Knee point detection via perpendicular distance method
-    - Dark-themed publication-quality plots
+    - Light publication-style plots
     - JSON export for downstream analysis
 """
 
@@ -82,13 +82,18 @@ class ParetoAnalyzer:
     ) -> None:
         self.pareto_front = pareto_front
         self.solutions = pareto_front["solutions"]
+        # Public-facing analyses must exclude NSGA internal IDs.
+        self.public_solutions = [
+            s for s in self.solutions
+            if not str(s.get("solution_id", "")).startswith("nsga_")
+        ]
         self.fp32_accuracy = fp32_accuracy
         self.fp32_ebops = fp32_ebops
         self.model_name = model_name
 
         # Sort solutions by accuracy (highest first = lowest loss)
         self.solutions_ranked = sorted(
-            self.solutions, key=lambda s: s.get("accuracy_loss", 0.0)
+            self.public_solutions, key=lambda s: s.get("accuracy_loss", 0.0)
         )
 
     # ------------------------------------------------------------------
@@ -104,11 +109,11 @@ class ParetoAnalyzer:
         """
         warnings: List[str] = []
 
-        if not self.solutions:
+        if not self.public_solutions:
             warnings.append("Pareto front is empty!")
             return warnings
 
-        for i, sol in enumerate(self.solutions):
+        for i, sol in enumerate(self.public_solutions):
             # NaN checks
             if math.isnan(sol.get("accuracy", 0)):
                 warnings.append(f"Solution {i}: accuracy is NaN")
@@ -124,8 +129,8 @@ class ParetoAnalyzer:
                 warnings.append(f"Solution {i}: EBops <= 0")
 
         # Non-domination check
-        for i, sol_i in enumerate(self.solutions):
-            for j, sol_j in enumerate(self.solutions):
+        for i, sol_i in enumerate(self.public_solutions):
+            for j, sol_j in enumerate(self.public_solutions):
                 if i == j:
                     continue
                 if (
@@ -158,6 +163,7 @@ class ParetoAnalyzer:
         enriched: List[Dict[str, Any]] = []
 
         for sol in self.solutions_ranked:
+            sid = str(sol.get("solution_id", "unknown"))
             config = sol.get("bitwidth_assignment", {})
             int4_count = sum(1 for bw in config.values() if bw == 4)
             int8_count = sum(1 for bw in config.values() if bw == 8)
@@ -170,12 +176,21 @@ class ParetoAnalyzer:
             if ebops_reduction == 0.0 and self.fp32_ebops > 0:
                 ebops_reduction = (self.fp32_ebops - ebops) / self.fp32_ebops * 100
 
+            # Real model size in MiB — prefer the value carried on the
+            # ParetoSolution (set with the canonical 1024² conversion);
+            # fall back to ebops/1024² so this is correct regardless of
+            # which constructor produced the solution.
+            model_size_mb = sol.get("model_size_mb")
+            if not model_size_mb:
+                model_size_mb = float(ebops) / (1024.0 * 1024.0)
+
             enriched.append({
-                "solution_id": sol.get("solution_id", "unknown"),
+                "solution_id": sid,
                 "accuracy": sol.get("accuracy", 0.0),
                 "accuracy_loss": sol.get("accuracy_loss", 0.0),
                 "ebops": ebops,
-                "ebops_mb": ebops / 1e6,
+                "ebops_mb": float(model_size_mb),
+                "model_size_mb": float(model_size_mb),
                 "ebops_reduction": ebops_reduction,
                 "compression_ratio": compression_ratio,
                 "int4_count": int4_count,
@@ -200,11 +215,11 @@ class ParetoAnalyzer:
         Objectives: minimise accuracy_loss, minimise ebops.
         Reference point: (max_loss + margin, max_ebops + margin).
         """
-        if not self.solutions:
+        if not self.public_solutions:
             return 0.0
 
-        losses = [s.get("accuracy_loss", 0.0) for s in self.solutions]
-        ebops_vals = [s.get("ebops", 0.0) for s in self.solutions]
+        losses = [s.get("accuracy_loss", 0.0) for s in self.public_solutions]
+        ebops_vals = [s.get("ebops", 0.0) for s in self.public_solutions]
 
         # Reference point: worst case + 10% margin
         ref_loss = max(losses) * 1.1 + 1.0
@@ -233,12 +248,12 @@ class ParetoAnalyzer:
         Lower spacing = more uniformly distributed solutions.
         Solutions are sorted by accuracy_loss before computing.
         """
-        if len(self.solutions) <= 1:
+        if len(self.public_solutions) <= 1:
             return 0.0
 
         # Sort by accuracy_loss
         sorted_sols = sorted(
-            self.solutions, key=lambda s: s.get("accuracy_loss", 0.0)
+            self.public_solutions, key=lambda s: s.get("accuracy_loss", 0.0)
         )
 
         # Normalise objectives to [0, 1] for fair distance computation
@@ -273,11 +288,11 @@ class ParetoAnalyzer:
 
         This is a standard technique in multi-objective optimisation.
         """
-        if len(self.solutions) < 3:
+        if len(self.public_solutions) < 3:
             return None
 
         sorted_sols = sorted(
-            self.solutions, key=lambda s: s.get("accuracy_loss", 0.0)
+            self.public_solutions, key=lambda s: s.get("accuracy_loss", 0.0)
         )
 
         # Extreme points: best accuracy (lowest loss) and best EBops
@@ -315,11 +330,11 @@ class ParetoAnalyzer:
 
     def find_extreme_solutions(self) -> Dict[str, Optional[Dict]]:
         """Identify extreme solutions and the balanced knee point."""
-        if not self.solutions:
+        if not self.public_solutions:
             return {"best_accuracy": None, "best_ebops": None, "balanced": None}
 
-        best_acc = min(self.solutions, key=lambda s: s.get("accuracy_loss", float("inf")))
-        best_ebops = min(self.solutions, key=lambda s: s.get("ebops", float("inf")))
+        best_acc = min(self.public_solutions, key=lambda s: s.get("accuracy_loss", float("inf")))
+        best_ebops = min(self.public_solutions, key=lambda s: s.get("ebops", float("inf")))
         balanced = self.find_knee_point()
 
         return {
@@ -330,12 +345,12 @@ class ParetoAnalyzer:
 
     def compute_all_metrics(self) -> Dict[str, float]:
         """Compute all global Pareto quality metrics."""
-        losses = [s.get("accuracy_loss", 0.0) for s in self.solutions]
-        ebops_vals = [s.get("ebops", 0.0) for s in self.solutions]
-        accuracies = [s.get("accuracy", 0.0) for s in self.solutions]
+        losses = [s.get("accuracy_loss", 0.0) for s in self.public_solutions]
+        ebops_vals = [s.get("ebops", 0.0) for s in self.public_solutions]
+        accuracies = [s.get("accuracy", 0.0) for s in self.public_solutions]
 
         return {
-            "num_solutions": len(self.solutions),
+            "num_solutions": len(self.public_solutions),
             "hypervolume": self.compute_hypervolume(),
             "spacing": self.compute_spacing(),
             "accuracy_min": min(accuracies) if accuracies else 0,
@@ -371,7 +386,7 @@ class ParetoAnalyzer:
         logger.info("Phase 2: Pareto Front Analysis & Visualization")
         logger.info("=" * 70)
         logger.info("  Model: %s", self.model_name)
-        logger.info("  Solutions: %d", len(self.solutions))
+        logger.info("  Solutions (public): %d", len(self.public_solutions))
         logger.info("  FP32 baseline: %.2f%% accuracy, %.2f MB",
                      self.fp32_accuracy, self.fp32_ebops / 1e6)
 
@@ -497,16 +512,16 @@ class ParetoAnalyzer:
 
         lines.append("## Solution Rankings")
         lines.append("")
-        lines.append("| Rank | Solution | Accuracy | Loss | EBops (MB) | "
+        lines.append("| Rank | Solution | Top-1 | Loss | Size (MiB) | "
                       "Compression | INT4 % |")
-        lines.append("|------|----------|----------|------|------------|"
+        lines.append("|------|----------|-------|------|------------|"
                       "-------------|--------|")
         for i, sol in enumerate(solutions):
             lines.append(
                 f"| {i+1} | {sol['solution_id']} | "
                 f"{sol['accuracy']:.2f}% | "
                 f"{sol['accuracy_loss']:.2f}% | "
-                f"{sol['ebops_mb']:.2f} | "
+                f"{sol.get('model_size_mb', sol['ebops_mb']):.2f} | "
                 f"{sol['compression_ratio']:.1f}x | "
                 f"{sol['int4_percent']:.0f}% |"
             )
@@ -559,21 +574,22 @@ class ParetoVisualizer:
     """
     Generates publication-quality Pareto front visualisations.
 
-    Uses a dark theme with carefully chosen colours for clarity.
-    All plots saved as high-DPI PNGs.
+    Uses the shared light publication style from ``visualization.style``
+    so colours/markers stay consistent with the XAI plots. Methods that
+    can be identified (FP32, PTQ, QAT, GPTQ, AWQ, SmoothQuant) get a
+    consistent colour + marker; the rest fall back to neutral grey.
+    All plots saved as high-DPI PNGs on a white background.
     """
 
-    # Colour palette (accessible, dark-theme friendly)
-    COLORS = {
-        "primary": "#4fc3f7",       # Light blue
-        "secondary": "#81c784",     # Green
-        "accent": "#ff8a65",        # Orange
-        "highlight": "#e57373",     # Red
-        "knee": "#ffd54f",          # Amber/gold
-        "text": "#e0e0e0",          # Light grey
-        "grid": "#424242",          # Dark grey
-        "bg": "#1e1e2e",            # Dark background
-        "panel": "#2d2d3d",         # Panel background
+    # Accent colours used for non-method-specific elements (extremes,
+    # frontier line, knee marker). The per-method palette comes from
+    # visualization.style.METHOD_STYLE.
+    ACCENT = {
+        "frontier": "#1f77b4",      # blue dashed connector
+        "best_acc": "#2ca02c",      # green up-triangle
+        "best_ebops": "#d62728",    # red down-triangle
+        "knee":       "#ffb000",    # amber star
+        "header_bg":  "#1f3a93",    # table header
     }
 
     def __init__(
@@ -589,118 +605,150 @@ class ParetoVisualizer:
         self.model_name = model_name
 
     def _setup_style(self) -> None:
-        """Configure dark theme for all plots."""
-        plt.rcParams.update({
-            "figure.facecolor": self.COLORS["bg"],
-            "axes.facecolor": self.COLORS["panel"],
-            "axes.edgecolor": self.COLORS["grid"],
-            "axes.labelcolor": self.COLORS["text"],
-            "text.color": self.COLORS["text"],
-            "xtick.color": self.COLORS["text"],
-            "ytick.color": self.COLORS["text"],
-            "grid.color": self.COLORS["grid"],
-            "grid.alpha": 0.3,
-            "font.family": "sans-serif",
-            "font.size": 11,
-        })
+        """Configure the shared light publication theme."""
+        from visualization.style import apply_publication_style
+        apply_publication_style()
 
     def plot_pareto_scatter(self, output_path: Path) -> Path:
-        """
-        2D scatter plot: Accuracy vs EBops reduction.
+        """Public 2-D Pareto scatter: Top-1 accuracy vs Model size (MiB).
 
-        Points coloured by INT4 percentage, sized by compression ratio.
-        Extreme solutions and knee point labelled.
+        Model size is the first-class second objective: accurate, small
+        and quantization-method aware. Each point is labelled with its
+        canonical bitwidth-tagged ID (``GPTQ_INT8``, ``AWQ_INT4``, …)
+        and uses the per-method colour/marker from
+        ``visualization.style.METHOD_STYLE``. NSGA internal solutions
+        (IDs starting ``nsga_``) are filtered out before plotting; they
+        live in checkpoints for reproducibility.
         """
+        from visualization.style import style_for, family_of
+
         self._setup_style()
-        fig, ax = plt.subplots(figsize=(10, 7))
+        fig, ax = plt.subplots(figsize=(10, 6.5))
 
-        if not self.solutions:
-            ax.text(0.5, 0.5, "No Pareto solutions",
-                    ha="center", va="center", fontsize=14,
-                    color=self.COLORS["text"])
-            fig.savefig(output_path, dpi=300, bbox_inches="tight")
+        public_solutions = [
+            s for s in self.solutions
+            if not str(s.get("solution_id", "")).startswith("nsga_")
+        ]
+
+        if not public_solutions:
+            ax.text(0.5, 0.5, "No public Pareto solutions",
+                    ha="center", va="center", fontsize=14)
+            fig.savefig(output_path)
             plt.close(fig)
             return output_path
 
-        accuracies = [s["accuracy"] for s in self.solutions]
-        ebops_red = [s["ebops_reduction"] for s in self.solutions]
-        int4_pct = [s["int4_percent"] for s in self.solutions]
-        comp_ratios = [s["compression_ratio"] for s in self.solutions]
-
-        # Scale point sizes by compression ratio
-        sizes = [max(40, min(r * 30, 300)) for r in comp_ratios]
-
-        # Scatter with INT4% colour mapping
-        scatter = ax.scatter(
-            ebops_red, accuracies,
-            c=int4_pct, cmap="YlOrRd", s=sizes,
-            edgecolors="white", linewidths=0.8,
-            alpha=0.85, zorder=5,
-        )
-
-        # Connect frontier with a line (sorted by EBops reduction)
-        sorted_by_ebops = sorted(
-            zip(ebops_red, accuracies), key=lambda p: p[0]
+        # Frontier connector ordered by model size — illustrative only.
+        sorted_pts = sorted(
+            ((s["ebops_mb"], s["accuracy"]) for s in public_solutions),
+            key=lambda p: p[0],
         )
         ax.plot(
-            [p[0] for p in sorted_by_ebops],
-            [p[1] for p in sorted_by_ebops],
-            color=self.COLORS["primary"], alpha=0.4,
-            linewidth=1.5, linestyle="--", zorder=3,
+            [p[0] for p in sorted_pts],
+            [p[1] for p in sorted_pts],
+            color=self.ACCENT["frontier"], linestyle="--",
+            linewidth=1.2, alpha=0.45, zorder=2, label="_frontier",
         )
 
-        # Label extreme solutions
+        # Per-method scatter + per-point ID label so the bitwidth is
+        # always visible alongside the marker.
+        plotted_families = set()
+        for s in public_solutions:
+            tag = s.get("solution_id", "")
+            fam = family_of(tag)
+            color, marker = style_for(tag)
+            comp = s.get("compression_ratio", 1.0) or 1.0
+            size = float(max(60, min(comp * 28, 320)))
+            label = fam if fam not in plotted_families else None
+            plotted_families.add(fam)
+            ax.scatter(
+                s["ebops_mb"], s["accuracy"],
+                marker=marker, s=size, c=color,
+                edgecolors="white", linewidths=1.0,
+                alpha=0.9, zorder=5, label=label,
+            )
+            # Inline bitwidth-aware label next to every public point.
+            ax.annotate(
+                tag,
+                xy=(s["ebops_mb"], s["accuracy"]),
+                xytext=(7, 5), textcoords="offset points",
+                fontsize=8.5, color="#222222",
+                bbox=dict(boxstyle="round,pad=0.18",
+                          fc="white", ec="#dddddd", alpha=0.85),
+                zorder=8,
+            )
+
+        # Highlight extremes with a second outlined marker on top.
         for key, marker, color, label in [
-            ("best_accuracy", "^", self.COLORS["secondary"], "Best Accuracy"),
-            ("best_ebops", "v", self.COLORS["accent"], "Best EBops"),
-            ("balanced", "*", self.COLORS["knee"], "Knee Point"),
+            ("best_accuracy", "^", self.ACCENT["best_acc"],   "Best Accuracy"),
+            ("best_ebops",    "v", self.ACCENT["best_ebops"], "Smallest size"),
+            ("balanced",      "*", self.ACCENT["knee"],       "Knee point"),
         ]:
             ext = self.extremes.get(key)
-            if ext:
-                ext_id = ext.get("solution_id", "")
-                # Find matching solution in our enriched list
-                for s in self.solutions:
-                    if s["solution_id"] == ext_id:
-                        ax.scatter(
-                            [s["ebops_reduction"]], [s["accuracy"]],
-                            marker=marker, s=200, c=color,
-                            edgecolors="white", linewidths=2,
-                            zorder=10, label=label,
-                        )
-                        break
+            if not ext:
+                continue
+            ext_id = ext.get("solution_id", "")
+            if str(ext_id).startswith("nsga_"):
+                continue  # don't highlight private NSGA solutions
+            for s in public_solutions:
+                if s["solution_id"] != ext_id:
+                    continue
+                ax.scatter(
+                    [s["ebops_mb"]], [s["accuracy"]],
+                    marker=marker, s=240, facecolors="none",
+                    edgecolors=color, linewidths=2.2,
+                    zorder=11, label=label,
+                )
+                break
 
-        # Colorbar
-        cbar = plt.colorbar(scatter, ax=ax, pad=0.02)
-        cbar.set_label("INT4 Layers (%)", fontsize=11)
-        cbar.ax.yaxis.set_tick_params(color=self.COLORS["text"])
-
-        # Labels and title
-        ax.set_xlabel("EBops Reduction (%)", fontsize=13, fontweight="bold")
-        ax.set_ylabel("Accuracy (%)", fontsize=13, fontweight="bold")
+        ax.set_xlabel("Model size (MiB)")
+        ax.set_ylabel("Top-1 accuracy (%)")
         ax.set_title(
-            f"Pareto Front: {self.model_name}\n"
-            f"{len(self.solutions)} solutions | HV={self.metrics.get('hypervolume', 0):.1f}",
-            fontsize=14, fontweight="bold", pad=15,
+            f"Accuracy vs Model size — {self.model_name}\n"
+            f"{len(public_solutions)} public methods · "
+            f"HV={self.metrics.get('hypervolume', 0):.2g}",
+            pad=12,
+        )
+        # Marker-size legend hint as caption.
+        ax.text(
+            0.99, 0.02,
+            "marker size ∝ compression ratio · labels show INT bitwidth",
+            transform=ax.transAxes, ha="right", va="bottom",
+            fontsize=9, color="#666666",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                      ec="#dddddd", alpha=0.85),
         )
 
-        ax.legend(loc="lower left", framealpha=0.7, fontsize=10)
-        ax.grid(True, alpha=0.2)
+        # Deduplicate legend entries (matplotlib repeats per-marker labels).
+        handles, labels = ax.get_legend_handles_labels()
+        seen = set()
+        uniq_handles, uniq_labels = [], []
+        for h, l in zip(handles, labels):
+            if l in seen or l == "_frontier":
+                continue
+            seen.add(l)
+            uniq_handles.append(h)
+            uniq_labels.append(l)
+        ax.legend(
+            uniq_handles, uniq_labels,
+            loc="lower left", ncol=2,
+            title="Method / Highlight",
+        )
 
-        fig.savefig(output_path, dpi=300, bbox_inches="tight",
-                    facecolor=self.COLORS["bg"])
+        fig.tight_layout()
+        fig.savefig(output_path)
         plt.close(fig)
         logger.info("    Saved: %s", output_path.name)
         return output_path
 
     def plot_bitwidth_distribution(self, output_path: Path) -> Path:
-        """
-        Stacked bar chart: INT4 vs INT8 layer counts per solution.
-        """
+        """Stacked bar chart of INT4 vs INT8 layer counts per solution."""
         self._setup_style()
-        fig, ax = plt.subplots(figsize=(10, 5))
+        fig, ax = plt.subplots(
+            figsize=(max(8.0, 0.45 * max(len(self.solutions), 1) + 4), 5),
+        )
 
         if not self.solutions:
-            fig.savefig(output_path, dpi=300, bbox_inches="tight")
+            fig.savefig(output_path)
             plt.close(fig)
             return output_path
 
@@ -709,43 +757,43 @@ class ParetoVisualizer:
         int8_counts = [s["int8_count"] for s in self.solutions]
         x = np.arange(len(labels))
 
-        bar_width = 0.6
+        bar_width = 0.62
         ax.bar(x, int4_counts, bar_width,
-               label="INT4", color=self.COLORS["accent"], alpha=0.85)
+               label="INT4", color="#ef8a62",
+               edgecolor="white", linewidth=0.7)
         ax.bar(x, int8_counts, bar_width, bottom=int4_counts,
-               label="INT8", color=self.COLORS["primary"], alpha=0.85)
+               label="INT8", color="#1f77b4",
+               edgecolor="white", linewidth=0.7)
 
-        ax.set_xlabel("Solution", fontsize=12, fontweight="bold")
-        ax.set_ylabel("Layer Count", fontsize=12, fontweight="bold")
-        ax.set_title("Bitwidth Distribution per Pareto Solution",
-                     fontsize=13, fontweight="bold")
+        ax.set_xlabel("Solution")
+        ax.set_ylabel("Layer count")
+        ax.set_title("Bitwidth distribution per Pareto solution")
         ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-        ax.legend(loc="upper right", framealpha=0.7)
-        ax.grid(True, axis="y", alpha=0.2)
+        ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=9)
+        ax.legend(loc="upper right", title="Bitwidth")
+        ax.grid(True, axis="y", alpha=0.4)
 
         fig.tight_layout()
-        fig.savefig(output_path, dpi=300, bbox_inches="tight",
-                    facecolor=self.COLORS["bg"])
+        fig.savefig(output_path)
         plt.close(fig)
         logger.info("    Saved: %s", output_path.name)
         return output_path
 
     def plot_metrics_table(self, output_path: Path) -> Path:
-        """
-        Visual table of solution rankings with key metrics.
-        """
+        """Visual table of solution rankings with key metrics (light theme)."""
         self._setup_style()
-        fig, ax = plt.subplots(figsize=(12, max(3, len(self.solutions) * 0.45 + 1.5)))
+        fig, ax = plt.subplots(
+            figsize=(12, max(3, len(self.solutions) * 0.42 + 1.6)),
+        )
         ax.axis("off")
 
         if not self.solutions:
-            fig.savefig(output_path, dpi=300, bbox_inches="tight")
+            fig.savefig(output_path)
             plt.close(fig)
             return output_path
 
-        headers = ["Rank", "Solution", "Accuracy", "Loss", "EBops (MB)",
-                    "Compression", "INT4 %"]
+        headers = ["Rank", "Solution", "Top-1", "Loss", "Size (MiB)",
+                   "Compression", "INT4 %"]
         cell_data = []
         for i, s in enumerate(self.solutions):
             cell_data.append([
@@ -753,7 +801,7 @@ class ParetoVisualizer:
                 s["solution_id"],
                 f"{s['accuracy']:.2f}%",
                 f"{s['accuracy_loss']:.2f}%",
-                f"{s['ebops_mb']:.2f}",
+                f"{s.get('model_size_mb', s['ebops_mb']):.2f}",
                 f"{s['compression_ratio']:.1f}x",
                 f"{s['int4_percent']:.0f}%",
             ])
@@ -765,31 +813,25 @@ class ParetoVisualizer:
             cellLoc="center",
         )
 
-        # Style the table
         table.auto_set_font_size(False)
-        table.set_fontsize(9)
-        table.scale(1, 1.4)
+        table.set_fontsize(10)
+        table.scale(1, 1.45)
 
-        # Header styling
-        for (row, col), cell in table.get_celld().items():
+        for (row, _col), cell in table.get_celld().items():
             if row == 0:
-                cell.set_facecolor("#3f51b5")
+                cell.set_facecolor(self.ACCENT["header_bg"])
                 cell.set_text_props(color="white", fontweight="bold")
             else:
-                cell.set_facecolor(
-                    self.COLORS["panel"] if row % 2 == 0 else "#252535"
-                )
-                cell.set_text_props(color=self.COLORS["text"])
-            cell.set_edgecolor(self.COLORS["grid"])
+                cell.set_facecolor("#f7f7fa" if row % 2 == 0 else "white")
+                cell.set_text_props(color="#222222")
+            cell.set_edgecolor("#bbbbbb")
 
         ax.set_title(
-            f"Pareto Solution Rankings: {self.model_name}",
-            fontsize=13, fontweight="bold", pad=20,
-            color=self.COLORS["text"],
+            f"Pareto solution rankings — {self.model_name}",
+            pad=18,
         )
 
-        fig.savefig(output_path, dpi=300, bbox_inches="tight",
-                    facecolor=self.COLORS["bg"])
+        fig.savefig(output_path)
         plt.close(fig)
         logger.info("    Saved: %s", output_path.name)
         return output_path
