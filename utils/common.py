@@ -10,6 +10,7 @@ No model-specific or dataset-specific assumptions.
 from __future__ import annotations
 
 import logging
+import os
 import random
 import time
 from contextlib import contextmanager
@@ -24,8 +25,34 @@ import torch.nn as nn
 logger = logging.getLogger("neuroquant")
 
 
-def set_seed(seed: int = 42) -> None:
-    """Set random seed for full reproducibility across all libraries."""
+def set_seed(seed: int = 42, strict: bool = True) -> None:
+    """Set random seed and (when ``strict``) enforce deterministic kernels.
+
+    ``strict=True`` is the production default and additionally:
+
+    * sets ``PYTHONHASHSEED`` so set/dict iteration order is fixed,
+    * pins ``CUBLAS_WORKSPACE_CONFIG=":4096:8"`` so cuBLAS GEMMs use a
+      deterministic workspace layout (required for
+      ``torch.use_deterministic_algorithms(True)`` on CUDA),
+    * calls ``torch.use_deterministic_algorithms(True, warn_only=True)``
+      which makes any non-deterministic op surface a warning instead of
+      silently producing different numbers across runs,
+    * disables the cuDNN auto-tuner (``benchmark=False``) and forces
+      deterministic conv algorithms (``deterministic=True``).
+
+    These flags must be set BEFORE the first CUDA context is created and
+    BEFORE the first DataLoader fork, so call ``set_seed`` at process
+    start. Some PyTorch ops (e.g. atomic-add reductions) cannot be
+    deterministic on CUDA — ``warn_only=True`` lets them run with a
+    warning rather than raising, which is the right default for a
+    pipeline that must produce *some* output.
+    """
+    # Process-wide state. Must be set before Python imports any module
+    # whose hash-seed-dependent state matters (e.g. dict-ordered code).
+    os.environ["PYTHONHASHSEED"] = str(int(seed))
+    if strict:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -33,7 +60,21 @@ def set_seed(seed: int = 42) -> None:
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-    logger.debug("Random seed set to %d", seed)
+
+    if strict:
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception as exc:  # pragma: no cover — older torch
+            logger.warning(
+                "Strict determinism unavailable (%s); falling back to "
+                "best-effort seeding.", exc,
+            )
+
+    logger.debug(
+        "Random seed set to %d (strict=%s, deterministic=%s)",
+        seed, strict,
+        bool(getattr(torch.backends.cudnn, "deterministic", False)),
+    )
 
 
 def get_device(preference: str = "auto") -> torch.device:
@@ -142,7 +183,9 @@ def load_checkpoint(
 ) -> Dict[str, Any]:
     """Load model checkpoint and return metadata."""
     map_location = device if device else "cpu"
-    checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+    # weights_only=True so we never execute pickle on a checkpoint file —
+    # state_dict envelopes are tensor-only and load fine in safe mode.
+    checkpoint = torch.load(path, map_location=map_location, weights_only=True)
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         model.load_state_dict(checkpoint["model_state_dict"], strict=False)

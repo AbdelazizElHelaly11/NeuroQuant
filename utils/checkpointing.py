@@ -130,11 +130,15 @@ class CheckpointManager:
         filename: str,
         model: nn.Module,
     ) -> None:
-        """Load a state_dict saved via save_named_model into the given model."""
+        """Load a state_dict saved via save_named_model into the given model.
+
+        Always loads with ``weights_only=True`` — these files contain a
+        bare ``state_dict`` and never need pickle to deserialize.
+        """
         path = self.ckpt_dir / filename
         if not path.exists():
             raise FileNotFoundError(f"No checkpoint: {path}")
-        state_dict = torch.load(path, map_location="cpu", weights_only=False)
+        state_dict = torch.load(path, map_location="cpu", weights_only=True)
         model.load_state_dict(state_dict, strict=False)
         logger.info("  [CKPT] Loaded model: %s", path.name)
 
@@ -142,26 +146,62 @@ class CheckpointManager:
         """Check whether an auxiliary checkpoint file exists."""
         return (self.ckpt_dir / filename).exists()
 
-    def save_full_module(self, filename: str, module: nn.Module) -> Path:
-        """Pickle an entire ``nn.Module`` (architecture + weights + buffers).
+    def save_safe_module(
+        self,
+        filename: str,
+        module: nn.Module,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        """Save a module's ``state_dict`` plus a JSON-safe metadata blob.
 
-        Use for models whose architecture has been modified at quantization
-        time (e.g. SmoothQuant inserts per-layer input-scaling wrappers).
-        State-dict-only saves lose those wrappers on reload.
+        Replaces the legacy ``save_full_module`` (which pickled the entire
+        ``nn.Module`` — exposing a remote-code-execution sink on
+        ``torch.load(weights_only=False)``). Architectural changes that
+        cannot be expressed in a pure ``state_dict`` (e.g. SmoothQuant's
+        ``_SmoothInputScale`` wrappers) must be encoded into ``metadata``
+        and rebuilt before ``load_state_dict`` is called.
         """
         path = self.ckpt_dir / filename
-        torch.save(module, path)
-        logger.info("  [CKPT] Saved: %s (full module)", path.name)
+        envelope = {
+            "state_dict": module.state_dict(),
+            "metadata": _make_serializable(metadata or {}),
+        }
+        torch.save(envelope, path)
+        logger.info("  [CKPT] Saved: %s (state_dict + metadata)", path.name)
         return path
 
-    def load_full_module(self, filename: str) -> nn.Module:
-        """Load an entire ``nn.Module`` previously saved with save_full_module."""
+    def load_safe_module(
+        self,
+        filename: str,
+        model: nn.Module,
+        rebuild: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Load a state_dict + metadata envelope into ``model``.
+
+        Always loads with ``weights_only=True`` — the envelope contains
+        only tensors and JSON-serialisable metadata, so no pickle code
+        path is exercised. If ``rebuild`` is given, it is called as
+        ``rebuild(model, metadata)`` BEFORE the state_dict is loaded so
+        any architectural wrappers (e.g. SmoothQuant) can be put back in
+        place ahead of the parameter copy.
+
+        Returns the metadata dict.
+        """
         path = self.ckpt_dir / filename
         if not path.exists():
             raise FileNotFoundError(f"No checkpoint: {path}")
-        module = torch.load(path, map_location="cpu", weights_only=False)
-        logger.info("  [CKPT] Loaded: %s (full module)", path.name)
-        return module
+        envelope = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(envelope, dict) or "state_dict" not in envelope:
+            raise ValueError(
+                f"{filename} is not a safe-module envelope "
+                "(missing 'state_dict' key)."
+            )
+        metadata = envelope.get("metadata", {}) or {}
+        if rebuild is not None:
+            rebuild(model, metadata)
+        model.load_state_dict(envelope["state_dict"], strict=False)
+        logger.info("  [CKPT] Loaded: %s (state_dict + metadata)", path.name)
+        return metadata
 
     # ------------------------------------------------------------------
     # Load
@@ -186,7 +226,9 @@ class CheckpointManager:
         path = self.ckpt_dir / f"{phase_name}.pth"
         if not path.exists():
             raise FileNotFoundError(f"No checkpoint: {path}")
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        # ``weights_only=True`` is the production-safe path; envelopes only
+        # contain a state_dict + JSON-safe metadata, no pickled Python.
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         # Support both the {"model_state_dict": ...} envelope and a bare
         # state_dict (older phase_0 checkpoints use the bare form).
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
@@ -226,9 +268,14 @@ def save_reproducibility_manifest(
 
     Includes:
         - Python/PyTorch/CUDA versions
+        - ONNX runtime version and providers (Wave 5 G3)
         - OS and GPU info
         - Config hash (for exact config matching)
         - Key result metrics
+        - ONNX deployment artefacts (FP32 baseline path + size +
+          ORT latency, latency-LUT cache path) — these are the
+          critical ingredients for reproducing the deployment-fidelity
+          report.
         - Timestamp and seed
     """
     manifest = {
@@ -266,6 +313,7 @@ def save_reproducibility_manifest(
         key_packages = [
             "torch", "torchvision", "numpy", "pandas",
             "matplotlib", "mlflow", "pymoo", "pyyaml",
+            "onnx", "onnxruntime", "onnxscript",
         ]
         manifest["packages"] = {}
         for pkg in key_packages:
@@ -275,6 +323,47 @@ def save_reproducibility_manifest(
                 manifest["packages"][pkg] = "not_installed"
     except ImportError:
         pass
+
+    # ── Wave 5 G3: ONNX Runtime metadata ──
+    # Capture the ORT version + the providers actually compiled into
+    # the binary. This is the difference between "we ran INT8 on CPU
+    # via QInt8 kernels" and "we ran INT8 on CUDA" — the report stays
+    # truthful only if we record which provider produced the timings.
+    try:
+        import onnxruntime as _ort  # noqa: WPS433 — local import, optional dep
+        manifest["onnx_runtime"] = {
+            "version": _ort.__version__,
+            "providers_available": list(_ort.get_available_providers()),
+        }
+    except Exception:
+        manifest["onnx_runtime"] = {"version": None, "providers_available": []}
+
+    # ── Wave 5 G3: ONNX deployment artefacts ──
+    # Pull the FP32 ONNX baseline + latency-LUT cache locations off
+    # the results dict (the pipeline stashes them under the keys
+    # ``fp32_onnx`` and ``latency_lut_path`` in newer wave-5 runs).
+    deployment: Dict[str, Any] = {}
+    fp32_onnx = results.get("fp32_onnx") if isinstance(results, dict) else None
+    if isinstance(fp32_onnx, dict):
+        deployment["fp32_onnx_path"] = fp32_onnx.get("fp32_onnx_path")
+        deployment["fp32_onnx_size_mb"] = fp32_onnx.get("fp32_onnx_size_mb")
+        ortlat = fp32_onnx.get("onnx_latency") or {}
+        if ortlat:
+            deployment["fp32_onnx_latency_mean_ms"] = ortlat.get(
+                "latency_mean_ms"
+            )
+            deployment["fp32_onnx_throughput_fps"] = ortlat.get(
+                "throughput_fps"
+            )
+    lut_path = (
+        results.get("latency_lut_path")
+        if isinstance(results, dict) else None
+    )
+    if lut_path:
+        deployment["latency_lut_path"] = str(lut_path)
+        deployment["latency_lut_present_on_disk"] = Path(lut_path).exists()
+    if deployment:
+        manifest["deployment"] = deployment
 
     path = Path(output_dir) / "reproducibility_manifest.json"
     path.parent.mkdir(parents=True, exist_ok=True)

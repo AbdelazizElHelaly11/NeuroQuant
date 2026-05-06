@@ -31,6 +31,7 @@ from torch.utils.data import DataLoader
 
 from config import ClusterAssignment, QuantizationConfig, QuantizationResult
 from quantization.base import BaseQuantizer
+from utils.numerics import EPS_PROB, MIN_SCALE
 
 logger = logging.getLogger("neuroquant")
 
@@ -62,7 +63,7 @@ def _kl_threshold(
         return 0.0
     abs_data = data.abs().to(torch.float32)
     amax = float(abs_data.max().item())
-    if amax < 1e-12:
+    if amax < EPS_PROB:
         return amax
 
     hist = torch.histc(abs_data, bins=num_bins, min=0.0, max=amax)
@@ -102,10 +103,10 @@ def _kl_threshold(
                 mean = Q_small[j] / counts[j].clamp(min=1.0)
                 Q[i] = mean
 
-        P_sum = P.sum().clamp(min=1e-12)
-        Q_sum = Q.sum().clamp(min=1e-12)
-        P_norm = P / P_sum + 1e-12
-        Q_norm = Q / Q_sum + 1e-12
+        P_sum = P.sum().clamp(min=EPS_PROB)
+        Q_sum = Q.sum().clamp(min=EPS_PROB)
+        P_norm = P / P_sum + EPS_PROB
+        Q_norm = Q / Q_sum + EPS_PROB
         kl = float((P_norm * (P_norm.log() - Q_norm.log())).sum().item())
 
         if kl < best_kl:
@@ -129,7 +130,7 @@ def _mse_threshold(
         return 0.0
     d = data.to(torch.float32)
     amax = float(d.abs().max().item())
-    if amax < 1e-12:
+    if amax < EPS_PROB:
         return amax
 
     qmax = max(2 ** (bitwidth - 1) - 1, 1)
@@ -139,7 +140,7 @@ def _mse_threshold(
     best_mse = float("inf")
     for frac in torch.linspace(0.3, 1.0, num_candidates):
         t_val = float((amax * frac).item())
-        scale = max(t_val / qmax, 1e-12)
+        scale = max(t_val / qmax, EPS_PROB)
         q = (d / scale).round().clamp(qmin, qmax) * scale
         mse = float(((d - q) ** 2).mean().item())
         if mse < best_mse:
@@ -317,7 +318,7 @@ class PTQQuantizer(BaseQuantizer):
                     # but different threshold → different scale → different q.
                     qmax = 2 ** (bw - 1) - 1
                     qmin = -(2 ** (bw - 1))
-                    scale = max(float(threshold) / max(qmax, 1), 1e-12)
+                    scale = max(float(threshold) / max(qmax, 1), EPS_PROB)
                     q = (param.data / scale).round().clamp(qmin, qmax)
                     param.data = q * scale
                 else:

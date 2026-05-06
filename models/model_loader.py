@@ -278,12 +278,23 @@ class ModelLoader:
         # Step 1: Build the base model
         model = self._build_base_model()
 
-        # Step 2: Adapt for target task
-        model = adapt_input_conv(model, self.config.input_shape)
-        model = adapt_classifier(
-            model, self.config.num_classes,
-            self.config.input_shape, self.device,
-        )
+        # Step 2: Adapt for target task. Detection models are loaded from
+        # ``torchvision.models.detection`` and have their head replaced
+        # inline by ``_load_torchvision_detection_model``; the
+        # classification-only adapters (last-Linear swap, first-Conv
+        # stride tweak) would corrupt FPN backbones and multi-head
+        # detectors, so we skip them entirely for task='detection'.
+        if self.config.task == "classification":
+            model = adapt_input_conv(model, self.config.input_shape)
+            model = adapt_classifier(
+                model, self.config.num_classes,
+                self.config.input_shape, self.device,
+            )
+        else:
+            logger.info(
+                "  task='%s' — skipping classification-specific adapters.",
+                self.config.task,
+            )
 
         # Step 3: Load checkpoint weights (if provided)
         if self.config.model_path and Path(self.config.model_path).exists():
@@ -306,7 +317,11 @@ class ModelLoader:
         if self.config.model_class:
             return self._load_from_class(self.config.model_class)
 
-        # Priority 2: TorchVision model by name
+        # Priority 2: Detection model (torchvision.models.detection)
+        if self.config.task == "detection":
+            return self._load_torchvision_detection_model(self.config.model_name)
+
+        # Priority 3: Classification model from torchvision.models
         return self._load_torchvision_model(self.config.model_name)
 
     def _load_from_class(self, class_path: str) -> nn.Module:
@@ -371,6 +386,87 @@ class ModelLoader:
         logger.info("  Loading torchvision model: %s", name_normalised)
         model_fn = getattr(tv_models, name_normalised)
         model = model_fn(weights=None)
+        return model
+
+    def _load_torchvision_detection_model(self, name: str) -> nn.Module:
+        """
+        Load an object-detection model from ``torchvision.models.detection``.
+
+        Resolution mirrors ``_load_torchvision_model`` but targets the
+        detection sub-package (Faster R-CNN, Mask R-CNN, Keypoint R-CNN,
+        SSD, RetinaNet, FCOS, …). Construction passes ``num_classes``
+        through so all heads — even non-RCNN ones — emit the configured
+        class count. For the Faster/Mask/Keypoint R-CNN family we then
+        explicitly swap ``roi_heads.box_predictor`` for a fresh
+        ``FastRCNNPredictor`` so a downstream checkpoint reload picks
+        up randomly-initialised classifier weights cleanly. Other
+        architectures (SSD, RetinaNet, …) emit a warning that automatic
+        head adaptation is not handled — the user's checkpoint must
+        already match ``num_classes``.
+        """
+        if not HAS_TORCHVISION:
+            raise ImportError(
+                "torchvision is required to load detection models by name. "
+                "Install it or set config.model_class to a custom model."
+            )
+
+        try:
+            from torchvision.models import detection as tv_detection
+        except ImportError as exc:  # pragma: no cover — torchvision installed without detection
+            raise ImportError(
+                "torchvision.models.detection unavailable; "
+                "install a torchvision build that includes the detection module."
+            ) from exc
+
+        name_normalised = name.lower().strip()
+        if not hasattr(tv_detection, name_normalised) or not callable(
+            getattr(tv_detection, name_normalised)
+        ):
+            available = [
+                n for n in dir(tv_detection)
+                if not n.startswith("_") and callable(getattr(tv_detection, n))
+            ]
+            raise ValueError(
+                f"Unknown detection model '{name}'. "
+                f"Available torchvision.models.detection entries include: "
+                f"{', '.join(sorted(available)[:20])}..."
+            )
+
+        logger.info("  Loading torchvision detection model: %s", name_normalised)
+        model_fn = getattr(tv_detection, name_normalised)
+        model = model_fn(
+            weights=None,
+            weights_backbone=None,
+            num_classes=self.config.num_classes,
+        )
+
+        # Faster/Mask/Keypoint R-CNN family — swap the box predictor.
+        if hasattr(model, "roi_heads") and hasattr(model.roi_heads, "box_predictor"):
+            try:
+                from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+                in_features = model.roi_heads.box_predictor.cls_score.in_features
+                model.roi_heads.box_predictor = FastRCNNPredictor(
+                    in_features, self.config.num_classes,
+                )
+                logger.info(
+                    "  Adapted detection box_predictor: in_features=%d, num_classes=%d",
+                    in_features, self.config.num_classes,
+                )
+            except (ImportError, AttributeError) as exc:
+                logger.warning(
+                    "Could not adapt R-CNN box_predictor for '%s' (%s); "
+                    "assuming the supplied checkpoint matches num_classes=%d.",
+                    name_normalised, exc, self.config.num_classes,
+                )
+        else:
+            logger.warning(
+                "Automatic head adaptation is not supported for detection "
+                "architecture '%s' (e.g. SSD/RetinaNet/FCOS). The model was "
+                "constructed with num_classes=%d; if a checkpoint is loaded, "
+                "it must match that class count.",
+                name_normalised, self.config.num_classes,
+            )
+
         return model
 
     def _load_checkpoint(self, model: nn.Module, path: str) -> None:

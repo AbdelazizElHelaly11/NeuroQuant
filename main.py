@@ -18,8 +18,10 @@ import copy
 import json
 import logging
 import random
+import shutil
 import sys
 import time
+from importlib import resources as importlib_resources
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -69,19 +71,24 @@ def build_model(config: QuantizationConfig) -> nn.Module:
 
 def build_data_loaders(config: QuantizationConfig):
     """
-    Build train/val/test/calibration DataLoaders from config.
+    Build train / search / val / test / calibration DataLoaders.
+
+    The ``search`` slice is the NSGA-II fitness loader (held-out 10% of
+    train, eval-time transforms). It is *separate* from ``val`` (QAT
+    early-stop) and ``test`` (the public headline). This separation is
+    a correctness fix: the single-loader design that preceded it
+    over-fit NSGA fitness to the validation set used for reporting.
 
     Returns:
-        (train_loader, val_loader, test_loader, calib_loader, class_names)
-        ``class_names`` is the dataset's ``.classes`` list when available,
-        otherwise ``None``. Older callers that unpack 4 values continue
-        to work via slicing.
+        (train_loader, search_loader, val_loader, test_loader,
+         calib_loader, class_names)
     """
     from data.data_loader import GenericDatasetLoader
 
     loader = GenericDatasetLoader(config)
     return (
         loader.get_train_loader(),
+        loader.get_search_loader(),
         loader.get_val_loader(),
         loader.get_test_loader(),
         loader.get_calibration_loader(
@@ -160,17 +167,21 @@ class NeuroQuantPipeline:
         self.resume = resume
         self.device = self._resolve_device(config.hyperparams.device)
 
-        # Reproducibility
-        seed = config.hyperparams.seed
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+        # Reproducibility — strict determinism (cuDNN deterministic,
+        # CUBLAS_WORKSPACE_CONFIG, torch.use_deterministic_algorithms).
+        # See utils.common.set_seed for the full list of flags. Strict
+        # mode adds a small per-op overhead but produces byte-stable
+        # outputs across reruns on the same machine, which is the
+        # contract a deployable system must offer.
+        from utils.common import set_seed
+        set_seed(int(config.hyperparams.seed), strict=True)
 
         # State populated during the pipeline
         self.model: Optional[nn.Module] = None
         self.train_loader: Optional[DataLoader] = None
+        # NSGA-II fitness loader. Disjoint from val/test; populated by
+        # ``build_data_loaders`` and consumed by phase 1c.
+        self.search_loader: Optional[DataLoader] = None
         self.val_loader: Optional[DataLoader] = None
         self.test_loader: Optional[DataLoader] = None
         self.calib_loader: Optional[DataLoader] = None
@@ -305,8 +316,9 @@ class NeuroQuantPipeline:
                      f"{sum(p.numel() for p in self.model.parameters()):,}")
 
         # Build data loaders + capture optional class names for XAI captions.
-        (self.train_loader, self.val_loader, self.test_loader,
-         self.calib_loader, self.class_names) = build_data_loaders(self.config)
+        (self.train_loader, self.search_loader, self.val_loader,
+         self.test_loader, self.calib_loader,
+         self.class_names) = build_data_loaders(self.config)
 
         # Optional: Train baseline model
         if self.training_epochs > 0:
@@ -345,6 +357,34 @@ class NeuroQuantPipeline:
             hp.hardware_report_path or None
         )
 
+        # ── Wave 4 J1+J2+J3: FP32 ONNX export + ORT latency baseline ──
+        # The FP32 ONNX export establishes the "deployable" upper bound
+        # for both size (.onnx file size on disk) and latency (ORT
+        # mean ms). Every quantized method later compares its real
+        # numbers against this, instead of against the synthetic
+        # ``numel × 32 / 8`` figure that has no disk presence.
+        self.fp32_onnx: Dict[str, Any] = {}
+        if getattr(hp, "onnx_export_enabled", True):
+            try:
+                from utils.onnx_export import (
+                    export_quantize_and_benchmark, is_onnx_available,
+                )
+                if is_onnx_available():
+                    onnx_dir = self.output_dir / "onnx"
+                    self.fp32_onnx = export_quantize_and_benchmark(
+                        self.model,
+                        self.config.input_shape,
+                        str(onnx_dir),
+                        name="fp32",
+                        calibration_loader=None,  # FP32 needs no calibration
+                        do_int8=False,
+                        batch_size=hp.latency_batch_size,
+                        warmup_runs=hp.latency_warmup_runs,
+                        measure_runs=hp.latency_measure_runs,
+                    )
+            except Exception as exc:
+                logger.warning("FP32 ONNX export skipped: %s", exc)
+
         # Save checkpoint
         ckpt_path = self.output_dir / "checkpoint_fp32.pth"
         torch.save(self.model.state_dict(), ckpt_path)
@@ -366,7 +406,7 @@ class NeuroQuantPipeline:
         # Public MLflow keys: Top-1 only. Top-5 is computed locally
         # for internal diagnostics (kept in the phase-0 checkpoint
         # JSON) but is NOT logged to MLflow as a public metric.
-        self.tracker.log_metrics({
+        fp32_metrics: Dict[str, float] = {
             "fp32_top1": self.fp32_acc,
             "fp32_ebops": self.fp32_ebops,
             "fp32_size_mb": self.fp32_size_mb,
@@ -374,16 +414,42 @@ class NeuroQuantPipeline:
             "fp32_latency_p50_ms": self.fp32_latency["latency_p50_ms"],
             "fp32_latency_p95_ms": self.fp32_latency["latency_p95_ms"],
             "fp32_throughput_fps": self.fp32_latency["throughput_fps"],
-        })
+        }
+        # Wave 5 I1+I2: FP32 ONNX baseline metrics + artifact.
+        fp32_onnx_size = self.fp32_onnx.get("fp32_onnx_size_mb")
+        fp32_onnx_lat_full = self.fp32_onnx.get("onnx_latency") or {}
+        if fp32_onnx_size is not None:
+            fp32_metrics["fp32_onnx_size_mb"] = float(fp32_onnx_size)
+        if fp32_onnx_lat_full:
+            fp32_metrics["fp32_onnx_latency_mean_ms"] = float(
+                fp32_onnx_lat_full.get("latency_mean_ms", 0.0)
+            )
+            fp32_metrics["fp32_onnx_throughput_fps"] = float(
+                fp32_onnx_lat_full.get("throughput_fps", 0.0)
+            )
+        self.tracker.log_metrics(fp32_metrics)
+        if self.fp32_onnx.get("fp32_onnx_path"):
+            self.tracker.log_artifact(
+                str(self.fp32_onnx["fp32_onnx_path"]), "onnx",
+            )
+        # Wave 5 G3: surface the ONNX baseline on ``self.results`` so
+        # the reproducibility manifest can pick it up at end-of-run
+        # without re-walking the file tree.
+        if self.fp32_onnx:
+            self.results["fp32_onnx"] = self.fp32_onnx
         self.tracker.end_run()
 
         # Build summary row for final report table — Top-1 only on the
         # public surface (Top-5 stays in internal metrics if computed).
+        fp32_onnx_lat = (self.fp32_onnx.get("onnx_latency") or {})
         self._add_summary_row(
             "FP32", self.fp32_acc,
             self.fp32_latency["latency_mean_ms"],
             self.fp32_latency["throughput_fps"],
             self.fp32_ebops, self.fp32_size_mb,
+            onnx_size_mb=self.fp32_onnx.get("fp32_onnx_size_mb"),
+            onnx_latency_ms=fp32_onnx_lat.get("latency_mean_ms"),
+            onnx_throughput_fps=fp32_onnx_lat.get("throughput_fps"),
         )
 
         self.report_lines.append(
@@ -401,6 +467,10 @@ class NeuroQuantPipeline:
             "fp32_ebops": self.fp32_ebops,
             "fp32_size_mb": self.fp32_size_mb,
             "fp32_latency": self.fp32_latency,
+            # Wave 5 G3: persist the FP32 ONNX baseline (path + size +
+            # ORT latency) so resumes can recreate the deployment-
+            # fidelity section without re-exporting.
+            "fp32_onnx": self.fp32_onnx,
         })
 
     # ==================================================================
@@ -492,11 +562,60 @@ class NeuroQuantPipeline:
 
         from quantization.nsga_ii_search import NSGAIIClusterSearch
 
+        # ── Wave 4 J4: closed-loop hardware-aware search ──
+        # When ``hardware_aware_search`` is True we build the per-layer
+        # ORT latency LUT (C2) once and pass it to NSGA, which switches
+        # to 3-objective mode ``[acc_loss, size_mb, latency_ms]``. The
+        # LUT is summed over the candidate's bitwidth assignment — fast
+        # enough to evaluate every gene without per-eval ONNX exports.
+        # The LUT is cached to ``output_dir/latency_lut.json`` so
+        # subsequent runs (and resumes) skip the ~minute rebuild cost.
+        latency_lut: Optional[Dict[str, Dict[int, float]]] = None
+        if getattr(hp, "hardware_aware_search", False):
+            try:
+                from utils.onnx_export import is_onnx_available
+                if is_onnx_available():
+                    from quantization.latency_lut import build_latency_lut
+                    cache = self.output_dir / "latency_lut.json"
+                    bws = tuple(getattr(hp, "latency_lut_bitwidths", [4, 8]))
+                    logger.info(
+                        "  Phase 1c: hardware-aware mode — building "
+                        "per-layer ORT latency LUT (bitwidths=%s)",
+                        list(bws),
+                    )
+                    latency_lut = build_latency_lut(
+                        self.model, self.config.input_shape,
+                        self.calib_loader,
+                        bitwidths=bws,
+                        warmup_runs=max(3, hp.latency_warmup_runs // 2),
+                        measure_runs=max(10, hp.latency_measure_runs // 2),
+                        cache_path=str(cache),
+                    )
+                    # Wave 5 G3: record the LUT cache path on the
+                    # results dict for the reproducibility manifest.
+                    self.results["latency_lut_path"] = str(cache)
+                else:
+                    logger.warning(
+                        "  hardware_aware_search=True but ONNX runtime "
+                        "is unavailable; falling back to 2-obj NSGA."
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "  Latency LUT build failed (%s); falling back to "
+                    "2-obj NSGA.", exc,
+                )
+
         nsga = NSGAIIClusterSearch(
-            self.model, self.cluster_assignments, self.config
+            self.model, self.cluster_assignments, self.config,
+            latency_lut=latency_lut,
         )
+        # NSGA fitness reads from the held-out ``search`` slice (10% of
+        # the original train set, eval-time transforms). Falling back to
+        # ``val_loader`` only if a legacy resume produced no search
+        # split — in fresh runs this branch is never taken.
+        nsga_loader = self.search_loader or self.val_loader
         self.pareto_front = nsga.search(
-            self.val_loader, self.fp32_acc, self.fit_seed["seed_config"],
+            nsga_loader, self.fp32_acc, self.fit_seed["seed_config"],
         )
 
         n_pareto = len(self.pareto_front["solutions"])
@@ -607,13 +726,17 @@ class NeuroQuantPipeline:
                     continue
                 self.method_results.append(res)
                 lat = res.get("latency") or {}
+                onnx_lat = res.get("onnx_latency") or {}
                 self._add_summary_row(
                     res["display_name"],
                     res["accuracy"],
                     lat.get("latency_mean_ms", 0.0),
                     lat.get("throughput_fps", 0.0),
                     res["ebops"],
-                    res["model_size_mb"],
+                    res.get("theoretical_size_mb", res["model_size_mb"]),
+                    onnx_size_mb=res.get("onnx_size_mb"),
+                    onnx_latency_ms=onnx_lat.get("latency_mean_ms"),
+                    onnx_throughput_fps=onnx_lat.get("throughput_fps"),
                 )
                 self.report_lines.append(
                     f"[Phase 1c] {res['display_name']}: "
@@ -735,12 +858,40 @@ class NeuroQuantPipeline:
 
         from quantization.qat import QATTrainer
 
+        # Production W+A QAT: hand the trainer the FP32 baseline as a
+        # KD teacher and the calibration loader for activation observer
+        # initialisation. Wave-2 contract:
+        #   - BN is folded into the preceding Conv inside ``prepare_model``.
+        #   - Activations are observed once on calib data, then frozen
+        #     at the deployment-time INT8 (or ``qat_act_bitwidth``) scale.
+        #   - Weights are fake-quantized via an autograd-aware
+        #     parametrization so STE clipping actually fires.
         qat_model = copy.deepcopy(self.adaround_result["model"])
-        qat_trainer = QATTrainer(qat_model, self.best_config, self.config)
+        teacher = copy.deepcopy(self.model)  # untouched FP32 baseline
+        qat_trainer = QATTrainer(
+            qat_model,
+            self.best_config,
+            self.config,
+            teacher=teacher,
+            calib_loader=self.calib_loader,
+        )
         self.qat_result = qat_trainer.train(self.train_loader, self.val_loader)
+
+        # Headline accuracy for QAT comes from ``test_loader`` — the
+        # final QAT model is evaluated against the public test split
+        # exactly once, here, after the best-epoch weights have been
+        # restored. ``final_val_acc`` (used to drive early stopping)
+        # remains in the result for diagnostics.
+        qat_test_top1 = self._evaluate_top1(
+            self.qat_result.get("model"), self.test_loader,
+        )
+        if qat_test_top1 is not None:
+            self.qat_result["test_top1"] = float(qat_test_top1)
+            self.results["qat_test_top1"] = float(qat_test_top1)
 
         self.tracker.log_metrics({
             "qat_final_acc": self.qat_result["final_val_acc"],
+            "qat_test_top1": qat_test_top1 if qat_test_top1 is not None else 0.0,
             "qat_epochs": len(self.qat_result["val_accuracy"]),
         })
         ws_src = self.results.get("qat_warmstart_source") or "ptq_best_acc"
@@ -751,10 +902,17 @@ class NeuroQuantPipeline:
         })
         self.tracker.end_run()
 
-        self.report_lines.append(
-            f"[Phase 1e] QAT: final_acc={self.qat_result['final_val_acc']:.2f}% "
-            f"(warmstart={ws_src}={ws_id})"
-        )
+        if qat_test_top1 is not None:
+            self.report_lines.append(
+                f"[Phase 1e] QAT: test_top1={qat_test_top1:.2f}%, "
+                f"val_top1={self.qat_result['final_val_acc']:.2f}% "
+                f"(warmstart={ws_src}={ws_id})"
+            )
+        else:
+            self.report_lines.append(
+                f"[Phase 1e] QAT: val_top1={self.qat_result['final_val_acc']:.2f}% "
+                f"(warmstart={ws_src}={ws_id})"
+            )
         self.results["qat_acc"] = self.qat_result["final_val_acc"]
 
         # Checkpoint: save the fine-tuned QAT model and the metric history.
@@ -763,6 +921,7 @@ class NeuroQuantPipeline:
         # post-mortem analysis can answer "which PTQ was QAT trained on?".
         qat_meta = {
             "final_val_acc": self.qat_result.get("final_val_acc", 0.0),
+            "test_top1": self.qat_result.get("test_top1"),
             "best_epoch": self.qat_result.get("best_epoch", 0),
             "train_accuracy": self.qat_result.get("train_accuracy", []),
             "val_accuracy": self.qat_result.get("val_accuracy", []),
@@ -794,6 +953,7 @@ class NeuroQuantPipeline:
         from quantization.gptq import GPTQQuantizer
         from quantization.awq import AWQQuantizer
         from quantization.smoothquant import SmoothQuantQuantizer
+        from quantization.smoothquant_gptq import SmoothQuantGPTQQuantizer
 
         hp = self.config.hyperparams
         methods_enabled = {m.value.lower() for m in self.config.methods}
@@ -808,12 +968,27 @@ class NeuroQuantPipeline:
             ("awq",  "AWQ",  8, AWQQuantizer),
             ("smoothquant", "SmoothQuant", 8, SmoothQuantQuantizer),
             ("smoothquant", "SmoothQuant", 4, SmoothQuantQuantizer),
+            # F4: combined two-stage (SmoothQuant migration → GPTQ).
+            # Strict-Pareto improvement over either method alone in
+            # almost every configuration we have measured.
+            ("smoothquant_gptq", "SmoothQuantGPTQ", 8, SmoothQuantGPTQQuantizer),
+            ("smoothquant_gptq", "SmoothQuantGPTQ", 4, SmoothQuantGPTQQuantizer),
         ]
 
         produced_models: Dict[str, nn.Module] = {}
         produced_models_by_id: Dict[str, nn.Module] = {}
         new_results: List[Dict[str, Any]] = []
         from utils.common import compute_quantized_size_mb
+
+        onnx_enabled = bool(getattr(hp, "onnx_export_enabled", True))
+        onnx_dir = self.output_dir / "onnx"
+        if onnx_enabled:
+            from utils.onnx_export import (
+                export_quantize_and_benchmark, is_onnx_available,
+            )
+            if not is_onnx_available():
+                onnx_enabled = False
+                logger.info("  ONNX export disabled (onnxruntime unavailable).")
 
         for i, (key, label, bw, cls) in enumerate(plan, 1):
             if methods_enabled and key not in methods_enabled:
@@ -826,49 +1001,124 @@ class NeuroQuantPipeline:
                     num_batches=hp.calibration_batches,
                 )
                 res = quantizer.evaluate(q_model, self.val_loader, bitwidth=bw)
-                # Canonical, bitwidth-tagged identity. ``display_name``
-                # is the public label used everywhere (summary table,
-                # Pareto plot, XAI rows). It deliberately does NOT
-                # double-prefix with the method family.
                 res["config_id"] = f"{label}_INT{bw}"
                 res["display_name"] = f"{label}_INT{bw}"
                 res["bitwidth"] = int(bw)
-                # Real model size from the bitwidth assignment; the
-                # quantizer may not have populated this consistently.
+                # Synthetic (theoretical) size from the bitwidth
+                # assignment is preserved as a diagnostic; the public
+                # ``model_size_mb`` is overwritten with the on-disk
+                # ``.onnx`` file size below when ONNX export succeeds.
                 bw_assignment = res.get("bitwidth_assignment", {}) or {
                     n: bw for n, _ in self.model.named_parameters()
                     if "weight" in n
                 }
                 res["bitwidth_assignment"] = bw_assignment
-                res["model_size_mb"] = compute_quantized_size_mb(
+                theoretical_mb = compute_quantized_size_mb(
                     self.model, bw_assignment,
                 )
+                res["theoretical_size_mb"] = theoretical_mb
+                res["model_size_mb"] = theoretical_mb
+
+                # ── J1 + J2 + J3: real ONNX export, on-disk size, ORT latency ──
+                if onnx_enabled:
+                    try:
+                        info = export_quantize_and_benchmark(
+                            q_model,
+                            self.config.input_shape,
+                            str(onnx_dir),
+                            name=f"{res['display_name']}",
+                            calibration_loader=self.calib_loader,
+                            num_batches=min(8, hp.calibration_batches),
+                            do_int8=(bw <= 8),
+                            batch_size=hp.latency_batch_size,
+                            warmup_runs=hp.latency_warmup_runs,
+                            measure_runs=hp.latency_measure_runs,
+                        )
+                        if info.get("int8_onnx_size_mb") is not None:
+                            res["onnx_size_mb"] = info["int8_onnx_size_mb"]
+                            res["onnx_path"] = info["int8_onnx_path"]
+                            res["model_size_mb"] = info["int8_onnx_size_mb"]
+                        elif info.get("fp32_onnx_size_mb") is not None:
+                            res["onnx_size_mb"] = info["fp32_onnx_size_mb"]
+                            res["onnx_path"] = info["fp32_onnx_path"]
+                            res["model_size_mb"] = info["fp32_onnx_size_mb"]
+                        if info.get("onnx_latency"):
+                            res["onnx_latency"] = info["onnx_latency"]
+                            res["latency_ms"] = info["onnx_latency"]["latency_mean_ms"]
+                            res["latency"] = info["onnx_latency"]
+                    except Exception as exc:
+                        logger.debug(
+                            "    %s ONNX export failed: %s",
+                            res["display_name"], exc,
+                        )
+
+                self._attach_split_metrics(res, q_model)
                 self.method_results.append(res)
                 new_results.append(res)
                 produced_models.setdefault(key, q_model)
                 produced_models_by_id[res["display_name"]] = q_model
-                logger.info("    %s INT%d: acc=%.2f%%", label, bw, res["accuracy"])
+                logger.info(
+                    "    %s INT%d: test_top1=%.2f%%, val_top1=%.2f%%",
+                    label, bw,
+                    float(res.get("test_top1") or res.get("accuracy", 0.0)),
+                    float(res.get("val_top1") or 0.0),
+                )
             except Exception as e:
                 logger.warning("    %s INT%d FAILED: %s", label, bw, e)
 
         # Log results to MLflow with bitwidth-tagged keys; Top-5 is NOT
-        # surfaced (kept internal only).
+        # surfaced (kept internal only). Wave 5 I1+I2: when an ONNX
+        # artefact exists for the method, log the on-disk size, ORT
+        # latency stats, and ORT throughput as public metrics, and
+        # attach the .onnx file to the run as an artifact so MLflow's
+        # Compare Runs view shows the actual deployable model alongside
+        # its accuracy/size numbers.
         for res in new_results:
             tag = res["display_name"]
-            self.tracker.log_metrics({
+            metrics: Dict[str, float] = {
                 f"{tag}_top1": res["accuracy"],
                 f"{tag}_ebops": res["ebops"],
                 f"{tag}_size_mb": res["model_size_mb"],
                 f"{tag}_latency_ms": res.get("latency_ms", 0) or 0,
-            })
+            }
+            theo = res.get("theoretical_size_mb")
+            if theo is not None:
+                metrics[f"{tag}_theoretical_size_mb"] = float(theo)
+            onnx_lat_full = res.get("onnx_latency") or {}
+            if res.get("onnx_size_mb") is not None:
+                metrics[f"{tag}_onnx_size_mb"] = float(res["onnx_size_mb"])
+            if onnx_lat_full:
+                metrics[f"{tag}_onnx_latency_mean_ms"] = float(
+                    onnx_lat_full.get("latency_mean_ms", 0.0)
+                )
+                metrics[f"{tag}_onnx_latency_p50_ms"] = float(
+                    onnx_lat_full.get("latency_p50_ms", 0.0)
+                )
+                metrics[f"{tag}_onnx_latency_p95_ms"] = float(
+                    onnx_lat_full.get("latency_p95_ms", 0.0)
+                )
+                metrics[f"{tag}_onnx_throughput_fps"] = float(
+                    onnx_lat_full.get("throughput_fps", 0.0)
+                )
+            self.tracker.log_metrics(metrics)
+
+            # Attach the deployable ONNX file to the MLflow run.
+            onnx_path = res.get("onnx_path")
+            if onnx_path:
+                self.tracker.log_artifact(str(onnx_path), "onnx")
+
             lat = res.get("latency") or {}
+            onnx_lat = res.get("onnx_latency") or {}
             self._add_summary_row(
                 res["display_name"],
                 res["accuracy"],
                 lat.get("latency_mean_ms", 0) or 0.0,
                 lat.get("throughput_fps", 0) or 0.0,
                 res["ebops"],
-                res["model_size_mb"],
+                res.get("theoretical_size_mb", res["model_size_mb"]),
+                onnx_size_mb=res.get("onnx_size_mb"),
+                onnx_latency_ms=onnx_lat.get("latency_mean_ms"),
+                onnx_throughput_fps=onnx_lat.get("throughput_fps"),
             )
         self.tracker.end_run()
 
@@ -895,22 +1145,48 @@ class NeuroQuantPipeline:
             self.results["awq_model"] = produced_models["awq"]
         if "smoothquant" in produced_models:
             self.results["sq_model"] = produced_models["smoothquant"]
+        if "smoothquant_gptq" in produced_models:
+            self.results["sq_gptq_model"] = produced_models["smoothquant_gptq"]
 
         # Checkpoint: persist each family's representative so phase 3 can
         # resume without re-running quantization, and the method results
-        # so phase 2 can merge solutions on resume.
+        # so phase 2 can merge solutions on resume. AWQ + SmoothQuant
+        # + SmoothQuant→GPTQ all carry input-scale wrappers, so the
+        # safe-module path (state_dict + JSON manifest) is used; loads
+        # run under ``weights_only=True`` and never execute pickle.
         if "gptq" in produced_models:
             self.ckpt.save_named_model("phase_1f_gptq_model.pth",
                                        produced_models["gptq"])
         if "awq" in produced_models:
-            self.ckpt.save_named_model("phase_1f_awq_model.pth",
-                                       produced_models["awq"])
+            from quantization.awq import serialize_awq_metadata
+            awq_meta = serialize_awq_metadata(produced_models["awq"])
+            self.ckpt.save_safe_module(
+                "phase_1f_awq_model.pt",
+                produced_models["awq"], metadata=awq_meta,
+            )
         if "smoothquant" in produced_models:
-            # SmoothQuant inserts architectural wrappers (_SmoothInputScale)
-            # per layer; a state-dict-only save would drop them on reload,
-            # so pickle the full module instead.
-            self.ckpt.save_full_module("phase_1f_sq_model.pt",
-                                       produced_models["smoothquant"])
+            from quantization.smoothquant import (
+                serialize_smoothquant_metadata,
+            )
+            sq_meta = serialize_smoothquant_metadata(
+                produced_models["smoothquant"],
+            )
+            self.ckpt.save_safe_module(
+                "phase_1f_sq_model.pt",
+                produced_models["smoothquant"],
+                metadata=sq_meta,
+            )
+        if "smoothquant_gptq" in produced_models:
+            from quantization.smoothquant import (
+                serialize_smoothquant_metadata,
+            )
+            sg_meta = serialize_smoothquant_metadata(
+                produced_models["smoothquant_gptq"],
+            )
+            self.ckpt.save_safe_module(
+                "phase_1f_sq_gptq_model.pt",
+                produced_models["smoothquant_gptq"], metadata=sg_meta,
+            )
         self.ckpt.save_phase_json("phase_1f_gptq_smooth_awq", {
             "method_results": self.method_results,
         })
@@ -1203,7 +1479,30 @@ class NeuroQuantPipeline:
                 "metrics", {}
             ).get("hypervolume", 0)
 
+        # ── Wave 5 I3: Pareto front comparison summary ──
+        # Aggregate the public method rows into the headline stats
+        # MLflow's "Compare Runs" view consumes — best/median/worst on
+        # every public objective. The same dict goes to disk as
+        # ``pareto_summary.json`` so a downstream consumer (paper plot
+        # generator, dashboard) does not have to re-walk the per-method
+        # results to reconstruct it.
+        pareto_summary = self._build_pareto_summary()
+        for k, v in pareto_summary.items():
+            if isinstance(v, (int, float)):
+                summary_metrics[f"pareto_{k}"] = float(v)
+
         self.tracker.log_metrics(summary_metrics)
+
+        # Persist the full summary (including non-scalar fields) as a
+        # JSON artefact so reviewers can read it without spinning up
+        # MLflow.
+        summary_path = self.output_dir / "pareto_summary.json"
+        try:
+            with open(summary_path, "w") as f:
+                json.dump(pareto_summary, f, indent=2, default=str)
+            self.tracker.log_artifact(str(summary_path), "reports")
+        except Exception as exc:
+            logger.warning("Pareto summary export failed: %s", exc)
 
         # Save config as artifact
         config_path = self.output_dir / "config_used.json"
@@ -1258,7 +1557,7 @@ class NeuroQuantPipeline:
 
         # Data loaders are not serialised; rebuild from config and grab
         # the dataset class-name list for downstream XAI captions.
-        (self.train_loader, self.val_loader,
+        (self.train_loader, self.search_loader, self.val_loader,
          self.test_loader, self.calib_loader,
          self.class_names) = build_data_loaders(self.config)
 
@@ -1268,17 +1567,22 @@ class NeuroQuantPipeline:
         self.fp32_ebops = float(data.get("fp32_ebops", 0.0))
         self.fp32_size_mb = float(data.get("fp32_size_mb", 0.0))
         self.fp32_latency = data.get("fp32_latency", {}) or {}
+        self.fp32_onnx = data.get("fp32_onnx", {}) or {}
 
         self.results["fp32_acc"] = self.fp32_acc
         self.results["fp32_top5"] = self.fp32_top5
 
         # Recreate the FP32 row in the summary table for the final report.
         # Top-1 only on the public surface.
+        fp32_onnx_lat = (self.fp32_onnx.get("onnx_latency") or {})
         self._add_summary_row(
             "FP32", self.fp32_acc,
             self.fp32_latency.get("latency_mean_ms", 0.0),
             self.fp32_latency.get("throughput_fps", 0.0),
             self.fp32_ebops, self.fp32_size_mb,
+            onnx_size_mb=self.fp32_onnx.get("fp32_onnx_size_mb"),
+            onnx_latency_ms=fp32_onnx_lat.get("latency_mean_ms"),
+            onnx_throughput_fps=fp32_onnx_lat.get("throughput_fps"),
         )
 
     def _resume_phase_1a_hessian_clustering(self) -> None:
@@ -1324,13 +1628,18 @@ class NeuroQuantPipeline:
             if not res:
                 continue
             lat = res.get("latency") or {}
+            onnx_lat = res.get("onnx_latency") or {}
             self._add_summary_row(
                 res.get("display_name") or res.get("config_id", "PTQ"),
                 float(res.get("accuracy", 0.0)),
                 lat.get("latency_mean_ms", 0.0),
                 lat.get("throughput_fps", 0.0),
                 float(res.get("ebops", 0.0)),
-                float(res.get("model_size_mb", 0.0)),
+                float(res.get("theoretical_size_mb",
+                              res.get("model_size_mb", 0.0))),
+                onnx_size_mb=res.get("onnx_size_mb"),
+                onnx_latency_ms=onnx_lat.get("latency_mean_ms"),
+                onnx_throughput_fps=onnx_lat.get("throughput_fps"),
             )
 
     def _resume_phase_1d_adaround(self) -> None:
@@ -1413,23 +1722,56 @@ class NeuroQuantPipeline:
             return m
 
         gptq_model = _restore("gptq")
-        awq_model = _restore("awq")
         if gptq_model is not None:
             self.results["gptq_model"] = gptq_model
-        if awq_model is not None:
-            self.results["awq_model"] = awq_model
 
-        # SmoothQuant is pickled as a full module so its input-scaling
-        # wrappers survive resume. Fall back to the legacy state_dict path
-        # for checkpoints produced before that change.
+        # AWQ: production AWQ now ships with ``_AWQInputScale`` wrappers
+        # so it follows the same safe-module + manifest pattern as
+        # SmoothQuant. Fall back to the legacy state_dict path only for
+        # checkpoints predating the F2 audit.
+        if self.ckpt.file_exists("phase_1f_awq_model.pt"):
+            from quantization.awq import restore_awq_wrappers
+            awq_model = build_model(self.config)
+            self.ckpt.load_safe_module(
+                "phase_1f_awq_model.pt",
+                awq_model, rebuild=restore_awq_wrappers,
+            )
+            self.results["awq_model"] = awq_model.to(self.device)
+        else:
+            awq_model = _restore("awq")
+            if awq_model is not None:
+                self.results["awq_model"] = awq_model
+
+        # SmoothQuant: rebuild the FP32 architecture, replay the
+        # ``_SmoothInputScale`` wrappers from the JSON manifest captured at
+        # save time, then load the state_dict in safe (``weights_only=True``)
+        # mode. No pickle code path is exercised. Fall back to the legacy
+        # state_dict path only for checkpoints predating the security fix.
         if self.ckpt.file_exists("phase_1f_sq_model.pt"):
-            self.results["sq_model"] = self.ckpt.load_full_module(
-                "phase_1f_sq_model.pt"
-            ).to(self.device)
+            from quantization.smoothquant import restore_smoothquant_wrappers
+            sq_model = build_model(self.config)
+            self.ckpt.load_safe_module(
+                "phase_1f_sq_model.pt",
+                sq_model,
+                rebuild=restore_smoothquant_wrappers,
+            )
+            self.results["sq_model"] = sq_model.to(self.device)
         else:
             sq_model = _restore("sq")
             if sq_model is not None:
                 self.results["sq_model"] = sq_model
+
+        # Combined SmoothQuant→GPTQ (F4): same wrapper shape as
+        # SmoothQuant — restore via the same helper, no special-casing
+        # for the GPTQ rounding step (it's already in the state_dict).
+        if self.ckpt.file_exists("phase_1f_sq_gptq_model.pt"):
+            from quantization.smoothquant import restore_smoothquant_wrappers
+            sg_model = build_model(self.config)
+            self.ckpt.load_safe_module(
+                "phase_1f_sq_gptq_model.pt",
+                sg_model, rebuild=restore_smoothquant_wrappers,
+            )
+            self.results["sq_gptq_model"] = sg_model.to(self.device)
 
         # Rebuild the summary-table rows produced on the original run.
         # Use the canonical display_name (no METHOD_METHOD duplication)
@@ -1440,13 +1782,17 @@ class NeuroQuantPipeline:
                 res.get("display_name")
                 or res.get("config_id", res.get("method", "?"))
             )
+            onnx_lat = res.get("onnx_latency") or {}
             self._add_summary_row(
                 display,
                 res.get("accuracy", 0.0),
                 lat.get("latency_mean_ms", 0.0),
                 lat.get("throughput_fps", 0.0),
                 res.get("ebops", 0.0),
-                res.get("model_size_mb", 0.0),
+                res.get("theoretical_size_mb", res.get("model_size_mb", 0.0)),
+                onnx_size_mb=res.get("onnx_size_mb"),
+                onnx_latency_ms=onnx_lat.get("latency_mean_ms"),
+                onnx_throughput_fps=onnx_lat.get("throughput_fps"),
             )
 
     def _resume_phase_2_pareto(self) -> None:
@@ -1528,6 +1874,66 @@ class NeuroQuantPipeline:
     # Report & Utilities
     # ==================================================================
 
+    def _evaluate_top1(
+        self,
+        model: nn.Module,
+        loader: Optional[DataLoader],
+    ) -> Optional[float]:
+        """Compute Top-1 accuracy on ``loader`` if available, else None.
+
+        Cheap wrapper used by ``_attach_split_metrics`` to populate the
+        ``val_top1`` / ``test_top1`` / ``search_top1`` fields on every
+        method result. Keeping the call sites explicit makes it obvious
+        which loader produced which number, which is the whole point of
+        the A1/A2 split-isolation contract.
+        """
+        if loader is None or model is None:
+            return None
+        try:
+            return float(evaluate_model(model, loader, self.device)["top1"])
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning("  [eval] top-1 on loader failed: %s", exc)
+            return None
+
+    def _attach_split_metrics(
+        self,
+        result: Dict[str, Any],
+        model: nn.Module,
+    ) -> Dict[str, Any]:
+        """Populate ``val_top1`` + ``test_top1`` on a method result and
+        promote ``test_top1`` to the public ``accuracy`` field.
+
+        Always recomputes ``val_top1`` and ``test_top1`` from the model
+        directly so the headline is independent of whatever loader the
+        upstream evaluator happened to use (rerank uses ``search_loader``
+        for selection; phase 1f's ``BaseQuantizer.evaluate`` uses
+        ``val_loader``). After this call:
+
+        * ``result["search_top1"]`` — kept as set by the caller (or
+          ``None``); used internally for selection only.
+        * ``result["val_top1"]``    — diagnostic; QAT early-stop signal.
+        * ``result["test_top1"]``   — public headline.
+        * ``result["accuracy"]``    — alias of ``test_top1``.
+
+        If ``test_loader`` is unavailable (legacy resume), the function
+        leaves the prior ``accuracy`` value untouched and writes only
+        the val number — strictly better than nothing on those paths.
+        """
+        val_top1 = self._evaluate_top1(model, self.val_loader)
+        if val_top1 is not None:
+            result["val_top1"] = val_top1
+
+        test_top1 = self._evaluate_top1(model, self.test_loader)
+        if test_top1 is not None:
+            result["test_top1"] = test_top1
+            # Public contract: the headline accuracy is the test-set
+            # Top-1. Never overwrite with val/search.
+            result["accuracy"] = test_top1
+        elif val_top1 is not None and "accuracy" not in result:
+            # Last-resort fallback: no test loader → val becomes headline.
+            result["accuracy"] = val_top1
+        return result
+
     @staticmethod
     def _select_rerank_candidates(
         nsga_solutions: List[Dict[str, Any]],
@@ -1580,6 +1986,11 @@ class NeuroQuantPipeline:
         from quantization.ptq import PTQQuantizer
         from utils.common import compute_quantized_size_mb
 
+        # Selection loader for the rerank decision (NSGA-fitness slice).
+        # The public ``test_loader`` is *not* read here so it stays
+        # untouched until the headline-evaluation pass below.
+        select_loader = self.search_loader or self.val_loader
+
         materialized: List[Dict[str, Any]] = []
         models: List[nn.Module] = []
         for cand in candidates:
@@ -1596,7 +2007,12 @@ class NeuroQuantPipeline:
             )
             q_model = ptq.quantize_with_config(assignment)
             dom_bw = self._dominant_bitwidth(assignment)
-            res = ptq.evaluate(q_model, self.val_loader, bitwidth=dom_bw)
+            # Evaluate on the SEARCH slice to drive the selection. The
+            # value lands in ``search_top1``; the public ``accuracy``
+            # field is overwritten with the test number after a winner
+            # is picked.
+            res = ptq.evaluate(q_model, select_loader, bitwidth=dom_bw)
+            res["search_top1"] = float(res.get("accuracy", 0.0))
 
             # Mixed assignments get an explicit "MIXED" tag so they can
             # be distinguished from the uniform-INT8/INT4 picks in the
@@ -1612,26 +2028,27 @@ class NeuroQuantPipeline:
             materialized.append(res)
             models.append(q_model)
             logger.info(
-                "  PTQ rerank candidate %s: acc=%.2f%%, size=%.2f MiB",
-                display, float(res["accuracy"]), float(res["model_size_mb"]),
+                "  PTQ rerank candidate %s: search_top1=%.2f%%, size=%.2f MiB",
+                display, float(res["search_top1"]),
+                float(res["model_size_mb"]),
             )
 
         if not materialized:
             return None, None, None, None
 
-        # Best by REAL Top-1.
+        # Best by SEARCH Top-1 (held-out, not val/test).
         best_acc_idx = max(
             range(len(materialized)),
-            key=lambda i: float(materialized[i]["accuracy"]),
+            key=lambda i: float(materialized[i]["search_top1"]),
         )
 
         # Tradeoff: most compressed among those within the accuracy cap;
         # fallback to smallest size overall when none satisfies the cap.
         cap = float(getattr(hp, "ptq_tradeoff_max_acc_drop", 1.0))
-        ref_acc = float(materialized[best_acc_idx]["accuracy"])
+        ref_acc = float(materialized[best_acc_idx]["search_top1"])
         within_cap = [
             i for i, r in enumerate(materialized)
-            if (ref_acc - float(r["accuracy"])) <= cap
+            if (ref_acc - float(r["search_top1"])) <= cap
         ]
         if within_cap:
             best_tradeoff_idx = min(
@@ -1646,17 +2063,13 @@ class NeuroQuantPipeline:
 
         # Disambiguate display names when best_acc and best_tradeoff
         # land on the same config (the mixed/INT8 tag would collide).
-        if best_acc_idx == best_tradeoff_idx:
-            return (
-                models[best_acc_idx], materialized[best_acc_idx],
-                models[best_tradeoff_idx], materialized[best_tradeoff_idx],
-            )
+        same_pick = (best_acc_idx == best_tradeoff_idx)
 
-        # When tags collide but configs differ, append a discriminator.
-        if (
+        if not same_pick and (
             materialized[best_acc_idx]["display_name"]
             == materialized[best_tradeoff_idx]["display_name"]
         ):
+            # When tags collide but configs differ, append a discriminator.
             tradeoff_dom = self._dominant_bitwidth(
                 materialized[best_tradeoff_idx]["bitwidth_assignment"]
             )
@@ -1668,6 +2081,19 @@ class NeuroQuantPipeline:
             new_name = f"PTQ_{tradeoff_tag}_tradeoff"
             materialized[best_tradeoff_idx]["display_name"] = new_name
             materialized[best_tradeoff_idx]["config_id"] = new_name
+
+        # Promote the winners' headline accuracy to the test-set Top-1
+        # via ``_attach_split_metrics``. ``search_top1`` is preserved on
+        # the result (used internally) and ``val_top1`` is filled from
+        # the val_loader. The public ``accuracy`` field becomes the
+        # test number — that is the deployment headline.
+        self._attach_split_metrics(
+            materialized[best_acc_idx], models[best_acc_idx],
+        )
+        if not same_pick:
+            self._attach_split_metrics(
+                materialized[best_tradeoff_idx], models[best_tradeoff_idx],
+            )
 
         return (
             models[best_acc_idx], materialized[best_acc_idx],
@@ -1737,6 +2163,10 @@ class NeuroQuantPipeline:
         self, method: str, top1: float,
         latency_ms: float, throughput: float,
         ebops: float, size_mb: float,
+        *,
+        onnx_size_mb: Optional[float] = None,
+        onnx_latency_ms: Optional[float] = None,
+        onnx_throughput_fps: Optional[float] = None,
     ) -> None:
         """Add or update a row in the public summary table.
 
@@ -1750,6 +2180,14 @@ class NeuroQuantPipeline:
         Top-5 is intentionally NOT a column on the public report — only
         Top-1 is surfaced. Top-5 may still be computed internally but is
         excluded from the user-facing result contract.
+
+        Wave 5 G1 additions: when ``onnx_*`` fields are supplied (typical
+        for any quantized method after Wave 4 wired ONNX export into
+        phase 1f), they are stored on the row so the public table can
+        show real on-disk size and ORT latency next to the synthetic
+        ``size_mb`` and PyTorch ``latency_ms`` numbers. Rows without
+        ONNX numbers (e.g. FP32 baseline before ONNX export ran)
+        leave those fields ``None``; the printer falls back to "-".
         """
         if not hasattr(self, '_summary_rows'):
             self._summary_rows = []
@@ -1757,6 +2195,9 @@ class NeuroQuantPipeline:
             "method": method, "top1": top1,
             "latency_ms": latency_ms, "throughput": throughput,
             "ebops": ebops, "size_mb": size_mb,
+            "onnx_size_mb": onnx_size_mb,
+            "onnx_latency_ms": onnx_latency_ms,
+            "onnx_throughput_fps": onnx_throughput_fps,
         }
         for i, existing in enumerate(self._summary_rows):
             if existing.get("method") == method:
@@ -1784,21 +2225,54 @@ class NeuroQuantPipeline:
 
         # Public summary table — Top-1 only, Size(MiB) is a first-class
         # column so the accuracy/size/EBops trade-off is visible.
+        # Wave 5 G1: when any row has ONNX numbers, three deployment
+        # columns ``ONNX MiB``, ``ORT(ms)``, ``ORT FPS`` are appended
+        # to the table. Rows without ONNX numbers print "-" so the
+        # table stays rectangular even when ONNX is disabled.
         rows = getattr(self, '_summary_rows', [])
         if rows:
+            has_onnx = any(
+                r.get("onnx_size_mb") is not None
+                or r.get("onnx_latency_ms") is not None
+                for r in rows
+            )
             print()
-            hdr = (
+            base_hdr = (
                 f"  {'Method':<22} {'Top-1':>7} {'Lat(ms)':>9} "
                 f"{'FPS':>9} {'EBops':>12} {'Size(MiB)':>10}"
             )
+            if has_onnx:
+                hdr = (
+                    base_hdr
+                    + f" {'ONNX MiB':>9} {'ORT(ms)':>8} {'ORT FPS':>9}"
+                )
+            else:
+                hdr = base_hdr
             print(hdr)
             print("  " + "-" * (len(hdr) - 2))
             for r in rows:
-                print(
+                base_line = (
                     f"  {r['method']:<22} {r['top1']:>6.2f}% "
                     f"{r['latency_ms']:>8.2f} {r['throughput']:>8.1f} "
                     f"{r['ebops']:>12.0f} {r['size_mb']:>9.2f}"
                 )
+                if has_onnx:
+                    onnx_size = r.get("onnx_size_mb")
+                    onnx_lat = r.get("onnx_latency_ms")
+                    onnx_fps = r.get("onnx_throughput_fps")
+                    base_line += (
+                        f" {self._fmt_or_dash(onnx_size, '>9.2f')}"
+                        f" {self._fmt_or_dash(onnx_lat, '>8.2f')}"
+                        f" {self._fmt_or_dash(onnx_fps, '>9.1f')}"
+                    )
+                print(base_line)
+
+            # ── G4: deployment fidelity section ──
+            # Spell out theoretical vs on-disk size and PyTorch vs ORT
+            # latency so the report makes deployment-equivalence claims
+            # explicit. Only printed when ONNX export actually produced
+            # numbers; degraded gracefully otherwise.
+            self._print_deployment_fidelity_section(rows)
 
         # Hardware metrics
         hw = getattr(self, 'hardware_metrics', {})
@@ -1818,6 +2292,213 @@ class NeuroQuantPipeline:
             status = f"INCOMPLETE ({self.phases_passed}/{phases_total})"
         print(f"  Status: {status}")
         print("=" * 90)
+
+    def _build_pareto_summary(self) -> Dict[str, Any]:
+        """Build the public Pareto comparison dict for I3.
+
+        Aggregates the headline metrics across every public method row
+        into best / median / worst statistics. Numeric fields end up
+        prefixed with ``pareto_`` in MLflow; the full dict (including
+        the per-method breakdown) is also written to
+        ``pareto_summary.json`` for downstream consumers.
+
+        The summary is built from ``self._summary_rows`` rather than
+        ``self.method_results`` so it always matches the public report
+        table — same row inclusion rules, same numbers.
+        """
+        rows = list(getattr(self, "_summary_rows", []))
+        # Drop the FP32 baseline row from the per-method aggregation —
+        # it's the comparator, not a competitor.
+        method_rows = [r for r in rows if r.get("method") != "FP32"]
+        fp32_row = next(
+            (r for r in rows if r.get("method") == "FP32"), {},
+        )
+
+        def _stats(values: List[float]) -> Dict[str, float]:
+            if not values:
+                return {}
+            sorted_v = sorted(values)
+            return {
+                "best": min(sorted_v),
+                "median": sorted_v[len(sorted_v) // 2],
+                "worst": max(sorted_v),
+            }
+
+        # Top-1 stats are best=max not min; handle separately.
+        top1_vals = [float(r["top1"]) for r in method_rows if r.get("top1") is not None]
+        top1_stats: Dict[str, float] = {}
+        if top1_vals:
+            sorted_top1 = sorted(top1_vals, reverse=True)
+            top1_stats = {
+                "best": sorted_top1[0],
+                "median": sorted_top1[len(sorted_top1) // 2],
+                "worst": sorted_top1[-1],
+            }
+
+        size_stats = _stats(
+            [float(r["size_mb"]) for r in method_rows if r.get("size_mb") is not None]
+        )
+        onnx_size_stats = _stats(
+            [float(r["onnx_size_mb"]) for r in method_rows
+             if r.get("onnx_size_mb") is not None]
+        )
+        onnx_lat_stats = _stats(
+            [float(r["onnx_latency_ms"]) for r in method_rows
+             if r.get("onnx_latency_ms") is not None]
+        )
+
+        summary: Dict[str, Any] = {
+            "model_name": self.config.model_name,
+            "fp32_top1": float(self.fp32_acc),
+            "fp32_size_mb": float(self.fp32_size_mb),
+            "n_methods": len(method_rows),
+        }
+        if fp32_row.get("onnx_size_mb") is not None:
+            summary["fp32_onnx_size_mb"] = float(fp32_row["onnx_size_mb"])
+        if fp32_row.get("onnx_latency_ms") is not None:
+            summary["fp32_onnx_latency_ms"] = float(fp32_row["onnx_latency_ms"])
+
+        for prefix, stats in [
+            ("top1", top1_stats),
+            ("size_mb", size_stats),
+            ("onnx_size_mb", onnx_size_stats),
+            ("onnx_latency_ms", onnx_lat_stats),
+        ]:
+            for key, val in stats.items():
+                summary[f"{prefix}_{key}"] = val
+
+        # Full breakdown so the JSON is self-contained — not flattened
+        # into MLflow metrics, but available for downstream tooling.
+        summary["methods"] = [
+            {
+                "method": r["method"],
+                "top1": r.get("top1"),
+                "size_mb": r.get("size_mb"),
+                "onnx_size_mb": r.get("onnx_size_mb"),
+                "onnx_latency_ms": r.get("onnx_latency_ms"),
+                "onnx_throughput_fps": r.get("onnx_throughput_fps"),
+                "ebops": r.get("ebops"),
+            }
+            for r in method_rows
+        ]
+        if self.pareto_analysis:
+            summary["hypervolume"] = float(
+                self.pareto_analysis.get("metrics", {}).get("hypervolume", 0.0)
+            )
+            summary["spacing"] = float(
+                self.pareto_analysis.get("metrics", {}).get("spacing", 0.0)
+            )
+            summary["plot_paths"] = self.pareto_analysis.get("plot_paths", {})
+
+        return summary
+
+    @staticmethod
+    def _fmt_or_dash(value: Optional[float], fmt: str) -> str:
+        """Format ``value`` with ``fmt`` or return a right-aligned ``"-"``.
+
+        Used by the public report so missing ONNX columns don't break
+        the rectangular layout. ``fmt`` is the trailing portion of an
+        f-string spec (e.g. ``">9.2f"``); when ``value`` is ``None`` we
+        render a dash padded to the same width derived from the spec.
+        """
+        if value is None:
+            try:
+                width = int(fmt.lstrip("<>=").split(".")[0])
+            except Exception:
+                width = 8
+            return f"{'-':>{width}}"
+        return f"{value:{fmt}}"
+
+    def _print_deployment_fidelity_section(
+        self,
+        rows: List[Dict[str, Any]],
+    ) -> None:
+        """Public ONNX deployment-fidelity summary (Wave 5 G4).
+
+        Surfaces three things the user always asks first:
+
+          * "How big is the model when I actually deploy it?" — average
+            ratio of on-disk INT8 ``.onnx`` size to the synthetic
+            ``size_mb`` (closer to 1.0 means the synthetic estimate
+            tracked reality; ratios below 1.0 indicate compiler-level
+            packing the synthetic count missed).
+          * "How fast is it under ONNX Runtime?" — median ORT latency
+            across quantized methods, plus speedup vs the FP32 ONNX
+            baseline.
+          * "Where does each method land?" — a per-method delta line so
+            the table-skim user can see immediately which methods
+            actually improved deployment metrics.
+
+        Only printed when ONNX numbers are present on at least one
+        method row; otherwise this section is silent so reports without
+        ONNX (e.g. ``onnx_export_enabled=false``) stay clean.
+        """
+        quantized = [
+            r for r in rows
+            if r.get("method", "") != "FP32"
+            and r.get("onnx_size_mb") is not None
+        ]
+        if not quantized:
+            return
+
+        fp32_onnx = getattr(self, "fp32_onnx", {}) or {}
+        fp32_onnx_size = fp32_onnx.get("fp32_onnx_size_mb")
+        fp32_onnx_lat = (fp32_onnx.get("onnx_latency") or {}).get(
+            "latency_mean_ms"
+        )
+
+        size_ratios = [
+            float(r["onnx_size_mb"]) / float(r["size_mb"])
+            for r in quantized
+            if r.get("size_mb")
+        ]
+        latencies = [
+            float(r["onnx_latency_ms"]) for r in quantized
+            if r.get("onnx_latency_ms") is not None
+        ]
+
+        print()
+        print("  ONNX deployment fidelity:")
+        if fp32_onnx_size is not None:
+            print(f"    FP32 ONNX size on disk:    {fp32_onnx_size:>8.2f} MiB")
+        if fp32_onnx_lat is not None:
+            print(f"    FP32 ORT mean latency:     {fp32_onnx_lat:>8.2f} ms")
+        if size_ratios:
+            mean_ratio = sum(size_ratios) / len(size_ratios)
+            print(
+                f"    Mean (on-disk / theoretical) size ratio: "
+                f"{mean_ratio:>5.2f}x  "
+                f"({len(size_ratios)} method"
+                f"{'' if len(size_ratios) == 1 else 's'})"
+            )
+        if latencies:
+            sorted_lat = sorted(latencies)
+            median = sorted_lat[len(sorted_lat) // 2]
+            line = f"    Median quantized ORT latency: {median:>5.2f} ms"
+            if fp32_onnx_lat:
+                speedup = fp32_onnx_lat / max(median, 1e-9)
+                line += f"  ({speedup:.2f}x vs FP32 ONNX)"
+            print(line)
+
+        # Per-method deltas — only if FP32 baseline ONNX numbers exist.
+        if fp32_onnx_size is not None or fp32_onnx_lat is not None:
+            print()
+            print("    Per-method ONNX deltas vs FP32 baseline:")
+            for r in quantized:
+                bits: List[str] = []
+                if fp32_onnx_size and r.get("onnx_size_mb") is not None:
+                    pct = (
+                        (1.0 - float(r["onnx_size_mb"]) / fp32_onnx_size)
+                        * 100.0
+                    )
+                    bits.append(f"size −{pct:>5.1f}%")
+                if fp32_onnx_lat and r.get("onnx_latency_ms") is not None:
+                    speed = fp32_onnx_lat / max(float(r["onnx_latency_ms"]), 1e-9)
+                    bits.append(f"ORT {speed:>4.2f}x")
+                if bits:
+                    print(
+                        f"      {r['method']:<22} " + ", ".join(bits)
+                    )
 
     @staticmethod
     def _resolve_device(device_str: str) -> torch.device:
@@ -1869,14 +2550,14 @@ Examples:
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
-        help="Random seed for reproducibility (default: 42).",
+        default=None,
+        help="Override random seed for reproducibility (default: from config).",
     )
     parser.add_argument(
         "--device",
         type=str,
-        default="auto",
-        help="Compute device: auto, cuda, cpu (default: auto).",
+        default=None,
+        help="Override compute device: auto, cuda, cpu, mps (default: from config).",
     )
     parser.add_argument(
         "--epochs",
@@ -1896,12 +2577,66 @@ Examples:
         default=False,
         help="Resume from checkpoints: skip phases that already completed.",
     )
+    parser.add_argument(
+        "--init",
+        action="store_true",
+        default=False,
+        help="Write the bundled default config.yaml to the current directory and exit.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Allow --init to overwrite an existing ./config.yaml.",
+    )
     return parser.parse_args()
+
+
+def _run_init_command(force: bool) -> int:
+    """Copy the bundled default config to ``./config.yaml`` and return an exit code.
+
+    Reads the template from ``quantization/_default_config.yaml`` via
+    ``importlib.resources`` so it works both from a source checkout and from
+    a wheel installed under ``site-packages``.
+    """
+
+    target = Path.cwd() / "config.yaml"
+    pre_existing = target.exists()
+    if pre_existing and not force:
+        print(
+            f"Refusing to overwrite existing {target}. "
+            "Re-run with `--init --force` to replace it.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        source_traversable = importlib_resources.files("quantization") / "_default_config.yaml"
+        with importlib_resources.as_file(source_traversable) as source_path:
+            shutil.copy(source_path, target)
+    except (FileNotFoundError, ModuleNotFoundError) as exc:
+        print(
+            f"Could not locate the bundled default config: {exc}. "
+            "Reinstall NeuroQuant or report this as a packaging bug.",
+            file=sys.stderr,
+        )
+        return 1
+
+    action = "Overwrote" if pre_existing else "Created"
+    print(f"{action} config.yaml in the current directory ({target}).")
+    print("Edit it to point at your model + dataset, then run `neuroquant --config config.yaml`.")
+    return 0
 
 
 def main() -> None:
     """Entry point for the NeuroQuant pipeline."""
     args = parse_args()
+
+    # ── --init: write the bundled default config and exit. ──────────────
+    if args.init:
+        sys.exit(_run_init_command(force=args.force))
+    if args.force:
+        print("`--force` has no effect without `--init`; ignoring.", file=sys.stderr)
 
     # Load configuration
     if args.config:
@@ -1920,9 +2655,9 @@ def main() -> None:
     # Override with CLI args
     if args.output_dir:
         config.output_dir = args.output_dir
-    if args.seed:
+    if args.seed is not None:
         config.hyperparams.seed = args.seed
-    if args.device:
+    if args.device is not None:
         config.hyperparams.device = args.device
     if args.phases:
         config.run_phases = args.phases

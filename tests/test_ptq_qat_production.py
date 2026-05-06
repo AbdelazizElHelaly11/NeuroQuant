@@ -327,13 +327,20 @@ def test_nsga_individual_to_config_only_quantizable():
 def _build_pipeline(cfg: QuantizationConfig):
     """Construct a NeuroQuantPipeline without running phase 0, then
     plug in a tiny model + loaders by hand. Avoids the torchvision /
-    dataset-download cost during unit tests."""
+    dataset-download cost during unit tests.
+
+    Provides search/val/test loaders separately so the production
+    contract (NSGA on search, QAT early-stop on val, headline on test)
+    is exercised end-to-end in the unit tests too.
+    """
     from main import NeuroQuantPipeline
 
     pipe = NeuroQuantPipeline(cfg, training_epochs=0, resume=False)
     pipe.model = _TinyNet(cfg.num_classes)
     pipe.calib_loader = _make_loader(classes=cfg.num_classes)
+    pipe.search_loader = _make_loader(classes=cfg.num_classes)
     pipe.val_loader = _make_loader(classes=cfg.num_classes)
+    pipe.test_loader = _make_loader(classes=cfg.num_classes)
     pipe.fp32_acc = 50.0  # placeholder; we don't measure absolute deltas
     pipe.fp32_ebops = sum(
         p.numel() * 32 for p in pipe.model.parameters()

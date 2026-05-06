@@ -40,6 +40,7 @@ from config import (
     ParetoSolution,
     QuantizationConfig,
 )
+from utils.numerics import EPS_GEOMETRIC
 
 logger = logging.getLogger("neuroquant")
 
@@ -170,7 +171,7 @@ class ParetoAnalyzer:
             total = max(int4_count + int8_count, 1)
 
             ebops = sol.get("ebops", 1.0)
-            compression_ratio = self.fp32_ebops / max(ebops, 1e-8)
+            compression_ratio = self.fp32_ebops / max(ebops, EPS_GEOMETRIC)
 
             ebops_reduction = sol.get("ebops_reduction", 0.0)
             if ebops_reduction == 0.0 and self.fp32_ebops > 0:
@@ -197,6 +198,9 @@ class ParetoAnalyzer:
                 "int8_count": int8_count,
                 "int4_percent": int4_count / total * 100,
                 "crowding_distance": sol.get("crowding_distance", 0.0),
+                # Wave 5: forward the third Pareto axis (ORT latency)
+                # so the 3-D plot can read it without an extra lookup.
+                "latency_mean_ms": sol.get("latency_mean_ms"),
             })
 
         return enriched
@@ -304,8 +308,8 @@ class ParetoAnalyzer:
         x2, y2 = best_ebops.get("accuracy_loss", 0), best_ebops.get("ebops", 0)
 
         # Normalise
-        x_range = max(abs(x2 - x1), 1e-8)
-        y_range = max(abs(y2 - y1), 1e-8)
+        x_range = max(abs(x2 - x1), EPS_GEOMETRIC)
+        y_range = max(abs(y2 - y1), EPS_GEOMETRIC)
 
         max_dist = -1.0
         knee = None
@@ -318,7 +322,7 @@ class ParetoAnalyzer:
 
             # Perpendicular distance from point to line
             line_len = math.sqrt(x2n ** 2 + y2n ** 2)
-            if line_len < 1e-8:
+            if line_len < EPS_GEOMETRIC:
                 continue
             dist = abs(x * y2n - y * x2n) / line_len
 
@@ -439,6 +443,21 @@ class ParetoAnalyzer:
             plot_paths["metrics_table"] = str(
                 viz.plot_metrics_table(out / "metrics_table.png")
             )
+            # Wave 5 G2: 3-objective Pareto when any solution carries an
+            # ORT latency. The plot helpers themselves no-op gracefully
+            # if no such solutions are present, so we always attempt the
+            # render and let the result speak for itself.
+            has_latency = any(
+                s.get("latency_mean_ms") is not None
+                for s in solution_metrics
+            )
+            if has_latency:
+                try:
+                    plot_paths["pareto_3d"] = str(
+                        viz.plot_3d_pareto(out / "pareto_3d.png")
+                    )
+                except Exception as exc:
+                    logger.warning("  3-D Pareto plot skipped: %s", exc)
 
             logger.info("  Plots saved to: %s", output_dir)
         elif output_dir and not HAS_MATPLOTLIB:
@@ -733,6 +752,83 @@ class ParetoVisualizer:
             loc="lower left", ncol=2,
             title="Method / Highlight",
         )
+
+        fig.tight_layout()
+        fig.savefig(output_path)
+        plt.close(fig)
+        logger.info("    Saved: %s", output_path.name)
+        return output_path
+
+    def plot_3d_pareto(self, output_path: Path) -> Path:
+        """3-objective Pareto scatter: accuracy vs size vs ORT latency.
+
+        Generated only when latency numbers are present on the
+        solutions (the hardware-aware search path or any method whose
+        ONNX latency was measured). The plot uses the same per-method
+        colour/marker palette as the 2-D plot so a reader can follow a
+        method across both views.
+
+        If matplotlib's 3D backend is unavailable we still write the
+        file (an empty axis with a clear message), so callers can
+        unconditionally check for ``output_path.exists()``.
+        """
+        from visualization.style import style_for, family_of
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 — registers 3D
+
+        self._setup_style()
+
+        public_solutions = [
+            s for s in self.solutions
+            if not str(s.get("solution_id", "")).startswith("nsga_")
+            and s.get("latency_mean_ms") is not None
+        ]
+
+        fig = plt.figure(figsize=(10, 7))
+        ax = fig.add_subplot(111, projection="3d")
+
+        if not public_solutions:
+            ax.text2D(
+                0.5, 0.5, "No latency-tagged Pareto solutions",
+                transform=ax.transAxes,
+                ha="center", va="center", fontsize=12,
+            )
+            fig.savefig(output_path)
+            plt.close(fig)
+            return output_path
+
+        plotted_families = set()
+        for s in public_solutions:
+            tag = s.get("solution_id", "")
+            fam = family_of(tag)
+            color, marker = style_for(tag)
+            comp = s.get("compression_ratio", 1.0) or 1.0
+            size = float(max(50, min(comp * 22, 240)))
+            label = fam if fam not in plotted_families else None
+            plotted_families.add(fam)
+            ax.scatter(
+                s["ebops_mb"],
+                float(s["latency_mean_ms"]),
+                s["accuracy"],
+                marker=marker, s=size, c=color,
+                edgecolors="white", linewidths=0.8,
+                alpha=0.9, label=label,
+            )
+
+        ax.set_xlabel("Model size (MiB)")
+        ax.set_ylabel("ORT latency (ms)")
+        ax.set_zlabel("Top-1 accuracy (%)")
+        ax.set_title(
+            f"3-objective Pareto — {self.model_name}\n"
+            f"{len(public_solutions)} method"
+            f"{'' if len(public_solutions) == 1 else 's'} · "
+            f"axes minimise size/latency, maximise accuracy",
+            pad=14,
+        )
+        ax.legend(loc="upper left", title="Method", fontsize=8)
+        try:
+            ax.view_init(elev=18, azim=-60)
+        except Exception:
+            pass
 
         fig.tight_layout()
         fig.savefig(output_path)

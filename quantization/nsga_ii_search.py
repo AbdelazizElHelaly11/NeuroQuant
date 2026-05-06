@@ -9,12 +9,21 @@ Key design decisions:
     - Only MEDIUM and LOW clusters are searchable (HIGH = fixed INT8)
     - Individuals encode bitwidths as binary genes (0=INT4, 1=INT8)
     - Fake quantization used for fast evaluation during search
-    - Proper NSGA-II: non-dominated sorting + crowding distance
+    - Proper NSGA-II: non-dominated sorting + crowding distance,
+      generalized to N objectives so the same code handles the 2-obj
+      ``[acc_loss, size]`` and 3-obj ``[acc_loss, size, latency]``
+      cases. The 3-objective mode is what wave J4 calls
+      "hardware-aware search" — pass a per-layer latency LUT and the
+      search will pick configurations that are also fast on the
+      deployment runtime, not just compressed.
     - Warm-started with FITCompress elite seed from Phase 1b
 
-Objectives (both minimised):
+Objectives (all minimised):
     1. Accuracy loss = FP32_accuracy - quantized_accuracy
     2. Model size (MiB) = sum(params x bitwidth) / 8 / (1024²)
+    3. Latency (ms) = Σ over all layers of LUT[param][bitwidth].
+       Present only when ``latency_lut`` is supplied at construction;
+       otherwise the search runs in 2-objective mode.
 """
 
 from __future__ import annotations
@@ -37,6 +46,7 @@ from config import (
     QuantizationConfig,
 )
 from utils.common import model_size_mb_from_bytes
+from utils.numerics import MIN_SCALE
 
 logger = logging.getLogger("neuroquant")
 
@@ -66,7 +76,7 @@ def _fake_quantize_tensor(tensor: torch.Tensor, bitwidth: int) -> torch.Tensor:
 
     qmax = 2 ** (bitwidth - 1) - 1
     scale = tensor.abs().max() / max(qmax, 1)
-    scale = max(scale.item(), 1e-8)
+    scale = max(scale.item(), MIN_SCALE)
 
     quantized = (tensor / scale).round().clamp(-qmax - 1, qmax)
     return quantized * scale
@@ -116,16 +126,36 @@ class NSGAIIClusterSearch:
         model: nn.Module,
         cluster_assignments: List[ClusterAssignment],
         config: QuantizationConfig,
+        *,
+        latency_lut: Optional[Dict[str, Dict[int, float]]] = None,
     ) -> None:
         """
         Args:
             model: FP32 baseline model (will be cloned for each evaluation).
             cluster_assignments: From Phase 1a LayerClusterer.create_clusters().
             config: Framework configuration (uses nsga_* hyperparameters).
+            latency_lut: Optional per-layer latency table built by
+                ``quantization.latency_lut.build_latency_lut`` — when
+                provided, the search adds a third objective
+                ``latency_ms`` so candidates that are equally accurate
+                and equally compressed are discriminated by their
+                deployment-runtime latency. If None, the search keeps
+                its original 2-objective behaviour and remains
+                backwards-compatible.
         """
         self.model = model
         self.config = config
         self.device = self._resolve_device(config.hyperparams.device)
+        self._latency_lut: Optional[Dict[str, Dict[int, float]]] = latency_lut
+        self._num_objectives: int = 3 if latency_lut else 2
+        # Cache the FP32 latency from the LUT (for ``latency_reduction``
+        # diagnostics on each Pareto solution).
+        self._fp32_latency_ms: float = 0.0
+        if latency_lut:
+            from quantization.latency_lut import latency_for_assignment
+            self._fp32_latency_ms = latency_for_assignment(
+                {pname: 32 for pname in latency_lut}, latency_lut,
+            )
 
         # Build the canonical set of TRULY quantizable parameters (the
         # weight tensors of Conv2d / Linear modules). Anything else
@@ -191,12 +221,16 @@ class NSGAIIClusterSearch:
 
         logger.info(
             "NSGA-II initialized: %d searchable clusters (%d genes), "
-            "%d fixed clusters (INT8), search space = 2^%d = %d",
+            "%d fixed clusters (INT8), search space = 2^%d = %d, "
+            "objectives = %d %s",
             self.num_genes,
             self.num_genes,
             len(self.fixed_clusters),
             self.num_genes,
             2 ** self.num_genes,
+            self._num_objectives,
+            "(acc_loss, size, latency)" if self._num_objectives == 3
+            else "(acc_loss, size)",
         )
 
     # ------------------------------------------------------------------
@@ -256,7 +290,7 @@ class NSGAIIClusterSearch:
         individual: List[int],
         val_loader: DataLoader,
         fp32_accuracy: float,
-    ) -> Tuple[float, float]:
+    ) -> Tuple[float, ...]:
         """
         Evaluate a single individual: fake-quantize model, measure metrics.
 
@@ -266,9 +300,16 @@ class NSGAIIClusterSearch:
             fp32_accuracy: Baseline FP32 accuracy (%).
 
         Returns:
-            (accuracy_loss, model_size_mb) — both to be minimised.
+            * 2-objective mode (no LUT): ``(accuracy_loss, model_size_mb)``
+            * 3-objective mode (with LUT):
+              ``(accuracy_loss, model_size_mb, latency_ms)``
+
+            All objectives are minimised. The number of values matches
+            ``self._num_objectives`` exactly so callers can write
+            objective-agnostic loops over the tuple.
         """
         config = self.individual_to_config(individual)
+        infinity = tuple([float("inf")] * self._num_objectives)
 
         try:
             # Clone and fake-quantize
@@ -284,16 +325,25 @@ class NSGAIIClusterSearch:
             ebops = self._compute_ebops_for_config(config)
             model_size_mb = model_size_mb_from_bytes(ebops)
 
-            # Clean up
+            # Clean up before the (potentially expensive) LUT lookup so
+            # we don't hold the cloned model in memory longer than
+            # necessary.
             del model_copy
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
+
+            if self._num_objectives == 3:
+                from quantization.latency_lut import latency_for_assignment
+                latency_ms = latency_for_assignment(
+                    config, self._latency_lut or {},
+                )
+                return accuracy_loss, model_size_mb, latency_ms
 
             return accuracy_loss, model_size_mb
 
         except Exception as e:
             logger.warning("Evaluation failed for individual: %s", e)
-            return float("inf"), float("inf")
+            return infinity
 
     def _evaluate_accuracy(
         self, model: nn.Module, data_loader: DataLoader
@@ -328,23 +378,31 @@ class NSGAIIClusterSearch:
 
     @staticmethod
     def _non_dominated_sort(
-        objectives: List[Tuple[float, float]],
+        objectives: List[Tuple[float, ...]],
     ) -> List[List[int]]:
         """
         Perform fast non-dominated sorting (Deb et al. 2002).
 
-        Both objectives are minimised: (accuracy_loss, model_size_mb).
+        All objectives are minimised. This function is dimension-agnostic:
+        each entry of ``objectives`` is an N-tuple, with the same N for
+        every entry (enforced by the caller — ``self._num_objectives``).
+        That lets the same routine drive both the 2-objective
+        ``(acc_loss, size)`` search and the 3-objective
+        ``(acc_loss, size, latency)`` hardware-aware search.
 
         Args:
-            objectives: List of (obj1, obj2) tuples.
+            objectives: List of N-tuples, one per individual. Smaller is
+                better in every dimension.
 
         Returns:
             List of fronts, where fronts[0] is the Pareto front (rank 1),
             fronts[1] is rank 2, etc. Each front is a list of indices.
         """
         n = len(objectives)
-        domination_count = [0] * n       # How many solutions dominate i
-        dominated_set: List[List[int]] = [[] for _ in range(n)]  # Solutions i dominates
+        if n == 0:
+            return []
+        domination_count = [0] * n
+        dominated_set: List[List[int]] = [[] for _ in range(n)]
 
         fronts: List[List[int]] = [[]]
 
@@ -352,31 +410,14 @@ class NSGAIIClusterSearch:
             for j in range(n):
                 if i == j:
                     continue
-                # i dominates j if i is <= in all objectives and < in at least one
-                i_leq_all = (
-                    objectives[i][0] <= objectives[j][0]
-                    and objectives[i][1] <= objectives[j][1]
-                )
-                i_lt_any = (
-                    objectives[i][0] < objectives[j][0]
-                    or objectives[i][1] < objectives[j][1]
-                )
-                if i_leq_all and i_lt_any:
+                if NSGAIIClusterSearch._dominates(objectives[i], objectives[j]):
                     dominated_set[i].append(j)
-                elif (
-                    objectives[j][0] <= objectives[i][0]
-                    and objectives[j][1] <= objectives[i][1]
-                    and (
-                        objectives[j][0] < objectives[i][0]
-                        or objectives[j][1] < objectives[i][1]
-                    )
-                ):
+                elif NSGAIIClusterSearch._dominates(objectives[j], objectives[i]):
                     domination_count[i] += 1
 
             if domination_count[i] == 0:
                 fronts[0].append(i)
 
-        # Build subsequent fronts
         current_front = 0
         while fronts[current_front]:
             next_front: List[int] = []
@@ -388,15 +429,34 @@ class NSGAIIClusterSearch:
             current_front += 1
             fronts.append(next_front)
 
-        # Remove the trailing empty front
         if not fronts[-1]:
             fronts.pop()
 
         return fronts
 
     @staticmethod
+    def _dominates(a: Tuple[float, ...], b: Tuple[float, ...]) -> bool:
+        """Return True iff ``a`` Pareto-dominates ``b`` for minimisation.
+
+        ``a`` dominates ``b`` ⇔ ``a[k] ≤ b[k]`` for every k AND
+        ``a[k] < b[k]`` for at least one k. Generalised to arbitrary N
+        so the same predicate works in 2- and 3-objective modes. Tuples
+        of different length are never compared — the caller guarantees
+        homogeneity.
+        """
+        leq_all = True
+        lt_any = False
+        for x, y in zip(a, b):
+            if x > y:
+                leq_all = False
+                break
+            if x < y:
+                lt_any = True
+        return leq_all and lt_any
+
+    @staticmethod
     def _crowding_distance(
-        objectives: List[Tuple[float, float]],
+        objectives: List[Tuple[float, ...]],
         front: List[int],
     ) -> Dict[int, float]:
         """
@@ -404,10 +464,12 @@ class NSGAIIClusterSearch:
 
         Boundary individuals get infinity. Interior individuals get
         the sum of normalised distances to their neighbours in each
-        objective dimension.
+        objective dimension. Generalised over N objectives — the only
+        change vs. the 2-objective version is that we iterate
+        ``range(num_obj)`` instead of hard-coding ``range(2)``.
 
         Args:
-            objectives: Full list of (obj1, obj2) tuples.
+            objectives: Full list of N-tuples.
             front: Indices of individuals in this front.
 
         Returns:
@@ -420,16 +482,16 @@ class NSGAIIClusterSearch:
                 distances[i] = float("inf")
             return distances
 
-        # For each objective dimension
-        for obj_dim in range(2):
-            # Sort front by this objective
+        if not objectives:
+            return distances
+        num_obj = len(objectives[front[0]])
+
+        for obj_dim in range(num_obj):
             sorted_front = sorted(front, key=lambda i: objectives[i][obj_dim])
 
-            # Boundary points get infinity
             distances[sorted_front[0]] = float("inf")
             distances[sorted_front[-1]] = float("inf")
 
-            # Range of this objective
             obj_range = (
                 objectives[sorted_front[-1]][obj_dim]
                 - objectives[sorted_front[0]][obj_dim]
@@ -437,7 +499,6 @@ class NSGAIIClusterSearch:
             if obj_range <= 0:
                 continue
 
-            # Interior points
             for k in range(1, len(sorted_front) - 1):
                 idx = sorted_front[k]
                 prev_val = objectives[sorted_front[k - 1]][obj_dim]
@@ -554,18 +615,21 @@ class NSGAIIClusterSearch:
         # ── Generation 0: Initialize population ──
         logger.info("Generation 0: Initializing population ...")
 
-        # Population: list of (individual, accuracy_loss, model_size_mb)
-        population: List[Tuple[List[int], float, float]] = []
+        # Population entries are ``(individual, objectives_tuple)`` where
+        # ``objectives_tuple`` has length ``self._num_objectives`` (2 or
+        # 3 depending on whether a latency LUT was supplied). Storing
+        # the tuple verbatim keeps the loop objective-agnostic.
+        population: List[Tuple[List[int], Tuple[float, ...]]] = []
 
         # Add elite seed
         elite_individual = self.config_to_individual(seed_config)
-        loss, size_mb = self.evaluate_individual(
-            elite_individual, val_loader, fp32_accuracy
+        elite_obj = self.evaluate_individual(
+            elite_individual, val_loader, fp32_accuracy,
         )
-        population.append((elite_individual, loss, size_mb))
+        population.append((elite_individual, elite_obj))
         logger.info(
-            "  Elite seed: acc_loss=%.2f%%, size=%.2f MiB",
-            loss, size_mb,
+            "  Elite seed: %s",
+            self._format_objectives(elite_obj),
         )
 
         # Fill with random individuals (avoid duplicates)
@@ -576,8 +640,8 @@ class NSGAIIClusterSearch:
             key = tuple(ind)
             if key not in seen:
                 seen.add(key)
-                l, e = self.evaluate_individual(ind, val_loader, fp32_accuracy)
-                population.append((ind, l, e))
+                obj = self.evaluate_individual(ind, val_loader, fp32_accuracy)
+                population.append((ind, obj))
             attempts += 1
 
         logger.info("  Population initialised: %d individuals", len(population))
@@ -591,8 +655,7 @@ class NSGAIIClusterSearch:
         for gen in range(1, max_gen + 1):
             final_gen = gen
 
-            # Extract objectives for sorting
-            objectives = [(ind[1], ind[2]) for ind in population]
+            objectives = [ind[1] for ind in population]
 
             # Non-dominated sort
             fronts = self._non_dominated_sort(objectives)
@@ -611,50 +674,43 @@ class NSGAIIClusterSearch:
             self._pareto_size_history.append(pareto_size)
 
             if gen % 5 == 0 or gen == 1:
-                # Log best solution on Pareto front
                 if fronts and fronts[0]:
                     best_idx = min(fronts[0], key=lambda i: objectives[i][0])
                     logger.info(
-                        "  Gen %d/%d: Pareto=%d, best_loss=%.2f%%, best_size=%.2f MiB",
+                        "  Gen %d/%d: Pareto=%d, best=%s",
                         gen, max_gen, pareto_size,
-                        objectives[best_idx][0], objectives[best_idx][1],
+                        self._format_objectives(objectives[best_idx]),
                     )
 
             # ── Create offspring ──
-            offspring: List[Tuple[List[int], float, float]] = []
+            offspring: List[Tuple[List[int], Tuple[float, ...]]] = []
             while len(offspring) < pop_size:
-                # Tournament selection
                 p1_idx = self._tournament_select(ranks, crowding)
                 p2_idx = self._tournament_select(ranks, crowding)
 
-                # Crossover
                 c1, c2 = self._crossover(
                     population[p1_idx][0], population[p2_idx][0], cx_prob
                 )
-
-                # Mutation
                 c1 = self._mutate(c1, mut_prob)
                 c2 = self._mutate(c2, mut_prob)
 
-                # Evaluate
-                l1, e1 = self.evaluate_individual(c1, val_loader, fp32_accuracy)
-                l2, e2 = self.evaluate_individual(c2, val_loader, fp32_accuracy)
-                offspring.append((c1, l1, e1))
-                offspring.append((c2, l2, e2))
+                obj1 = self.evaluate_individual(c1, val_loader, fp32_accuracy)
+                obj2 = self.evaluate_individual(c2, val_loader, fp32_accuracy)
+                offspring.append((c1, obj1))
+                offspring.append((c2, obj2))
                 total_evals += 2
 
             # ── Survivor selection ──
             combined = population + offspring
-            combined_obj = [(x[1], x[2]) for x in combined]
+            combined_obj = [x[1] for x in combined]
             combined_fronts = self._non_dominated_sort(combined_obj)
 
             # Fill next population front-by-front
-            next_pop: List[Tuple[List[int], float, float]] = []
+            next_pop: List[Tuple[List[int], Tuple[float, ...]]] = []
             for front in combined_fronts:
                 if len(next_pop) + len(front) <= pop_size:
                     next_pop.extend(combined[i] for i in front)
                 else:
-                    # Partial front: sort by crowding distance (descending)
                     cd = self._crowding_distance(combined_obj, front)
                     remaining = pop_size - len(next_pop)
                     sorted_by_cd = sorted(front, key=lambda i: -cd[i])
@@ -676,7 +732,7 @@ class NSGAIIClusterSearch:
                     break
 
         # ── Extract final Pareto front ──
-        final_objectives = [(x[1], x[2]) for x in population]
+        final_objectives = [x[1] for x in population]
         final_fronts = self._non_dominated_sort(final_objectives)
         final_cd = (
             self._crowding_distance(final_objectives, final_fronts[0])
@@ -688,30 +744,15 @@ class NSGAIIClusterSearch:
         pareto_indices = final_fronts[0] if final_fronts else []
 
         for rank_idx, pop_idx in enumerate(pareto_indices):
-            individual, acc_loss, model_size_mb = population[pop_idx]
-            config = self.individual_to_config(individual)
-            ebops = self._compute_ebops_for_config(config)
-
-            ebops_reduction = (
-                (self._fp32_ebops - ebops) / self._fp32_ebops * 100.0
-                if self._fp32_ebops > 0
-                else 0.0
+            individual, obj = population[pop_idx]
+            pareto_solutions.append(
+                self._build_pareto_solution(
+                    individual, obj,
+                    rank_id=f"nsga_gen{final_gen}_r{rank_idx + 1}",
+                    crowding_distance=final_cd.get(pop_idx, 0.0),
+                    fp32_accuracy=fp32_accuracy,
+                )
             )
-
-            solution = ParetoSolution(
-                solution_id=f"nsga_gen{final_gen}_r{rank_idx + 1}",
-                method="PTQ",
-                accuracy=fp32_accuracy - acc_loss,
-                accuracy_loss=acc_loss,
-                ebops=ebops,
-                ebops_reduction=ebops_reduction,
-                model_size_mb=model_size_mb,
-                bitwidth_assignment=config,
-                rank=1,
-                crowding_distance=final_cd.get(pop_idx, 0.0),
-                is_dominated=False,
-            )
-            pareto_solutions.append(solution)
 
         # Sort by accuracy (best first, lowest loss)
         pareto_solutions.sort(key=lambda s: s["accuracy_loss"])
@@ -761,39 +802,25 @@ class NSGAIIClusterSearch:
         else:
             individuals = [list(bits) for bits in itertools.product([0, 1], repeat=self.num_genes)]
 
-        population: List[Tuple[List[int], float, float]] = []
+        population: List[Tuple[List[int], Tuple[float, ...]]] = []
         for ind in individuals:
-            acc_loss, size_mb = self.evaluate_individual(ind, val_loader, fp32_accuracy)
-            population.append((ind, acc_loss, size_mb))
+            obj = self.evaluate_individual(ind, val_loader, fp32_accuracy)
+            population.append((ind, obj))
 
-        objectives = [(x[1], x[2]) for x in population]
+        objectives = [x[1] for x in population]
         fronts = self._non_dominated_sort(objectives)
         pareto_indices = fronts[0] if fronts else []
         cd = self._crowding_distance(objectives, pareto_indices) if pareto_indices else {}
 
         pareto_solutions: List[ParetoSolution] = []
         for rank_idx, idx in enumerate(pareto_indices):
-            individual, acc_loss, model_size_mb = population[idx]
-            config = self.individual_to_config(individual)
-            ebops = self._compute_ebops_for_config(config)
-            ebops_reduction = (
-                (self._fp32_ebops - ebops) / self._fp32_ebops * 100.0
-                if self._fp32_ebops > 0
-                else 0.0
-            )
+            individual, obj = population[idx]
             pareto_solutions.append(
-                ParetoSolution(
-                    solution_id=f"nsga_exhaustive_r{rank_idx + 1}",
-                    method="PTQ",
-                    accuracy=fp32_accuracy - acc_loss,
-                    accuracy_loss=acc_loss,
-                    ebops=ebops,
-                    ebops_reduction=ebops_reduction,
-                    model_size_mb=model_size_mb,
-                    bitwidth_assignment=config,
-                    rank=1,
+                self._build_pareto_solution(
+                    individual, obj,
+                    rank_id=f"nsga_exhaustive_r{rank_idx + 1}",
                     crowding_distance=cd.get(idx, 0.0),
-                    is_dominated=False,
+                    fp32_accuracy=fp32_accuracy,
                 )
             )
 
@@ -845,6 +872,61 @@ class NSGAIIClusterSearch:
             for n in ca.get("layer_names", []):
                 names.add(n)
         return sorted(names)
+
+    def _build_pareto_solution(
+        self,
+        individual: List[int],
+        objectives_tuple: Tuple[float, ...],
+        *,
+        rank_id: str,
+        crowding_distance: float,
+        fp32_accuracy: float,
+    ) -> ParetoSolution:
+        """Construct a ``ParetoSolution`` from an objectives tuple.
+
+        Centralises the (acc_loss, size, [latency]) → ParetoSolution
+        conversion so both the evolutionary loop and the exhaustive
+        search produce solutions with identical fields. The 3-objective
+        path additionally populates ``latency_mean_ms`` (the LUT-summed
+        deployment-runtime number used during the search).
+        """
+        config = self.individual_to_config(individual)
+        ebops = self._compute_ebops_for_config(config)
+        ebops_reduction = (
+            (self._fp32_ebops - ebops) / self._fp32_ebops * 100.0
+            if self._fp32_ebops > 0
+            else 0.0
+        )
+
+        acc_loss = float(objectives_tuple[0])
+        model_size_mb = float(objectives_tuple[1])
+        latency_mean_ms = (
+            float(objectives_tuple[2]) if len(objectives_tuple) >= 3 else None
+        )
+
+        return ParetoSolution(
+            solution_id=rank_id,
+            method="PTQ",
+            accuracy=fp32_accuracy - acc_loss,
+            accuracy_loss=acc_loss,
+            ebops=ebops,
+            ebops_reduction=ebops_reduction,
+            model_size_mb=model_size_mb,
+            latency_mean_ms=latency_mean_ms,
+            bitwidth_assignment=config,
+            rank=1,
+            crowding_distance=crowding_distance,
+            is_dominated=False,
+        )
+
+    def _format_objectives(self, obj: Tuple[float, ...]) -> str:
+        """Pretty-printer for an N-objective tuple, used in log messages."""
+        if len(obj) >= 3:
+            return (
+                f"acc_loss={obj[0]:.2f}%%, size={obj[1]:.2f} MiB, "
+                f"latency={obj[2]:.2f} ms"
+            )
+        return f"acc_loss={obj[0]:.2f}%%, size={obj[1]:.2f} MiB"
 
     @staticmethod
     def _resolve_device(device_str: str) -> torch.device:

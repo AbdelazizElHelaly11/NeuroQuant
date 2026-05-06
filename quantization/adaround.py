@@ -41,6 +41,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from config import AdaroundResult, QuantizationConfig
+from utils.numerics import MIN_SCALE
 
 logger = logging.getLogger("neuroquant")
 
@@ -105,7 +106,7 @@ def _compute_quant_params(
     qmax = 2 ** (bitwidth - 1) - 1
     qmin = -(qmax + 1)
     abs_max = weight.abs().max()
-    scale = torch.clamp(abs_max / qmax, min=1e-8)
+    scale = torch.clamp(abs_max / qmax, min=MIN_SCALE)
     return scale, qmin, qmax
 
 
@@ -201,13 +202,30 @@ class AdaroundOptimizer:
         # Original FP32 weights
         self._original_weights: Dict[str, torch.Tensor] = {}
 
-        # Target param names (only quantized weight params) and their
-        # owning module. Prioritise low-bit tensors (INT4) where learned
-        # rounding matters most; if none exist, fall back to all quantized
-        # weights (<32-bit).
+        # Target param names — only weights of Conv/Linear modules. BN
+        # γ/β, biases, and embedding weights are FP32 in the deployment
+        # graph and must not be touched by AdaRound, even if the
+        # upstream bitwidth_config accidentally includes them. This is
+        # the same hygiene rule the NSGA search applies; centralising
+        # it here protects against future configs that drop the filter
+        # upstream.
+        _name_to_module = dict(model.named_modules())
+        _quantizable_owners = (
+            nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Linear,
+        )
+
+        def _is_quantizable_weight(pname: str) -> bool:
+            if "weight" not in pname:
+                return False
+            owner = _name_to_module.get(pname.rsplit(".", 1)[0])
+            return isinstance(owner, _quantizable_owners)
+
+        # Prioritise low-bit tensors (INT4) where learned rounding matters
+        # most; if none exist, fall back to all quantized weights (<32-bit).
         quantized_weights = [
             name for name in bitwidth_config
-            if "weight" in name and int(bitwidth_config[name]) < 32
+            if _is_quantizable_weight(name)
+            and int(bitwidth_config[name]) < 32
         ]
         low_bit_weights = [
             name for name in quantized_weights
@@ -297,6 +315,84 @@ class AdaroundOptimizer:
             module = name_to_module.get(owner_name)
             if isinstance(module, (nn.Conv2d, nn.Linear)):
                 self._owner_modules[pname] = module
+
+    def _topological_order(self) -> List[str]:
+        """Return target weight params in input→output order.
+
+        Uses ``model.named_modules()`` ordering, which preserves the
+        ``__init__`` declaration order via Python's insertion-ordered
+        dict. For Sequential, ResNet-style attribute blocks, and most
+        feed-forward CNNs this matches the actual data-flow order. The
+        ordered AdaRound loop is robust to occasional out-of-order
+        cases because each layer's *real* input is streamed through
+        the partially-quantized model — so even if the iteration order
+        is slightly off, the upstream layers are quantized exactly
+        once before being used as predecessors.
+        """
+        if not self._owner_modules:
+            self._resolve_owner_modules()
+        # Module name → ordinal in the named_modules walk.
+        order = {n: i for i, (n, _) in enumerate(self.model.named_modules())}
+        ordered = sorted(
+            self._target_params,
+            key=lambda p: order.get(p.rsplit(".", 1)[0], 1 << 30),
+        )
+        return ordered
+
+    def _collect_activations_for_one_layer(
+        self,
+        pname: str,
+        max_samples: int,
+    ) -> Optional[torch.Tensor]:
+        """Stream ``calib_loader`` through the *current* model state and
+        capture inputs to the owner of ``pname``.
+
+        Returns at most ``max_samples`` tensors stacked along the batch
+        dim, or ``None`` if no calibration data was available. Memory
+        stays constant — only one layer's pool is live at a time, in
+        contrast to the legacy parallel collector which retained every
+        layer simultaneously.
+        """
+        if self.calib_loader is None:
+            return None
+        if not self._owner_modules:
+            self._resolve_owner_modules()
+        module = self._owner_modules.get(pname)
+        if module is None:
+            return None
+
+        captured: List[torch.Tensor] = []
+        taken = [0]
+        max_n = int(max_samples)
+
+        def _hook(_mod, inputs, _output):
+            if not inputs:
+                return
+            if taken[0] >= max_n:
+                return
+            x = inputs[0].detach()
+            n = min(int(x.shape[0]), max_n - taken[0])
+            if n > 0:
+                captured.append(x[:n].cpu())
+                taken[0] += n
+
+        h = module.register_forward_hook(_hook)
+        try:
+            self.model.eval()
+            self.model.to(self.device)
+            with torch.no_grad():
+                hp_batches = int(self.config.hyperparams.calibration_batches)
+                for i, batch in enumerate(self.calib_loader):
+                    if taken[0] >= max_n or i >= hp_batches:
+                        break
+                    images = batch[0].to(self.device)
+                    self.model(images)
+        finally:
+            h.remove()
+
+        if not captured:
+            return None
+        return torch.cat(captured, dim=0)
 
     def collect_activations(
         self,
@@ -394,6 +490,171 @@ class AdaroundOptimizer:
         if isinstance(module, nn.Linear):
             return torch.nn.functional.linear(x, weight, module.bias)
         raise TypeError(f"Unsupported module type for Adaround: {type(module)!r}")
+
+    def optimize_ordered(
+        self,
+        num_epochs: Optional[int] = None,
+        lr: Optional[float] = None,
+        lambda_reg: Optional[float] = None,
+    ) -> Dict[str, List[float]]:
+        """Canonical, ordered AdaRound (Nagel et al. 2020).
+
+        For each target layer in topological order:
+
+          1. Stream the calibration loader through the *current* (partially
+             quantized) model and capture the layer's input activations.
+             This is what makes the algorithm work end-to-end: the
+             upstream layers are already at their hard-quantized state, so
+             the input X reflects accumulated quantization error.
+          2. Compute the FP32 reference output ``y_ref = layer(X; w_orig)``.
+          3. Optimize this layer's V to minimise
+             ``||layer(X; w_q_soft) - y_ref||² + λ · h(1-h)``.
+          4. Apply hard rounding to this layer immediately so the next
+             iteration sees the quantized predecessor.
+
+        Memory cost: O(one layer's activations) instead of O(all layers).
+        Runtime cost: same as parallel optimize() in the FP-gradient case;
+        the per-layer Adam optimizer is trivially small.
+        """
+        epochs = int(num_epochs or self.config.hyperparams.adaround_epochs)
+        learning_rate = float(lr or self.config.hyperparams.adaround_lr)
+        lam = float(lambda_reg or self.config.hyperparams.adaround_reg_param)
+        max_samples = int(getattr(
+            self.config.hyperparams,
+            "adaround_max_samples_per_layer", 1024,
+        ))
+
+        if self.calib_loader is None:
+            logger.warning(
+                "Ordered AdaRound requires a calib_loader; falling back "
+                "to the legacy parallel optimize()."
+            )
+            return self.optimize(num_epochs, lr, lambda_reg)
+
+        if not self._v_params:
+            logger.warning("No V parameters initialized. Call initialize() first.")
+            return {"epoch_losses": [], "recon_losses": [],
+                    "weight_mse_losses": [], "reg_losses": []}
+
+        ordered = self._topological_order()
+        logger.info(
+            "AdaRound (ordered): %d target layers, %d epochs/layer, "
+            "lr=%.6f, λ=%.4f, max_samples_per_layer=%d.",
+            len(ordered), epochs, learning_rate, lam, max_samples,
+        )
+
+        history: Dict[str, List[float]] = {
+            "epoch_losses": [], "recon_losses": [],
+            "weight_mse_losses": [], "reg_losses": [],
+        }
+        # Per-layer aggregates so the final ``_objective_components``
+        # mirrors the parallel variant's contract.
+        layer_recon_finals: List[float] = []
+        layer_w_mse_finals: List[float] = []
+        layer_reg_finals: List[float] = []
+        layer_total_finals: List[float] = []
+
+        for li, pname in enumerate(ordered, 1):
+            module = self._owner_modules.get(pname)
+            if module is None:
+                continue
+            v = self._v_params.get(pname)
+            z_floor = self._quant_floors.get(pname)
+            scale = self._quant_scales.get(pname)
+            original_w = self._original_weights.get(pname)
+            if v is None or z_floor is None or scale is None or original_w is None:
+                continue
+
+            bw = int(self.bitwidth_config[pname])
+            qmax = 2 ** (bw - 1) - 1
+            qmin = -(qmax + 1)
+
+            # ── 1. Stream this layer's input through the current model ──
+            x_layer = self._collect_activations_for_one_layer(pname, max_samples)
+            if x_layer is None or x_layer.numel() == 0:
+                logger.warning(
+                    "  [%d/%d] %s: no calibration input captured; skipping.",
+                    li, len(ordered), pname,
+                )
+                continue
+            x_layer = x_layer.to(self.device)
+
+            # ── 2. FP32 reference output ──
+            with torch.no_grad():
+                y_ref = self._layer_forward(module, x_layer, original_w)
+
+            # ── 3. Optimize V for this layer alone ──
+            opt = torch.optim.Adam([v], lr=learning_rate)
+            last = {"total": 0.0, "recon": 0.0, "w_mse": 0.0, "reg": 0.0}
+            for _epoch in range(1, epochs + 1):
+                opt.zero_grad()
+                h = _stretched_sigmoid(v)
+                z_soft = z_floor + h
+                z_clamped = torch.clamp(z_soft, qmin, qmax)
+                w_q_soft = z_clamped * scale
+
+                weight_mse = (w_q_soft - original_w).pow(2).mean()
+                y_q = self._layer_forward(module, x_layer, w_q_soft)
+                recon = (y_q - y_ref).pow(2).mean()
+                reg = _rounding_regularizer(h)
+                loss = recon + lam * reg
+                loss.backward()
+                opt.step()
+
+                last["total"] = float(loss.item())
+                last["recon"] = float(recon.item())
+                last["w_mse"] = float(weight_mse.item())
+                last["reg"] = float(reg.item())
+
+            # ── 4. Apply hard rounding to this layer NOW ──
+            with torch.no_grad():
+                h_hard = _stretched_sigmoid(v).round()
+                z_final = torch.clamp(z_floor + h_hard, qmin, qmax)
+                module.weight.data.copy_(z_final * scale)
+
+            # Free this layer's activation pool before moving on.
+            del x_layer, y_ref
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            layer_total_finals.append(last["total"])
+            layer_recon_finals.append(last["recon"])
+            layer_w_mse_finals.append(last["w_mse"])
+            layer_reg_finals.append(last["reg"])
+
+            history["epoch_losses"].append(last["total"])
+            history["recon_losses"].append(last["recon"])
+            history["weight_mse_losses"].append(last["w_mse"])
+            history["reg_losses"].append(last["reg"])
+
+            if li % max(1, len(ordered) // 10) == 0 or li == 1 or li == len(ordered):
+                logger.info(
+                    "  [%d/%d] %s: recon=%.6e w_mse=%.6e reg=%.4f",
+                    li, len(ordered), pname,
+                    last["recon"], last["w_mse"], last["reg"],
+                )
+
+        # Stash final-epoch components for the AdaroundResult contract.
+        n = max(len(layer_total_finals), 1)
+        self._objective_components = {
+            "final_total": sum(layer_total_finals) / n,
+            "final_recon": sum(layer_recon_finals) / n,
+            "final_weight_mse": sum(layer_w_mse_finals) / n,
+            "final_reg": sum(layer_reg_finals) / n,
+            # Use the same tag as parallel mode so existing tests still
+            # match — the difference is recorded in ``traversal``.
+            "objective": "layer_output_reconstruction",
+            "traversal": "ordered_input_to_output",
+            "epochs": int(epochs),
+            "lambda_reg": float(lam),
+            "n_layers": int(n),
+        }
+
+        logger.info(
+            "  AdaRound (ordered) complete. Mean final recon: %.6e",
+            self._objective_components["final_recon"],
+        )
+        return history
 
     def optimize(
         self,
@@ -653,10 +914,21 @@ class AdaroundOptimizer:
                 recon_before,
             )
 
-        # Step 1-3
+        # Step 1-3.
+        # Production default: ordered input→output traversal with
+        # streaming activations (D1). The legacy parallel path stays
+        # available behind ``adaround_ordered=False`` for ablations.
         self.initialize()
-        self.optimize()
-        self.apply()
+        use_ordered = bool(getattr(
+            self.config.hyperparams, "adaround_ordered", True,
+        ))
+        if use_ordered and self.calib_loader is not None:
+            self.optimize_ordered()
+            # ordered mode applied hard rounding inline per-layer; no
+            # separate apply() call needed.
+        else:
+            self.optimize()
+            self.apply()
 
         # MSE after (with learned rounding) — weight-space
         mse_after_weights: Dict[str, torch.Tensor] = {}

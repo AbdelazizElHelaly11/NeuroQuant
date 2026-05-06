@@ -39,6 +39,7 @@ from torch.utils.data import DataLoader
 
 from config import QuantizationConfig, QuantizationResult
 from quantization.base import BaseQuantizer
+from utils.numerics import MIN_DAMP, MIN_SCALE
 
 logger = logging.getLogger("neuroquant")
 
@@ -165,7 +166,7 @@ class GPTQQuantizer(BaseQuantizer):
 
         # Dampening
         diag_mean = H.diag().mean().item()
-        damp = max(damp_pct * diag_mean, 1e-6)
+        damp = max(damp_pct * diag_mean, MIN_DAMP)
         H += damp * torch.eye(H.shape[0], device=self.device)
 
         # Invert Hessian (Cholesky for numerical stability)
@@ -186,7 +187,7 @@ class GPTQQuantizer(BaseQuantizer):
             w_col = w_2d[:, col].clone()
 
             # Compute scale for this column
-            amax = w_col.abs().max().clamp(min=1e-8)
+            amax = w_col.abs().max().clamp(min=MIN_SCALE)
             scale = amax / qmax
 
             # Quantize
@@ -200,7 +201,7 @@ class GPTQQuantizer(BaseQuantizer):
 
             # Propagate error to subsequent columns using Hessian inverse
             if col < n_cols - 1:
-                h_ii = H_inv[col, col].clamp(min=1e-8)
+                h_ii = H_inv[col, col].clamp(min=MIN_SCALE)
                 # Update remaining columns
                 w_2d[:, col + 1:] -= (
                     error.unsqueeze(1) * H_inv[col, col + 1:].unsqueeze(0) / h_ii

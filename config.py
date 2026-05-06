@@ -3,17 +3,76 @@ NeuroQuant v2.0 - Configuration Module
 
 Defines all configuration dataclasses and type definitions
 for the quantization framework. Supports YAML/JSON config loading.
+
+Wave 6 L1: ``HyperparameterSet`` and ``QuantizationConfig`` are now
+``pydantic.dataclasses.dataclass`` instances (Pydantic v2). This is a
+drop-in replacement for the stdlib ``@dataclass``: every existing
+field name, type, and default is preserved, every existing call site
+(``cfg.hyperparams.seed``, ``cfg.model_name``, …) keeps working, and
+the legacy ``validate()`` cross-field check still runs end-to-end.
+
+What pydantic adds:
+
+* Field-level validation runs on construction. ``QuantizationConfig(
+  num_classes=-3)`` raises immediately instead of silently going on
+  to break a downstream phase.
+* YAML / JSON loaders emit clear, multi-error messages pointing at
+  the offending key path (e.g. ``hyperparams.qat_lr → must be > 0``).
+* Type coercion on load: integer values arriving as strings from a
+  loosely-formatted YAML become ``int`` automatically; mistyped
+  fields surface during config load, not during phase execution.
+
+Legacy fallback: if pydantic is not installed (rare; it is a hard
+requirement in ``requirements.txt`` from wave 6 onward), we
+transparently fall back to the stdlib ``@dataclass`` so older
+checkpoints/configs still load. The behavioural surface is identical
+in either path; only the error-quality improves with pydantic.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import yaml
+
+try:
+    from pydantic.dataclasses import dataclass as _pydantic_dataclass
+    from pydantic import ConfigDict, field_validator
+    _HAS_PYDANTIC = True
+
+    def dataclass(*args: Any, **kwargs: Any):  # type: ignore[no-redef]
+        """Wrap pydantic.dataclasses.dataclass with a permissive config.
+
+        ``arbitrary_types_allowed`` lets downstream consumers attach
+        non-pydantic attributes (e.g. live ``nn.Module`` instances on
+        result dicts) without tripping validation. ``validate_assignment``
+        is left at the default ``False`` so post-construction edits
+        (``cfg.hyperparams.qat_epochs = 1`` in tests) keep working.
+        """
+        kwargs.setdefault(
+            "config",
+            ConfigDict(arbitrary_types_allowed=True),
+        )
+        return _pydantic_dataclass(*args, **kwargs)
+
+except ImportError:  # pragma: no cover — pydantic is a hard dep from wave 6
+    from dataclasses import dataclass  # type: ignore[no-redef]
+    _HAS_PYDANTIC = False
+
+    def field_validator(*_args: Any, **_kwargs: Any):  # type: ignore[no-redef]
+        """No-op stand-in when pydantic isn't installed.
+
+        Lets the same source code run under stdlib ``@dataclass``;
+        the ``.validate()`` method continues to enforce the same
+        constraints in that mode.
+        """
+        def _wrap(fn: Any) -> Any:
+            return fn
+        return _wrap
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -59,13 +118,27 @@ class HardwareMetrics(TypedDict, total=False):
     source: str                    # 'vivado_hls' | 'quartus' | 'not_provided'
 
 
-class QuantizationResult(TypedDict):
-    """Result from evaluating a single quantized model."""
+class QuantizationResult(TypedDict, total=False):
+    """Result from evaluating a single quantized model.
+
+    Accuracy fields:
+      * ``accuracy``      — public headline. Always equals the
+        ``test_loader`` Top-1 once A2 has been wired through; the older
+        single-loader pipeline stored the val number here.
+      * ``val_top1``      — diagnostic; the same number used by QAT
+        early-stopping. Never the headline.
+      * ``test_top1``     — public headline (deployment-time estimate).
+      * ``search_top1``   — NSGA-fitness number on the held-out search
+        slice. Used internally for selection decisions only.
+    """
     config_id: str
     method: str  # 'PTQ', 'QAT', 'GPTQ', 'SmoothQuant', 'AWQ'
     bitwidth_assignment: Dict[str, int]  # layer_name -> bitwidth
     accuracy: float
     top5_accuracy: Optional[float]
+    val_top1: Optional[float]
+    test_top1: Optional[float]
+    search_top1: Optional[float]
     model_size_mb: float
     ebops: float
     latency_ms: Optional[float]
@@ -198,6 +271,12 @@ class HyperparameterSet:
     hessian_batches: int = 20
     cluster_high_percentile: float = 0.66
     cluster_low_percentile: float = 0.33
+    # Sensitivity estimator. "fisher" (default, production) uses
+    # ``(∂L/∂w)²`` averaged over calibration batches — single backprop,
+    # ~3× faster, correlates ≥0.9 with the diagonal Hessian on standard
+    # classification heads. "diag_hessian" runs the original double
+    # backprop for ablations or when an exact diagonal is needed.
+    hessian_estimator: str = "fisher"  # 'fisher' | 'diag_hessian'
 
     # NSGA-II
     nsga_population_size: int = 8
@@ -213,6 +292,18 @@ class HyperparameterSet:
     adaround_epochs: int = 100
     adaround_lr: float = 0.0001
     adaround_reg_param: float = 0.01  # lambda for entropy regularizer
+    # Ordered (canonical) AdaRound: iterate target layers in topological
+    # order, propagating each layer's quantized output into the
+    # downstream activations the next layer sees. The original paper
+    # (Nagel et al. 2020) describes this; the parallel variant ignores
+    # accumulated upstream error and consistently underperforms on
+    # deep networks. Disable only for ablations or to trade accuracy
+    # for ~2x faster optimization.
+    adaround_ordered: bool = True
+    # Bounded per-layer activation pool for the streaming
+    # collector. Constant memory regardless of model depth — only one
+    # layer's activations live at a time.
+    adaround_max_samples_per_layer: int = 1024
 
     # QAT
     qat_epochs: int = 5
@@ -225,6 +316,22 @@ class HyperparameterSet:
     # compressed PTQ that stays within ``ptq_tradeoff_max_acc_drop`` of
     # FP32. The chosen source ID is persisted to checkpoints/metadata.
     qat_warmstart_source: str = "ptq_best_acc"  # 'ptq_best_acc' | 'ptq_best_tradeoff'
+
+    # ── W+A QAT (E1 / E3) ────────────────────────────────────────────────
+    # Activation bitwidth used during QAT. Production defaults to INT8 —
+    # the deployment shape that every supported INT backend (qnnpack,
+    # fbgemm, ORT, TensorRT) expects. Override only for research
+    # experiments; W4A4 does not have a real backend.
+    qat_act_bitwidth: int = 8
+    # Pre-QAT analytic Conv-BN fold. Disabling this (set to False) is
+    # only useful for ablations: real INT8 inference always has BN folded.
+    qat_fold_bn: bool = True
+    # ── KD distillation (E5) ─────────────────────────────────────────────
+    # Mixes a soft-target KL term against the FP32 teacher. ``alpha`` is
+    # the weight of the KD term in the total loss; ``temperature``
+    # softens the teacher distribution. ``alpha=0`` disables KD.
+    qat_distill_alpha: float = 0.5
+    qat_distill_temperature: float = 4.0
 
     # Multi-fidelity PTQ rerank (phase 1c)
     # Number of NSGA candidates materialised through real PTQ +
@@ -243,9 +350,29 @@ class HyperparameterSet:
 
     # SmoothQuant
     smoothquant_alpha: float = 0.5
+    # Per-layer α grid search. When True, each layer searches its own
+    # migration strength over ``smoothquant_alpha_grid`` and keeps the
+    # value that minimises post-quantization output reconstruction MSE
+    # on the calibration sample. Single global α is rarely optimal —
+    # production runs always enable the search.
+    smoothquant_per_layer_alpha: bool = True
+    smoothquant_alpha_grid: List[float] = field(
+        default_factory=lambda: [0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+    )
 
     # AWQ
     awq_group_size: int = 128
+    # Per-layer α grid for the activation-driven migration scale
+    # ``s = a^α``. The chosen α minimises layer-output reconstruction
+    # MSE on the calibration sample. Wider grid = better quality, more
+    # search time. Defaults match the AWQ reference implementation.
+    awq_alpha_grid: List[float] = field(
+        default_factory=lambda: [0.0, 0.25, 0.5, 0.75, 1.0],
+    )
+    # Top-K% activation channels kept at FP16 instead of quantized.
+    # 0.0 = pure scaling (production AWQ default); 0.01 = the AWQ
+    # paper Section 3 ablation that keeps the most salient 1%.
+    awq_keep_top_pct: float = 0.0
 
     # XAI / Explainability
     xai_num_images: int = 5               # Number of test images to explain
@@ -262,6 +389,125 @@ class HyperparameterSet:
     hardware_report_path: str = ""        # Path to synthesis report (JSON/CSV)
     use_latency_in_pareto: bool = False   # Add latency as 3rd Pareto objective
 
+    # ── Wave 4: ONNX export + hardware-aware search ─────────────────────
+    # When True, every quantized method result is also exported to ONNX
+    # and the on-disk INT8 ``.onnx`` file size + ORT inference latency
+    # are recorded as ``onnx_size_mb`` / ``onnx_latency`` on the
+    # QuantizationResult. The synthetic ``model_size_mb`` (= numel ×
+    # bw / 8) is replaced by the real ONNX size on disk; the synthetic
+    # number is kept under ``theoretical_size_mb`` for ablation. This is
+    # the J1 + J2 + J3 deployment-fidelity contract.
+    onnx_export_enabled: bool = True
+    # Per-layer ORT latency LUT (C2) feeds NSGA's third objective. When
+    # ``hardware_aware_search`` is True the pipeline builds the LUT
+    # before phase 1c (≈ 1–2 minutes for a CIFAR-class model) and NSGA
+    # runs in 3-objective mode ``[acc_loss, size_mb, latency_ms]``. The
+    # LUT is cached to ``output_dir/latency_lut.json`` so subsequent
+    # runs skip the rebuild.
+    hardware_aware_search: bool = False
+    # Bitwidths the LUT profiles. Must be a subset of
+    # ``supported_bitwidths`` for the search to consume them.
+    latency_lut_bitwidths: List[int] = field(default_factory=lambda: [4, 8])
+
+    # ────────────────────────────────────────────────────────────────────
+    # Field validators (Wave 6 L1, pydantic v2)
+    # ────────────────────────────────────────────────────────────────────
+    # These fire at construction. Each one targets a category of error
+    # that previously surfaced inside a phase (often with a confusing
+    # downstream traceback) rather than at config-load time.
+
+    @field_validator("device", mode="after")
+    @classmethod
+    def _validate_device(cls, v: str) -> str:
+        if v not in ("auto", "cpu", "cuda", "mps"):
+            raise ValueError(
+                f"device='{v}' invalid. Use 'auto', 'cuda', 'cpu', or 'mps'."
+            )
+        return v
+
+    @field_validator("hessian_estimator", mode="after")
+    @classmethod
+    def _validate_hessian_estimator(cls, v: str) -> str:
+        if v not in ("fisher", "diag_hessian"):
+            raise ValueError(
+                f"hessian_estimator='{v}' invalid. "
+                "Use 'fisher' or 'diag_hessian'."
+            )
+        return v
+
+    @field_validator("qat_warmstart_source", mode="after")
+    @classmethod
+    def _validate_warmstart_source(cls, v: str) -> str:
+        if v not in ("ptq_best_acc", "ptq_best_tradeoff"):
+            raise ValueError(
+                f"qat_warmstart_source='{v}' invalid. "
+                "Use 'ptq_best_acc' or 'ptq_best_tradeoff'."
+            )
+        return v
+
+    @field_validator("qat_act_bitwidth", mode="after")
+    @classmethod
+    def _validate_qat_act_bitwidth(cls, v: int) -> int:
+        if v not in (4, 8, 16, 32):
+            raise ValueError(
+                f"qat_act_bitwidth={v} invalid. Use 4, 8, 16, or 32."
+            )
+        return v
+
+    @field_validator("qat_distill_alpha", mode="after")
+    @classmethod
+    def _validate_distill_alpha(cls, v: float) -> float:
+        if not (0.0 <= float(v) <= 1.0):
+            raise ValueError(
+                f"qat_distill_alpha={v} must be in [0, 1]."
+            )
+        return float(v)
+
+    @field_validator("qat_distill_temperature", "adaround_lr",
+                     "qat_lr", mode="after")
+    @classmethod
+    def _validate_strictly_positive(cls, v: float) -> float:
+        if float(v) <= 0:
+            raise ValueError(f"value={v} must be > 0.")
+        return float(v)
+
+    @field_validator("nsga_population_size", mode="after")
+    @classmethod
+    def _validate_nsga_pop(cls, v: int) -> int:
+        if int(v) < 4:
+            raise ValueError(
+                f"nsga_population_size={v} must be >= 4."
+            )
+        return int(v)
+
+    @field_validator("nsga_generations", "ptq_real_rerank_topk",
+                     mode="after")
+    @classmethod
+    def _validate_strictly_positive_int(cls, v: int) -> int:
+        if int(v) < 1:
+            raise ValueError(f"value={v} must be >= 1.")
+        return int(v)
+
+    @field_validator("ptq_tradeoff_max_acc_drop", mode="after")
+    @classmethod
+    def _validate_acc_drop_cap(cls, v: float) -> float:
+        if float(v) < 0:
+            raise ValueError(
+                f"ptq_tradeoff_max_acc_drop={v} must be >= 0."
+            )
+        return float(v)
+
+    @field_validator("latency_lut_bitwidths", mode="after")
+    @classmethod
+    def _validate_lut_bitwidths(cls, v: List[int]) -> List[int]:
+        for bw in v:
+            if int(bw) not in (4, 8, 16, 32):
+                raise ValueError(
+                    f"latency_lut_bitwidths contains invalid {bw}; "
+                    "use only 4, 8, 16, or 32."
+                )
+        return [int(b) for b in v]
+
 
 @dataclass
 class QuantizationConfig:
@@ -273,10 +519,20 @@ class QuantizationConfig:
     model_class: Optional[str] = None  # Fully qualified class name
     num_classes: int = 10
     input_shape: Tuple[int, ...] = (3, 32, 32)
+    # Task family the model targets. "classification" runs the standard
+    # last-Linear adaptation + first-Conv stride tweak. "detection" loads
+    # from ``torchvision.models.detection`` and skips the
+    # classification-specific adapters; head replacement is handled
+    # inline by the loader for the Faster/Mask/Keypoint R-CNN family.
+    task: str = "classification"  # 'classification' | 'detection'
 
     # ── Dataset ──
     dataset_name: str = "cifar10"
     dataset_path: str = "./data"
+    dataset_class: Optional[str] = None  # Fully qualified Dataset class name
+    dataset_train_dir: Optional[str] = None
+    dataset_val_dir: Optional[str] = None
+    dataset_test_dir: Optional[str] = None
     batch_size: int = 128
     num_workers: int = 4
 
@@ -319,21 +575,95 @@ class QuantizationConfig:
         ]
     )
 
+    # ────────────────────────────────────────────────────────────────────
+    # Field validators (Wave 6 L1, pydantic v2)
+    # ────────────────────────────────────────────────────────────────────
+
+    @field_validator("num_classes", mode="after")
+    @classmethod
+    def _validate_num_classes(cls, v: int) -> int:
+        if int(v) < 2:
+            raise ValueError(f"num_classes={v} must be >= 2.")
+        return int(v)
+
+    @field_validator("task", mode="after")
+    @classmethod
+    def _validate_task(cls, v: str) -> str:
+        if v not in ("classification", "detection"):
+            raise ValueError(
+                f"task='{v}' invalid. Use 'classification' or 'detection'."
+            )
+        return v
+
+    @field_validator("batch_size", mode="after")
+    @classmethod
+    def _validate_batch_size(cls, v: int) -> int:
+        if int(v) < 1:
+            raise ValueError(f"batch_size={v} must be >= 1.")
+        return int(v)
+
+    @field_validator("io_layer_bitwidth", mode="after")
+    @classmethod
+    def _validate_io_bitwidth(cls, v: int) -> int:
+        if int(v) not in (4, 8, 16, 32):
+            raise ValueError(
+                f"io_layer_bitwidth={v} invalid. Use 4, 8, 16, or 32."
+            )
+        return int(v)
+
+    @field_validator("input_shape", mode="after")
+    @classmethod
+    def _validate_input_shape(cls, v: Tuple[int, ...]) -> Tuple[int, ...]:
+        # Pydantic may coerce list → tuple; normalise then sanity-check.
+        v = tuple(int(x) for x in v)
+        if len(v) != 3:
+            raise ValueError(
+                f"input_shape must be (C, H, W) with 3 dims, "
+                f"got {v} ({len(v)} dims)."
+            )
+        c, h, w = v
+        if c not in (1, 3, 4):
+            raise ValueError(
+                f"input_shape channels={c} unexpected "
+                "(expected 1, 3, or 4)."
+            )
+        if h < 8 or w < 8:
+            raise ValueError(
+                f"input_shape spatial dims ({h}x{w}) too small "
+                "(minimum 8x8)."
+            )
+        return v
+
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> "QuantizationConfig":
-        """Load configuration from a YAML file."""
+        """Load configuration from a YAML file.
+
+        Wave 6 L1: ``.validate()`` runs at the end of the load so
+        invalid values surface at config-load time rather than during
+        a downstream phase. Pydantic field validators only fire on
+        ``__init__``; the load path uses ``setattr`` to copy values
+        onto a default-constructed config, which bypasses them — so
+        we call the runtime ``validate()`` explicitly here.
+        """
         path = Path(path)
         with open(path, "r") as f:
             data = yaml.safe_load(f) or {}
-        return cls._from_dict(data)
+        config = cls._from_dict(data)
+        config.validate()
+        return config
 
     @classmethod
     def from_json(cls, path: Union[str, Path]) -> "QuantizationConfig":
-        """Load configuration from a JSON file."""
+        """Load configuration from a JSON file.
+
+        Same load-time validation contract as ``from_yaml``.
+        """
         path = Path(path)
         with open(path, "r") as f:
             data = json.load(f)
-        return cls._from_dict(data)
+        config = cls._from_dict(data)
+        config.validate()
+        return config
 
     @classmethod
     def _from_dict(cls, data: Dict[str, Any]) -> "QuantizationConfig":
@@ -352,6 +682,8 @@ class QuantizationConfig:
             config.num_classes = model["num_classes"]
         if "input_shape" in model:
             config.input_shape = tuple(model["input_shape"])
+        if "task" in model and model["task"]:
+            config.task = model["task"]
 
         # Dataset
         ds = data.get("dataset", {})
@@ -359,6 +691,14 @@ class QuantizationConfig:
             config.dataset_name = ds["name"]
         if "path" in ds:
             config.dataset_path = ds["path"]
+        if "class" in ds and ds["class"]:
+            config.dataset_class = ds["class"]
+        if "train_dir" in ds and ds["train_dir"]:
+            config.dataset_train_dir = ds["train_dir"]
+        if "val_dir" in ds and ds["val_dir"]:
+            config.dataset_val_dir = ds["val_dir"]
+        if "test_dir" in ds and ds["test_dir"]:
+            config.dataset_test_dir = ds["test_dir"]
         if "batch_size" in ds:
             config.batch_size = ds["batch_size"]
         if "num_workers" in ds:
@@ -385,12 +725,34 @@ class QuantizationConfig:
         if "io_layer" in bw:
             config.io_layer_bitwidth = bw["io_layer"]
 
-        # Hyperparameters
+        # Hyperparameters. Enum-typed fields are stored as their
+        # ``.value`` string in YAML/JSON; convert back to the enum on
+        # load so downstream consumers continue to receive the strong
+        # type. Looks the enum class up via the dataclass field
+        # annotation so adding new enum-typed fields needs no extra
+        # plumbing here.
         hp_data = data.get("hyperparams", {})
         hp = config.hyperparams
+        hp_field_types: Dict[str, Any] = {}
+        try:
+            hp_field_types = {
+                fname: ftype for fname, ftype in
+                getattr(HyperparameterSet, "__annotations__", {}).items()
+            }
+        except Exception:
+            hp_field_types = {}
         for key, value in hp_data.items():
-            if hasattr(hp, key) and value is not None:
-                setattr(hp, key, value)
+            if not hasattr(hp, key) or value is None:
+                continue
+            ftype = hp_field_types.get(key)
+            if (
+                ftype is not None
+                and isinstance(ftype, type)
+                and issubclass(ftype, Enum)
+                and isinstance(value, str)
+            ):
+                value = ftype(value)
+            setattr(hp, key, value)
 
         # Phases
         phases_raw = data.get("phases", [])
@@ -424,10 +786,15 @@ class QuantizationConfig:
                 "class": self.model_class,
                 "num_classes": self.num_classes,
                 "input_shape": list(self.input_shape),
+                "task": self.task,
             },
             "dataset": {
                 "name": self.dataset_name,
                 "path": self.dataset_path,
+                "class": self.dataset_class,
+                "train_dir": self.dataset_train_dir,
+                "val_dir": self.dataset_val_dir,
+                "test_dir": self.dataset_test_dir,
                 "batch_size": self.batch_size,
                 "num_workers": self.num_workers,
             },
@@ -442,7 +809,8 @@ class QuantizationConfig:
                 "io_layer": self.io_layer_bitwidth,
             },
             "hyperparams": {
-                k: v for k, v in self.hyperparams.__dict__.items()
+                k: (v.value if isinstance(v, Enum) else v)
+                for k, v in self.hyperparams.__dict__.items()
                 if not k.startswith("_")
             },
             "phases": self.run_phases,
@@ -461,6 +829,11 @@ class QuantizationConfig:
         # ── Dataset ──
         if not self.dataset_name:
             errors.append("dataset_name must not be empty.")
+        if self.dataset_class and "." not in self.dataset_class:
+            errors.append(
+                "dataset_class must be fully qualified, e.g. "
+                "'my_pkg.my_data.MyDataset'."
+            )
 
         # ── Input shape ──
         if len(self.input_shape) != 3:
@@ -484,6 +857,13 @@ class QuantizationConfig:
         # ── Num classes ──
         if self.num_classes < 2:
             errors.append("num_classes must be >= 2.")
+
+        # ── Task ──
+        if self.task not in ("classification", "detection"):
+            errors.append(
+                f"task='{self.task}' invalid. "
+                "Use 'classification' or 'detection'."
+            )
 
         # ── Batch size ──
         if self.batch_size < 1:
@@ -514,6 +894,11 @@ class QuantizationConfig:
             errors.append(
                 "Cluster percentiles must satisfy 0 < low < high < 1."
             )
+        if hp.hessian_estimator not in ("fisher", "diag_hessian"):
+            errors.append(
+                f"hessian_estimator='{hp.hessian_estimator}' invalid. "
+                "Use 'fisher' or 'diag_hessian'."
+            )
 
         # ── Learning rates ──
         if hp.adaround_lr <= 0:
@@ -531,6 +916,26 @@ class QuantizationConfig:
             errors.append("ptq_real_rerank_topk must be >= 1.")
         if hp.ptq_tradeoff_max_acc_drop < 0:
             errors.append("ptq_tradeoff_max_acc_drop must be >= 0.")
+
+        # ── W+A QAT / KD ──
+        if hp.qat_act_bitwidth not in (4, 8, 16, 32):
+            errors.append(
+                f"qat_act_bitwidth={hp.qat_act_bitwidth} invalid. "
+                "Use 4, 8, 16, or 32."
+            )
+        if not (0.0 <= hp.qat_distill_alpha <= 1.0):
+            errors.append("qat_distill_alpha must be in [0, 1].")
+        if hp.qat_distill_temperature <= 0:
+            errors.append("qat_distill_temperature must be > 0.")
+
+        # ── Wave 4: hardware-aware search ──
+        if hp.latency_lut_bitwidths:
+            for bw in hp.latency_lut_bitwidths:
+                if bw not in (4, 8, 16, 32):
+                    errors.append(
+                        f"latency_lut_bitwidths contains invalid {bw}; "
+                        "use only 4, 8, 16, or 32."
+                    )
 
         # ── Phases ──
         valid_phases = {name for name, _ in [

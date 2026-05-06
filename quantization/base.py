@@ -19,6 +19,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from config import QuantizationConfig, QuantizationResult
+from utils.numerics import MIN_SCALE
 
 logger = logging.getLogger("neuroquant")
 
@@ -183,11 +184,11 @@ class BaseQuantizer(abc.ABC):
             shape = [1] * tensor.dim()
             shape[channel_dim] = tensor.size(channel_dim)
             amax = tensor.abs().flatten(1).max(dim=1)[0]
-            amax = amax.clamp(min=1e-8)
+            amax = amax.clamp(min=MIN_SCALE)
             scale = amax / qmax
             scale = scale.view(shape)
         else:
-            amax = tensor.abs().max().clamp(min=1e-8)
+            amax = tensor.abs().max().clamp(min=MIN_SCALE)
             scale = amax / qmax
 
         # Quantize then dequantize

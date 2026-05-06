@@ -1,9 +1,10 @@
-# NeuroQuant v2.0 — Full Configuration (development checkout copy)
+# NeuroQuant v2.0 — Default Configuration
+# This file is the canonical configuration shipped inside the wheel.
+# After ``pip install neuroquant`` you can drop a copy of it next to your
+# project with:
 #
-# This file mirrors ``quantization/_default_config.yaml``, which is the
-# version shipped inside the wheel. After ``pip install neuroquant`` users
-# can recreate it with ``neuroquant --init``. Keep both files in sync when
-# editing comments or default values.
+#     neuroquant --init           # writes ./config.yaml
+#     neuroquant --init --force   # overwrite an existing ./config.yaml
 #
 # Every pipeline knob is exposed here so code does not need to be edited.
 # Keys below map 1:1 onto the dataclasses in config.py (QuantizationConfig +

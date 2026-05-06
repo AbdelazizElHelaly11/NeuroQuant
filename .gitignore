@@ -1,41 +1,115 @@
-# NeuroQuant v2.0 - Git Ignore
+# NeuroQuant v2.0 — Git ignore
 
-# Python
+# ── Python build / cache ─────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
-*.egg-info/
-dist/
-build/
+*$py.class
+*.so
 *.egg
+*.egg-info/
+build/
+dist/
+wheels/
+*.whl
+.Python
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+MANIFEST
 
-# Virtual environments
+# ── Test + coverage ──────────────────────────────────────────────────────
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.cache
+.pytest_cache/
+.hypothesis/
+.tox/
+.nox/
+nosetests.xml
+*.cover
+.mypy_cache/
+.ruff_cache/
+
+# ── Virtual environments ─────────────────────────────────────────────────
 .venv/
 venv/
 env/
+ENV/
+env.bak/
+venv.bak/
 
-# Data (auto-downloaded, large)
-data/
-*.tar.gz
-
-# Artifacts (generated at runtime)
-artifacts/
-mlruns/
-logs/
-
-# Checkpoints (large binary files)
-*.pth
-!examples/*.pth
-
-# IDE
+# ── Editor / IDE ─────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
+*.sublime-project
+*.sublime-workspace
 
-# OS
+# ── Claude Code (local-only settings) ────────────────────────────────────
+.claude/
+
+# ── OS noise ─────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Jupyter
+# ── Jupyter ──────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
+*.ipynb
+
+# ── Datasets (auto-downloaded, large) ────────────────────────────────────
+# ``data/`` itself is the *source* package (contains data_loader.py).
+# The downloaded datasets land *inside* ``data/`` at fixed paths that
+# torchvision and our synthetic loader use. Whitelist the source code
+# and ignore the rest.
+data/cifar-10-batches-py/
+data/cifar-100-python/
+data/cifar-10-python.tar.gz
+data/cifar-100-python.tar.gz
+data/MNIST/
+data/FashionMNIST/
+data/imagenet/
+data/imagefolder/
+*.tar.gz
+*.tar
+*.zip
+
+# ── Runtime artefacts ────────────────────────────────────────────────────
+artifacts/
+mlruns/
+mlflow.db
+mlflow.db-journal
+logs/
+outputs/
+
+# ── Model checkpoints (large binary files) ───────────────────────────────
+*.pth
+*.pt
+*.ckpt
+!examples/*.pth
+
+# ── ONNX temp + intermediate files ───────────────────────────────────────
+# `quant_pre_process` writes <name>.preproc.onnx during static-INT8
+# quantization; the new code cleans up afterwards but older runs may
+# have left these (and the misnamed "sym_shape_infer_temp.onnx").
+*.preproc.onnx
+sym_shape_infer_temp.onnx
+*_temp.onnx
+
+# ── MLflow stray files ───────────────────────────────────────────────────
+# UUID-named .data files are MLflow trace fragments that occasionally
+# leak into the working directory under crashed runs.
+[a-f0-9]*-[a-f0-9]*-*-*-*.data
+
+# ── Misc ─────────────────────────────────────────────────────────────────
+*.log
