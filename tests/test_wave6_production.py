@@ -361,7 +361,7 @@ def test_latency_for_assignment_is_a_pure_sum(n_layers):
 
 def test_pyproject_toml_configures_coverage():
     """``pyproject.toml`` exists and configures pytest-cov."""
-    project_root = Path(__file__).resolve().parent
+    project_root = Path(__file__).resolve().parent.parent
     pyproject = project_root / "pyproject.toml"
     assert pyproject.exists(), "pyproject.toml missing"
     # ``encoding`` is mandatory on Windows: the file legitimately
@@ -380,7 +380,7 @@ def test_pyproject_toml_configures_coverage():
 
 def test_github_actions_workflow_exists():
     """A CI workflow file exists under ``.github/workflows/``."""
-    project_root = Path(__file__).resolve().parent
+    project_root = Path(__file__).resolve().parent.parent
     workflow_dir = project_root / ".github" / "workflows"
     assert workflow_dir.exists(), ".github/workflows missing"
     workflows = list(workflow_dir.glob("*.yml")) + list(workflow_dir.glob("*.yaml"))

@@ -134,6 +134,7 @@ include-package-data = true
 # are gated behind the ``integration`` marker so the default
 # ``pytest`` invocation stays fast (<60s on CPU).
 testpaths = ["tests"]
+pythonpath = ["."]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
