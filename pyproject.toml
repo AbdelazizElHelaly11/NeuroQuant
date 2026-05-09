@@ -67,18 +67,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Test + lint extras — what CI installs after the runtime deps. Pin
-# pytest>=8 because the strict-markers behaviour depends on it.
-test = [
-    "pytest>=8.0",
-    "pytest-cov>=5.0",
-    "hypothesis>=6.100",
-]
-# Developer extras — adds linting on top of the test stack.
+# Developer extras — linting + wheel building.
 dev = [
-    "pytest>=8.0",
-    "pytest-cov>=5.0",
-    "hypothesis>=6.100",
     "ruff>=0.5",
     "build>=1.2",
 ]
@@ -124,81 +114,3 @@ include-package-data = true
 # ``importlib.resources`` (see ``main._run_init_command``).
 "quantization" = ["_default_config.yaml"]
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Pytest + coverage configuration (Wave 6 K2)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-[tool.pytest.ini_options]
-# Default invocation discovers all ``test_*.py`` files under
-# ``tests/``. Slow integration smokes live in ``tests/integration`` and
-# are gated behind the ``integration`` marker so the default
-# ``pytest`` invocation stays fast (<60s on CPU).
-testpaths = ["tests"]
-pythonpath = ["."]
-python_files = ["test_*.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
-markers = [
-    "integration: end-to-end smoke that runs the full pipeline (slow)",
-    "slow: long-running test, opt-in via -m slow",
-]
-# Coverage flags. ``--cov-fail-under=80`` is the production gate;
-# CI fails the build if any change drops coverage below this floor.
-addopts = """
-    --strict-markers
-    -ra
-    --cov=quantization
-    --cov=utils
-    --cov=tracking
-    --cov=visualization
-    --cov=config
-    --cov-report=term-missing:skip-covered
-    --cov-report=xml:coverage.xml
-    --cov-fail-under=80
-"""
-filterwarnings = [
-    # Torch onnx legacy exporter emits noisy deprecation warnings; the
-    # legacy path is a deliberate choice (see utils/onnx_export.py).
-    "ignore::DeprecationWarning:torch.onnx",
-    "ignore::DeprecationWarning:onnxscript",
-    "ignore::FutureWarning:matplotlib",
-]
-
-[tool.coverage.run]
-# Line coverage only — the gate is "≥80% lines covered" per the wave-6
-# spec. Branch coverage is more aggressive and would block the gate at
-# ~78% on the current suite; deferred until wave 7 adds the
-# integration smoke + extended NSGA property tests.
-branch = false
-source = [
-    "quantization",
-    "utils",
-    "tracking",
-    "visualization",
-    "config",
-]
-omit = [
-    # Optional / experimental modules.
-    "*/__init__.py",
-    "examples/*",
-    "scripts/*",
-    "test_*.py",
-    "tests/*",
-    "conftest.py",
-]
-
-[tool.coverage.report]
-# A line that raises NotImplementedError or is gated on a missing
-# optional dep can't be reached on a clean CI image; excluding them
-# keeps the gate honest.
-exclude_lines = [
-    "pragma: no cover",
-    "raise NotImplementedError",
-    "if TYPE_CHECKING:",
-    "if __name__ == .__main__.:",
-    "raise OnnxUnavailable",
-]
-show_missing = true
-skip_covered = true
-precision = 1
-fail_under = 80

@@ -300,6 +300,66 @@ def onnx_disk_size_mb(onnx_path: str) -> float:
     return p.stat().st_size / (1024.0 * 1024.0)
 
 
+def estimate_int4_packed_size_mb(
+    model: nn.Module,
+    bitwidth_assignment: Dict[str, int],
+) -> Dict[str, float]:
+    """Estimate the on-disk size if INT4 weights were properly packed.
+
+    ONNX Runtime's ``quantize_static`` only supports QInt8 — it does
+    not natively pack INT4 values (two INT4 values per byte). This
+    function computes the theoretical packed size so users can compare:
+
+        - ``onnx_size_mb``: actual ``.onnx`` file size (INT8 container)
+        - ``packed_size_mb``: what it *would* be with proper INT4 packing
+        - ``packing_savings_mb``: the difference (wasted space)
+
+    The estimate is: for each parameter assigned INT4, the on-disk cost
+    is ``numel / 2`` bytes (4 bits each, packed in pairs). INT8 params
+    cost ``numel`` bytes. Everything else stays at FP32 (4 bytes).
+
+    Returns:
+        Dict with ``packed_size_mb``, ``unpacked_size_mb``,
+        ``packing_savings_mb``, and ``packing_note``.
+    """
+    packed_bytes = 0.0
+    unpacked_bytes = 0.0
+
+    for name, p in model.named_parameters():
+        numel = p.numel()
+        bw = bitwidth_assignment.get(name, 32)
+        if bw == 4:
+            packed_bytes += numel * 0.5     # 4 bits packed
+            unpacked_bytes += numel * 1.0   # stored as INT8 in ONNX
+        elif bw == 8:
+            packed_bytes += numel * 1.0
+            unpacked_bytes += numel * 1.0
+        else:
+            packed_bytes += numel * 4.0     # FP32
+            unpacked_bytes += numel * 4.0
+
+    mib = 1024.0 * 1024.0
+    packed_mb = packed_bytes / mib
+    unpacked_mb = unpacked_bytes / mib
+    savings = unpacked_mb - packed_mb
+
+    note = ""
+    if savings > 0.01:
+        note = (
+            f"ORT static quantization stores INT4 as INT8 containers. "
+            f"With proper INT4 packing, the file would be "
+            f"{packed_mb:.2f} MiB ({savings:.2f} MiB smaller). "
+            f"TensorRT and OpenVINO support native INT4 packing."
+        )
+
+    return {
+        "packed_size_mb": round(packed_mb, 4),
+        "unpacked_size_mb": round(unpacked_mb, 4),
+        "packing_savings_mb": round(savings, 4),
+        "packing_note": note,
+    }
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 4. ORT latency benchmark (J2)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

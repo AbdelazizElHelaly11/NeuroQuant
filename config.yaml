@@ -1,9 +1,10 @@
-# NeuroQuant v2.0 — Full Configuration (development checkout copy)
+# NeuroQuant v2.0 — Default Configuration
+# This file is the canonical configuration shipped inside the wheel.
+# After ``pip install neuroquant`` you can drop a copy of it next to your
+# project with:
 #
-# This file mirrors ``quantization/_default_config.yaml``, which is the
-# version shipped inside the wheel. After ``pip install neuroquant`` users
-# can recreate it with ``neuroquant --init``. Keep both files in sync when
-# editing comments or default values.
+#     neuroquant --init           # writes ./config.yaml
+#     neuroquant --init --force   # overwrite an existing ./config.yaml
 #
 # Every pipeline knob is exposed here so code does not need to be edited.
 # Keys below map 1:1 onto the dataclasses in config.py (QuantizationConfig +
@@ -50,7 +51,7 @@ output:
   experiment_name: "neuroquant_v2"
 
 # ── Methods to run in Phase 1f (and PTQ gating in Phase 1c) ──────────────
-# Valid values: ptq | qat | gptq | smoothquant | awq
+# Valid values: ptq | qat | gptq | smoothquant | awq | smoothquant_gptq
 # Add or remove entries to control which methods are evaluated.
 # Order does not matter. Unknown methods are rejected at config-load time.
 methods:
@@ -59,6 +60,7 @@ methods:
   - gptq
   - smoothquant
   - awq
+  - smoothquant_gptq
 
 # ── Bitwidths ────────────────────────────────────────────────────────────
 # ``supported`` must be a subset of {4, 8} — the framework has backends
@@ -126,13 +128,26 @@ hyperparams:
 
   # SmoothQuant
   smoothquant_alpha: 0.5            # 0 → all difficulty on activations, 1 → on weights
-  smoothquant_per_layer_alpha: true # F3: per-layer α grid search
+  smoothquant_per_layer_alpha: true # F3: per-layer α (set false for paper baseline)
   smoothquant_alpha_grid: [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+  smoothquant_alpha_strategy: "closed_form"  # closed_form | grid
+                                             # closed_form: α = max|X|^β / (max|X|^β + max|W|^β)
+                                             #              ~6× faster, paper-recipe default.
+                                             # grid       : exhaustive search (ablation only).
 
   # AWQ (F2 production-corrected — input-scale wrapper + per-layer α)
   awq_group_size: 128
   awq_alpha_grid: [0.0, 0.25, 0.5, 0.75, 1.0]
+  awq_alpha_strategy: "golden"      # golden | grid
+                                    # golden: golden-section search over [min, max] of grid;
+                                    #         ~4 evals vs 5–9, no Optuna dep.
+                                    # grid  : exhaustive baseline (ablation only).
   awq_keep_top_pct: 0.0             # 0.01 keeps the top 1% channels at FP16
+
+  # Cluster-amortized α search. Reuses Phase 1a Hessian/Fisher
+  # clusters: search α on one representative per tier, broadcast to
+  # the rest. Falls back to per-layer search when clusters are absent.
+  alpha_cluster_amortize: true
 
   # XAI / explainability
   xai_num_images: 5

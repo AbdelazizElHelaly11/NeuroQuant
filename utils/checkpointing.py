@@ -4,6 +4,8 @@ NeuroQuant v2.0 - Phase Checkpointing & Reproducibility
 Provides:
     - Phase-level checkpoint save/load (resume after crash)
     - Reproducibility manifest (environment + config + results snapshot)
+    - Atomic writes: all saves go through a .tmp file + os.replace()
+      so a crash mid-write never corrupts an existing checkpoint.
 
 Checkpoint format:
     - .pth for model weights (torch.save)
@@ -17,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import platform
 import sys
 import time
@@ -78,12 +81,14 @@ class CheckpointManager:
     # ------------------------------------------------------------------
 
     def save_phase_json(self, phase_name: str, data: Dict[str, Any]) -> Path:
-        """Save phase results as JSON (for configs, metrics, assignments)."""
+        """Save phase results as JSON (for configs, metrics, assignments).
+
+        Uses atomic write: data → .tmp → os.replace() so a crash
+        mid-write never corrupts an existing checkpoint.
+        """
         path = self.ckpt_dir / f"{phase_name}.json"
-        # Convert numpy types for JSON serialization
         serializable = _make_serializable(data)
-        with open(path, "w") as f:
-            json.dump(serializable, f, indent=2, default=str)
+        _atomic_json_write(path, serializable)
         logger.info("  [CKPT] Saved: %s", path.name)
         return path
 
@@ -93,12 +98,15 @@ class CheckpointManager:
         model: nn.Module,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Path:
-        """Save model weights + optional metadata as .pth checkpoint."""
+        """Save model weights + optional metadata as .pth checkpoint.
+
+        Uses atomic write: torch.save → .tmp → os.replace().
+        """
         path = self.ckpt_dir / f"{phase_name}.pth"
         checkpoint = {"model_state_dict": model.state_dict()}
         if metadata:
             checkpoint["metadata"] = _make_serializable(metadata)
-        torch.save(checkpoint, path)
+        _atomic_torch_save(checkpoint, path)
         logger.info("  [CKPT] Saved: %s", path.name)
         return path
 
@@ -119,9 +127,12 @@ class CheckpointManager:
     ) -> Path:
         """Save a model state_dict under an arbitrary filename inside the
         checkpoint directory. Use for auxiliary per-phase artefacts (e.g.
-        multiple quantized variants produced by a single phase)."""
+        multiple quantized variants produced by a single phase).
+
+        Uses atomic write for crash safety.
+        """
         path = self.ckpt_dir / filename
-        torch.save(model.state_dict(), path)
+        _atomic_torch_save(model.state_dict(), path)
         logger.info("  [CKPT] Saved: %s", path.name)
         return path
 
@@ -160,13 +171,15 @@ class CheckpointManager:
         cannot be expressed in a pure ``state_dict`` (e.g. SmoothQuant's
         ``_SmoothInputScale`` wrappers) must be encoded into ``metadata``
         and rebuilt before ``load_state_dict`` is called.
+
+        Uses atomic write for crash safety.
         """
         path = self.ckpt_dir / filename
         envelope = {
             "state_dict": module.state_dict(),
             "metadata": _make_serializable(metadata or {}),
         }
-        torch.save(envelope, path)
+        _atomic_torch_save(envelope, path)
         logger.info("  [CKPT] Saved: %s (state_dict + metadata)", path.name)
         return path
 
@@ -396,6 +409,45 @@ def _hash_config(config: Any) -> str:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Helpers
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _atomic_json_write(path: Path, data: Any) -> None:
+    """Atomically write JSON data to *path*.
+
+    Writes to a temporary ``.tmp`` sibling first, then replaces the
+    target via ``os.replace`` which is atomic on POSIX and near-atomic
+    on Windows/NTFS. A crash during the write leaves only the temp
+    file — the previous checkpoint (if any) remains intact.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        # Best-effort cleanup of the temp file on failure.
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_torch_save(obj: Any, path: Path) -> None:
+    """Atomically save a PyTorch object to *path*.
+
+    Same write-then-replace strategy as ``_atomic_json_write``.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        torch.save(obj, str(tmp))
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _make_serializable(obj: Any) -> Any:

@@ -100,10 +100,16 @@ class GradCAMExplainer:
         self._activations = None
         self._gradients = None
 
-        # Register hooks on target layer
+        # Capture activation + gradient via a single forward hook that
+        # attaches a tensor-level ``register_hook`` to the output. We
+        # deliberately avoid ``register_full_backward_hook`` because it
+        # wraps the module output in a ``BackwardHookFunction`` view,
+        # which conflicts with any downstream in-place op (e.g.
+        # ``ReLU6(inplace=True)`` in MobileNetV2 — especially after QAT
+        # folds Conv-BN to an Identity, leaving the inplace activation
+        # directly consuming the captured tensor).
         fwd_hook = target_layer.register_forward_hook(self._save_activation)
-        bwd_hook = target_layer.register_full_backward_hook(self._save_gradient)
-        self._hooks = [fwd_hook, bwd_hook]
+        self._hooks = [fwd_hook]
 
         try:
             self.model.eval()
@@ -157,12 +163,16 @@ class GradCAMExplainer:
             self._hooks.clear()
 
     def _save_activation(self, module, input, output):
-        """Forward hook: save activations."""
-        self._activations = output.detach()
+        """Forward hook: cache activations and register tensor-level grad hook."""
+        if isinstance(output, torch.Tensor) and output.requires_grad:
+            output.register_hook(self._save_gradient)
+        self._activations = (
+            output.detach() if isinstance(output, torch.Tensor) else output
+        )
 
-    def _save_gradient(self, module, grad_input, grad_output):
-        """Backward hook: save gradients."""
-        self._gradients = grad_output[0].detach()
+    def _save_gradient(self, grad: torch.Tensor) -> None:
+        """Tensor-level backward hook: cache gradient w.r.t. captured activation."""
+        self._gradients = grad.detach()
 
 
 def _resize_2d(arr: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:

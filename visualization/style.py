@@ -24,13 +24,14 @@ from typing import Tuple
 # Colours are colour-blind-safe (Tableau 10 / ColorBrewer-derived).
 # Markers are picked so every family is distinguishable in monochrome.
 METHOD_STYLE = {
-    "FP32":        ("#000000", "D"),
-    "PTQ":         ("#1f77b4", "o"),
-    "QAT":         ("#ff7f0e", "s"),
-    "GPTQ":        ("#2ca02c", "^"),
-    "AWQ":         ("#9467bd", "P"),
-    "SMOOTHQUANT": ("#d62728", "X"),
-    "NSGA":        ("#1f77b4", "o"),   # NSGA solutions are tagged "PTQ"
+    "FP32":            ("#000000", "D"),
+    "PTQ":             ("#1f77b4", "o"),
+    "QAT":             ("#ff7f0e", "s"),
+    "GPTQ":            ("#2ca02c", "^"),
+    "AWQ":             ("#9467bd", "P"),
+    "SMOOTHQUANT":     ("#d62728", "X"),
+    "SMOOTHQUANTGPTQ": ("#17becf", "d"),   # combined SQ→GPTQ method
+    "NSGA":            ("#1f77b4", "o"),    # NSGA solutions are tagged "PTQ"
 }
 
 DEFAULT_COLOR = "#7f7f7f"

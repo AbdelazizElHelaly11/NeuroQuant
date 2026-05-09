@@ -68,8 +68,20 @@ class SmoothQuantGPTQQuantizer(BaseQuantizer):
         combined model resumes safely under ``weights_only=True``.
     """
 
-    def __init__(self, model: nn.Module, config: QuantizationConfig) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        config: QuantizationConfig,
+        *,
+        cluster_result: Optional[Dict[str, Any]] = None,
+        hessian_diag: Optional[Dict[str, float]] = None,
+    ) -> None:
         super().__init__(model, config)
+        # Phase 1a outputs are forwarded to the SmoothQuant stage so
+        # the cluster-amortized α search is consistent across F4 and
+        # standalone SmoothQuant.
+        self._cluster_result = cluster_result
+        self._hessian_diag = hessian_diag
 
     def quantize(
         self,
@@ -84,7 +96,11 @@ class SmoothQuantGPTQQuantizer(BaseQuantizer):
         )
 
         # ── Stage 1: SmoothQuant migration only ──
-        sq = SmoothQuantQuantizer(self.model, self.config)
+        sq = SmoothQuantQuantizer(
+            self.model, self.config,
+            cluster_result=self._cluster_result,
+            hessian_diag=self._hessian_diag,
+        )
         smoothed = sq.apply_smoothing_only(
             calibration_loader, num_batches=num_batches,
         )

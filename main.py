@@ -498,6 +498,30 @@ class NeuroQuantPipeline:
             "num_layers": len(self.hessian_diag),
             "num_clusters": n_clusters,
         })
+
+        # Per-layer sensitivity visualization — BEFORE end_run so
+        # MLflow artifact logging works within the active run.
+        try:
+            from visualization.sensitivity import (
+                plot_sensitivity_heatmap, plot_tier_distribution,
+            )
+            sens_dir = str(self.output_dir)
+            sens_path = plot_sensitivity_heatmap(
+                self.hessian_diag, self.cluster_result, sens_dir,
+                model_name=self.config.model_name,
+            )
+            tier_path = plot_tier_distribution(
+                self.cluster_result, sens_dir,
+                model_name=self.config.model_name,
+            )
+            # Log plots to MLflow so they show in the Artifacts tab.
+            if sens_path:
+                self.tracker.log_artifact(sens_path, "plots")
+            if tier_path:
+                self.tracker.log_artifact(tier_path, "plots")
+        except Exception as exc:
+            logger.warning("  Sensitivity plots skipped: %s", exc)
+
         self.tracker.end_run()
 
         self.report_lines.append(
@@ -915,6 +939,39 @@ class NeuroQuantPipeline:
             )
         self.results["qat_acc"] = self.qat_result["final_val_acc"]
 
+        # Surface QAT into the public summary table so it appears in
+        # ``pareto_summary.json`` alongside PTQ/GPTQ/AWQ/SmoothQuant.
+        # Previously QAT was logged to MLflow + persisted to the phase
+        # checkpoint but never made it into ``_summary_rows``, which is
+        # what ``_build_pareto_summary`` consumes — so the headline JSON
+        # silently dropped it (n_methods=7 with 8 candidates evaluated).
+        # Size + ebops come from ``self.best_config`` (the NSGA-chosen
+        # bitwidth assignment QAT was warmstarted on); QAT does not
+        # currently emit ONNX so the deployment fields stay null.
+        from utils.common import compute_quantized_size_mb
+        qat_bw = self.best_config or {}
+        qat_dom_bw = (
+            self._dominant_bitwidth(qat_bw) if qat_bw
+            else int(self.config.hyperparams.qat_act_bitwidth)
+        )
+        qat_size_mb = (
+            compute_quantized_size_mb(self.model, qat_bw) if qat_bw else 0.0
+        )
+        qat_ebops = self._ebops_from_bitwidth(qat_bw) if qat_bw else 0.0
+        qat_lat_dict = self.qat_result.get("latency") or {}
+        qat_headline_acc = (
+            float(qat_test_top1) if qat_test_top1 is not None
+            else float(self.qat_result.get("final_val_acc", 0.0) or 0.0)
+        )
+        self._add_summary_row(
+            f"QAT_INT{qat_dom_bw}",
+            qat_headline_acc,
+            float(qat_lat_dict.get("latency_mean_ms", 0.0) or 0.0),
+            float(qat_lat_dict.get("throughput_fps", 0.0) or 0.0),
+            qat_ebops,
+            qat_size_mb,
+        )
+
         # Checkpoint: save the fine-tuned QAT model and the metric history.
         # The warmstart source (ptq_best_acc / ptq_best_tradeoff) and the
         # PTQ ID it selected are persisted alongside so resuming or
@@ -988,14 +1045,33 @@ class NeuroQuantPipeline:
             )
             if not is_onnx_available():
                 onnx_enabled = False
-                logger.info("  ONNX export disabled (onnxruntime unavailable).")
+                logger.warning(
+                    "  ONNX export disabled — onnx/onnxruntime not importable. "
+                    "Install with `pip install onnx onnxruntime` to enable real "
+                    "INT8 disk size + ORT latency (Wave 4 J1/J2/J3). All "
+                    "onnx_size_mb / onnx_latency_ms / onnx_throughput_fps "
+                    "fields will be null in the final summary."
+                )
+
+        # Phase 1a outputs are passed as keyword args to quantizers that
+        # accept them (SmoothQuant, AWQ, SmoothQuant→GPTQ). When clusters
+        # are absent or the quantizer ignores them, the kwargs are simply
+        # not forwarded — keeps GPTQ's signature unchanged.
+        cluster_kwargs = {
+            "cluster_result": getattr(self, "cluster_result", None),
+            "hessian_diag": getattr(self, "hessian_diag", None),
+        }
+        cluster_aware_keys = {"smoothquant", "awq", "smoothquant_gptq"}
 
         for i, (key, label, bw, cls) in enumerate(plan, 1):
             if methods_enabled and key not in methods_enabled:
                 continue
             logger.info("  [%d/%d] %s INT%d ...", i, len(plan), label, bw)
             try:
-                quantizer = cls(self.model, self.config)
+                quantizer_kwargs = (
+                    cluster_kwargs if key in cluster_aware_keys else {}
+                )
+                quantizer = cls(self.model, self.config, **quantizer_kwargs)
                 q_model = quantizer.quantize(
                     self.calib_loader, bitwidth=bw,
                     num_batches=hp.calibration_batches,
@@ -1008,13 +1084,21 @@ class NeuroQuantPipeline:
                 # assignment is preserved as a diagnostic; the public
                 # ``model_size_mb`` is overwritten with the on-disk
                 # ``.onnx`` file size below when ONNX export succeeds.
+                # IMPORTANT: ``bw_assignment`` keys come from the
+                # *quantized* model's namespace (see BaseQuantizer.evaluate),
+                # which differs from ``self.model`` for methods that wrap
+                # layers — e.g. SmoothQuant/AWQ insert input-scale wrappers
+                # turning ``features.0.0.weight`` into ``features.0.0.1.weight``.
+                # Passing ``self.model`` (FP32 namespace) caused every key to
+                # miss in ``compute_ebops`` and silently fall back to 32-bit
+                # accounting → AWQ/SmoothQuant reported FP32 sizes.
                 bw_assignment = res.get("bitwidth_assignment", {}) or {
-                    n: bw for n, _ in self.model.named_parameters()
+                    n: bw for n, _ in q_model.named_parameters()
                     if "weight" in n
                 }
                 res["bitwidth_assignment"] = bw_assignment
                 theoretical_mb = compute_quantized_size_mb(
-                    self.model, bw_assignment,
+                    q_model, bw_assignment,
                 )
                 res["theoretical_size_mb"] = theoretical_mb
                 res["model_size_mb"] = theoretical_mb
@@ -1047,10 +1131,29 @@ class NeuroQuantPipeline:
                             res["latency_ms"] = info["onnx_latency"]["latency_mean_ms"]
                             res["latency"] = info["onnx_latency"]
                     except Exception as exc:
-                        logger.debug(
-                            "    %s ONNX export failed: %s",
+                        logger.warning(
+                            "    %s ONNX export failed: %s — falling back to "
+                            "theoretical_size_mb. Real on-disk size + ORT "
+                            "latency unavailable for this method.",
                             res["display_name"], exc,
                         )
+
+                # INT4 packing estimate: show the gap between ONNX's
+                # INT8-container storage and true INT4 packed size.
+                if bw == 4 or (bw_assignment and 4 in bw_assignment.values()):
+                    try:
+                        from utils.onnx_export import estimate_int4_packed_size_mb
+                        packing = estimate_int4_packed_size_mb(
+                            q_model, bw_assignment or {},
+                        )
+                        res["int4_packing"] = packing
+                        if packing.get("packing_note"):
+                            logger.info(
+                                "    %s: %s",
+                                res["display_name"], packing["packing_note"],
+                            )
+                    except Exception:
+                        pass  # non-critical
 
                 self._attach_split_metrics(res, q_model)
                 self.method_results.append(res)
@@ -1120,6 +1223,47 @@ class NeuroQuantPipeline:
                 onnx_latency_ms=onnx_lat.get("latency_mean_ms"),
                 onnx_throughput_fps=onnx_lat.get("throughput_fps"),
             )
+
+        # ── Quantization Error Attribution ──
+        # Compute per-layer activation errors between FP32 and each
+        # quantized model, generating visual diagnostics.
+        # Runs BEFORE end_run() so MLflow artifact logging works.
+        try:
+            from visualization.error_attribution import (
+                compute_layer_errors, plot_error_attribution,
+                plot_error_comparison,
+            )
+            ea_dir = str(self.output_dir)
+            all_errors: Dict[str, list] = {}
+            for label, q_model in produced_models_by_id.items():
+                if not isinstance(q_model, nn.Module):
+                    continue
+                try:
+                    errors = compute_layer_errors(
+                        self.model, q_model, self.calib_loader,
+                        self.device, num_batches=3,
+                    )
+                    if errors:
+                        all_errors[label] = errors
+                        ea_path = plot_error_attribution(
+                            errors, ea_dir,
+                            method_name=label,
+                            model_name=self.config.model_name,
+                        )
+                        if ea_path:
+                            self.tracker.log_artifact(ea_path, "plots")
+                except Exception as exc:
+                    logger.debug("  Error attribution for %s: %s", label, exc)
+            if len(all_errors) > 1:
+                cmp_path = plot_error_comparison(
+                    all_errors, ea_dir,
+                    model_name=self.config.model_name,
+                )
+                if cmp_path:
+                    self.tracker.log_artifact(cmp_path, "plots")
+        except Exception as exc:
+            logger.warning("  Error attribution skipped: %s", exc)
+
         self.tracker.end_run()
 
         # Short per-method report line (best of each family).
@@ -1280,15 +1424,31 @@ class NeuroQuantPipeline:
             s for s in all_solutions
             if not str(s.get("solution_id", "")).startswith("nsga_")
         ]
-        all_solutions = self._filter_non_dominated_solutions(public_candidates)
-        if len(all_solutions) < len(public_candidates):
+        non_dominated = self._filter_non_dominated_solutions(public_candidates)
+        non_dominated_ids = {
+            str(s.get("solution_id", "")) for s in non_dominated
+        }
+        if len(non_dominated) < len(public_candidates):
             logger.info(
-                "  Public Pareto filter: kept %d non-dominated of %d candidates",
-                len(all_solutions), len(public_candidates),
+                "  Public Pareto filter: %d non-dominated of %d candidates",
+                len(non_dominated), len(public_candidates),
             )
 
+        # Mark every candidate as dominated or non-dominated so the
+        # visualiser can show all solutions with highlighting.
+        for s in public_candidates:
+            sid = str(s.get("solution_id", ""))
+            s["is_dominated"] = sid not in non_dominated_ids
+
+        # Sort: non-dominated first (by accuracy desc), then dominated
+        # (by accuracy desc).
+        public_candidates.sort(
+            key=lambda s: (s.get("is_dominated", False),
+                           s.get("accuracy_loss", 0.0)),
+        )
+
         merged_front = ParetoFront(
-            solutions=all_solutions,
+            solutions=public_candidates,
             generation=self.pareto_front.get("generation", 0),
             evaluations=self.pareto_front.get("evaluations", 0),
             convergence_reason="public_methods_only",
@@ -1305,7 +1465,7 @@ class NeuroQuantPipeline:
 
         hv = self.pareto_analysis["metrics"].get("hypervolume", 0)
         metrics_to_log = {
-            "total_solutions": len(all_solutions),
+            "total_solutions": len(non_dominated),
             "public_candidates": len(public_candidates),
             "hypervolume": hv,
         }
@@ -1313,7 +1473,7 @@ class NeuroQuantPipeline:
         # as an auxiliary metric so existing 2D analysis is unchanged.
         if self.config.hyperparams.use_latency_in_pareto:
             latencies = [
-                s.get("latency_mean_ms") for s in all_solutions
+                s.get("latency_mean_ms") for s in non_dominated
                 if s.get("latency_mean_ms")
             ]
             if latencies:
@@ -1328,7 +1488,7 @@ class NeuroQuantPipeline:
         self.tracker.end_run()
 
         self.report_lines.append(
-            f"[Phase 2] Pareto: {len(all_solutions)} non-dominated / "
+            f"[Phase 2] Pareto: {len(non_dominated)} non-dominated / "
             f"{len(public_candidates)} candidates, "
             f"HV={hv:.2f}"
         )
@@ -1338,7 +1498,7 @@ class NeuroQuantPipeline:
         self.ckpt.save_phase_json("phase_2_pareto", {
             "pareto_analysis": self.pareto_analysis,
             "hypervolume": hv,
-            "total_solutions": len(all_solutions),
+            "total_solutions": len(non_dominated),
             "public_candidates": len(public_candidates),
         })
 
@@ -1522,6 +1682,41 @@ class NeuroQuantPipeline:
 
         self.report_lines.append("[Phase 4] MLflow: summary logged")
 
+        # ── Deployment backends info ──
+        try:
+            from utils.deployment_export import available_backends
+            backends = available_backends()
+            self.results["deployment_backends"] = backends
+            logger.info("  Deployment backends: %s", backends)
+        except Exception:
+            pass
+
+        # ── Detection-only: TensorRT / OpenVINO export ──
+        # For detection workloads, edge deployment typically targets
+        # TensorRT (NVIDIA Jetson) or OpenVINO (Intel CPU/iGPU). Auto-
+        # invoke both backends when available, using each method's
+        # already-exported FP32/INT8 ONNX file as the source. Best
+        # method per family is chosen by accuracy. Failures are logged
+        # but never abort the pipeline — ONNX Runtime stays the
+        # mandatory baseline. Classification runs skip this entirely
+        # to keep the existing behaviour unchanged.
+        task = getattr(self.config, "task", "classification")
+        if task == "detection":
+            self._export_detection_backends()
+
+        # ── HTML Report Generation ──
+        # Compile all pipeline artifacts into a self-contained HTML file.
+        try:
+            from visualization.report import generate_html_report
+            report_html = generate_html_report(
+                str(self.output_dir), self.config, self.results,
+            )
+            if report_html:
+                self.tracker.log_artifact(report_html, "reports")
+                self.report_lines.append("[Phase 4] HTML report generated")
+        except Exception as exc:
+            logger.warning("  HTML report generation skipped: %s", exc)
+
         # Checkpoint: completion marker so a second --resume run short-circuits
         # this phase instead of re-logging a duplicate MLflow summary.
         self.ckpt.save_phase_json("phase_4_mlflow", {
@@ -1688,6 +1883,7 @@ class NeuroQuantPipeline:
         self.qat_result = {
             "model": qat_model,
             "final_val_acc": float(metadata.get("final_val_acc", 0.0)),
+            "test_top1": metadata.get("test_top1"),
             "best_epoch": int(metadata.get("best_epoch", 0)),
             "train_accuracy": metadata.get("train_accuracy", []),
             "val_accuracy": metadata.get("val_accuracy", []),
@@ -1695,12 +1891,40 @@ class NeuroQuantPipeline:
             "time_seconds": float(metadata.get("time_seconds", 0.0)),
         }
         self.results["qat_acc"] = self.qat_result["final_val_acc"]
+        if self.qat_result.get("test_top1") is not None:
+            self.results["qat_test_top1"] = float(self.qat_result["test_top1"])
         # Restore warmstart provenance so post-mortem reads from
         # checkpoint match the original run.
         if metadata.get("qat_warmstart_source"):
             self.results["qat_warmstart_source"] = metadata["qat_warmstart_source"]
         if metadata.get("qat_warmstart_id"):
             self.results["qat_warmstart_id"] = metadata["qat_warmstart_id"]
+
+        # Re-add QAT to the public summary table on resume so the
+        # rebuilt ``pareto_summary.json`` matches the original run.
+        from utils.common import compute_quantized_size_mb
+        qat_bw = self.best_config or {}
+        qat_dom_bw = (
+            self._dominant_bitwidth(qat_bw) if qat_bw
+            else int(self.config.hyperparams.qat_act_bitwidth)
+        )
+        qat_size_mb = (
+            compute_quantized_size_mb(self.model, qat_bw) if qat_bw else 0.0
+        )
+        qat_ebops = self._ebops_from_bitwidth(qat_bw) if qat_bw else 0.0
+        qat_headline_acc = (
+            float(self.qat_result["test_top1"])
+            if self.qat_result.get("test_top1") is not None
+            else float(self.qat_result.get("final_val_acc", 0.0) or 0.0)
+        )
+        self._add_summary_row(
+            f"QAT_INT{qat_dom_bw}",
+            qat_headline_acc,
+            0.0,  # latency not persisted in qat_meta
+            0.0,
+            qat_ebops,
+            qat_size_mb,
+        )
 
     def _resume_phase_1f_gptq_smooth_awq(self) -> None:
         data = self.ckpt.load_phase_json("phase_1f_gptq_smooth_awq")
@@ -2292,6 +2516,116 @@ class NeuroQuantPipeline:
             status = f"INCOMPLETE ({self.phases_passed}/{phases_total})"
         print(f"  Status: {status}")
         print("=" * 90)
+
+    def _export_detection_backends(self) -> None:
+        """Export the best per-method ONNX file to TensorRT and OpenVINO.
+
+        Detection workloads commonly target edge accelerators that need
+        a vendor-specific runtime (TRT for Jetson, OpenVINO for Intel
+        CPU/iGPU). For each quantization method that produced a usable
+        ``.onnx`` file in Phase 1f, attempt a TRT engine build (INT8
+        when calibration data is loadable, otherwise FP32) and an
+        OpenVINO IR conversion. Results are stashed under
+        ``self.results['deployment_exports']`` and logged as MLflow
+        artifacts. Missing backends or per-method failures are warnings,
+        never errors — the public ONNX path is the mandatory contract.
+        """
+        try:
+            from utils.deployment_export import (
+                available_backends, export_tensorrt, export_openvino,
+            )
+        except Exception as exc:
+            logger.warning("  deployment_export import failed: %s", exc)
+            return
+
+        backends = set(available_backends())
+        if not (backends & {"tensorrt", "openvino"}):
+            logger.info(
+                "  Detection deployment skipped — neither TensorRT nor "
+                "OpenVINO is installed."
+            )
+            return
+
+        # Pick the candidate ONNX file per method family by accuracy.
+        # Each method already exposes ``onnx_path`` (set in Phase 1f).
+        best_per_family: Dict[str, Dict[str, Any]] = {}
+        for res in self.method_results:
+            onnx_path = res.get("onnx_path")
+            if not onnx_path or not Path(onnx_path).exists():
+                continue
+            family = str(res.get("display_name", "")).split("_")[0] or "method"
+            cur = best_per_family.get(family)
+            if cur is None or float(res.get("accuracy", 0.0)) > float(
+                cur.get("accuracy", 0.0)
+            ):
+                best_per_family[family] = res
+
+        if not best_per_family:
+            logger.info(
+                "  Detection deployment skipped — no ONNX artefacts "
+                "available to convert."
+            )
+            return
+
+        export_dir = self.output_dir / "deployment"
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        exports: List[Dict[str, Any]] = []
+        for family, res in best_per_family.items():
+            onnx_path = res["onnx_path"]
+            tag = res.get("display_name", family)
+
+            if "tensorrt" in backends:
+                try:
+                    trt_info = export_tensorrt(
+                        onnx_path,
+                        str(export_dir / f"{tag}.trt"),
+                        tuple(self.config.input_shape),
+                        batch_size=self.config.hyperparams.latency_batch_size,
+                        precision="fp32",  # INT8 needs a calibration array
+                    )
+                    if trt_info:
+                        trt_info["method"] = tag
+                        exports.append(trt_info)
+                        self.tracker.log_artifact(
+                            trt_info["engine_path"], "deployment",
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "  TensorRT export failed for %s: %s", tag, exc,
+                    )
+
+            if "openvino" in backends:
+                try:
+                    ov_info = export_openvino(
+                        onnx_path, str(export_dir),
+                        model_name=tag,
+                    )
+                    if ov_info:
+                        ov_info["method"] = tag
+                        exports.append(ov_info)
+                        self.tracker.log_artifact(
+                            ov_info["xml_path"], "deployment",
+                        )
+                        if Path(ov_info["bin_path"]).exists():
+                            self.tracker.log_artifact(
+                                ov_info["bin_path"], "deployment",
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "  OpenVINO export failed for %s: %s", tag, exc,
+                    )
+
+        if exports:
+            self.results["deployment_exports"] = exports
+            self.report_lines.append(
+                f"[Phase 4] Detection deployment: "
+                f"{len(exports)} engine(s) exported to {export_dir}"
+            )
+            logger.info(
+                "  Detection deployment: %d artefact(s) under %s",
+                len(exports), export_dir,
+            )
 
     def _build_pareto_summary(self) -> Dict[str, Any]:
         """Build the public Pareto comparison dict for I3.

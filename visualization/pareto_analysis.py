@@ -92,7 +92,10 @@ class ParetoAnalyzer:
         self.fp32_ebops = fp32_ebops
         self.model_name = model_name
 
-        # Sort solutions by accuracy (highest first = lowest loss)
+        # Sort solutions by accuracy (highest first = lowest loss).
+        # All public solutions are included; dominated entries carry
+        # ``is_dominated=True`` so downstream visualisers can highlight
+        # the non-dominated front.
         self.solutions_ranked = sorted(
             self.public_solutions, key=lambda s: s.get("accuracy_loss", 0.0)
         )
@@ -201,6 +204,9 @@ class ParetoAnalyzer:
                 # Wave 5: forward the third Pareto axis (ORT latency)
                 # so the 3-D plot can read it without an extra lookup.
                 "latency_mean_ms": sol.get("latency_mean_ms"),
+                # Phase 2 merge marks dominated solutions so plots/tables
+                # can show every candidate while highlighting the front.
+                "is_dominated": sol.get("is_dominated", False),
             })
 
         return enriched
@@ -529,20 +535,22 @@ class ParetoAnalyzer:
                               f"ebops={sol.get('ebops', 0):.0f})")
         lines.append("")
 
-        lines.append("## Solution Rankings")
+        lines.append("## All Solutions (by accuracy)")
         lines.append("")
         lines.append("| Rank | Solution | Top-1 | Loss | Size (MiB) | "
-                      "Compression | INT4 % |")
+                      "Compression | INT4 % | Status |")
         lines.append("|------|----------|-------|------|------------|"
-                      "-------------|--------|")
+                      "-------------|--------|--------|")
         for i, sol in enumerate(solutions):
+            status = "Dominated" if sol.get("is_dominated", False) else "★ Pareto"
             lines.append(
                 f"| {i+1} | {sol['solution_id']} | "
                 f"{sol['accuracy']:.2f}% | "
                 f"{sol['accuracy_loss']:.2f}% | "
                 f"{sol.get('model_size_mb', sol['ebops_mb']):.2f} | "
                 f"{sol['compression_ratio']:.1f}x | "
-                f"{sol['int4_percent']:.0f}% |"
+                f"{sol['int4_percent']:.0f}% | "
+                f"{status} |"
             )
         lines.append("")
 
@@ -631,13 +639,11 @@ class ParetoVisualizer:
     def plot_pareto_scatter(self, output_path: Path) -> Path:
         """Public 2-D Pareto scatter: Top-1 accuracy vs Model size (MiB).
 
-        Model size is the first-class second objective: accurate, small
-        and quantization-method aware. Each point is labelled with its
-        canonical bitwidth-tagged ID (``GPTQ_INT8``, ``AWQ_INT4``, …)
-        and uses the per-method colour/marker from
-        ``visualization.style.METHOD_STYLE``. NSGA internal solutions
-        (IDs starting ``nsga_``) are filtered out before plotting; they
-        live in checkpoints for reproducibility.
+        Shows ALL evaluated solutions. Non-dominated solutions are drawn
+        fully opaque with method-specific colours; dominated solutions
+        are rendered faded (alpha ≈ 0.35, dashed edge) so the Pareto
+        front stands out clearly. The dashed frontier line connects
+        only non-dominated points.
         """
         from visualization.style import style_for, family_of
 
@@ -656,36 +662,66 @@ class ParetoVisualizer:
             plt.close(fig)
             return output_path
 
-        # Frontier connector ordered by model size — illustrative only.
-        sorted_pts = sorted(
-            ((s["ebops_mb"], s["accuracy"]) for s in public_solutions),
-            key=lambda p: p[0],
-        )
-        ax.plot(
-            [p[0] for p in sorted_pts],
-            [p[1] for p in sorted_pts],
-            color=self.ACCENT["frontier"], linestyle="--",
-            linewidth=1.2, alpha=0.45, zorder=2, label="_frontier",
-        )
+        # Separate non-dominated and dominated sets.
+        nd_solutions = [s for s in public_solutions if not s.get("is_dominated", False)]
+        dom_solutions = [s for s in public_solutions if s.get("is_dominated", False)]
 
-        # Per-method scatter + per-point ID label so the bitwidth is
-        # always visible alongside the marker.
-        plotted_families = set()
-        for s in public_solutions:
+        # Frontier connector — only non-dominated, ordered by model size.
+        if nd_solutions:
+            sorted_pts = sorted(
+                ((s["ebops_mb"], s["accuracy"]) for s in nd_solutions),
+                key=lambda p: p[0],
+            )
+            ax.plot(
+                [p[0] for p in sorted_pts],
+                [p[1] for p in sorted_pts],
+                color=self.ACCENT["frontier"], linestyle="--",
+                linewidth=1.2, alpha=0.45, zorder=2, label="_frontier",
+            )
+
+        # --- Plot dominated solutions first (faded, behind) ---
+        plotted_families_dom: set = set()
+        for s in dom_solutions:
             tag = s.get("solution_id", "")
             fam = family_of(tag)
             color, marker = style_for(tag)
             comp = s.get("compression_ratio", 1.0) or 1.0
             size = float(max(60, min(comp * 28, 320)))
-            label = fam if fam not in plotted_families else None
-            plotted_families.add(fam)
+            label_dom = f"{fam} (dominated)" if fam not in plotted_families_dom else None
+            plotted_families_dom.add(fam)
+            ax.scatter(
+                s["ebops_mb"], s["accuracy"],
+                marker=marker, s=size, c=color,
+                edgecolors="#999999", linewidths=1.0,
+                alpha=0.35, zorder=3, label=label_dom,
+                linestyle="--",
+            )
+            ax.annotate(
+                tag,
+                xy=(s["ebops_mb"], s["accuracy"]),
+                xytext=(7, 5), textcoords="offset points",
+                fontsize=7.5, color="#888888",
+                bbox=dict(boxstyle="round,pad=0.18",
+                          fc="white", ec="#eeeeee", alpha=0.7),
+                zorder=6,
+            )
+
+        # --- Plot non-dominated solutions (full opacity, on top) ---
+        plotted_families_nd: set = set()
+        for s in nd_solutions:
+            tag = s.get("solution_id", "")
+            fam = family_of(tag)
+            color, marker = style_for(tag)
+            comp = s.get("compression_ratio", 1.0) or 1.0
+            size = float(max(60, min(comp * 28, 320)))
+            label = fam if fam not in plotted_families_nd else None
+            plotted_families_nd.add(fam)
             ax.scatter(
                 s["ebops_mb"], s["accuracy"],
                 marker=marker, s=size, c=color,
                 edgecolors="white", linewidths=1.0,
                 alpha=0.9, zorder=5, label=label,
             )
-            # Inline bitwidth-aware label next to every public point.
             ax.annotate(
                 tag,
                 xy=(s["ebops_mb"], s["accuracy"]),
@@ -708,7 +744,7 @@ class ParetoVisualizer:
             ext_id = ext.get("solution_id", "")
             if str(ext_id).startswith("nsga_"):
                 continue  # don't highlight private NSGA solutions
-            for s in public_solutions:
+            for s in nd_solutions:
                 if s["solution_id"] != ext_id:
                     continue
                 ax.scatter(
@@ -721,16 +757,18 @@ class ParetoVisualizer:
 
         ax.set_xlabel("Model size (MiB)")
         ax.set_ylabel("Top-1 accuracy (%)")
+        n_nd = len(nd_solutions)
+        n_total = len(public_solutions)
         ax.set_title(
             f"Accuracy vs Model size — {self.model_name}\n"
-            f"{len(public_solutions)} public methods · "
+            f"{n_total} methods ({n_nd} Pareto-optimal) · "
             f"HV={self.metrics.get('hypervolume', 0):.2g}",
             pad=12,
         )
         # Marker-size legend hint as caption.
         ax.text(
             0.99, 0.02,
-            "marker size ∝ compression ratio · labels show INT bitwidth",
+            "marker size ∝ compression ratio · faded = dominated",
             transform=ax.transAxes, ha="right", va="bottom",
             fontsize=9, color="#666666",
             bbox=dict(boxstyle="round,pad=0.3", fc="white",
@@ -863,7 +901,7 @@ class ParetoVisualizer:
 
         ax.set_xlabel("Solution")
         ax.set_ylabel("Layer count")
-        ax.set_title("Bitwidth distribution per Pareto solution")
+        ax.set_title("Bitwidth distribution per solution")
         ax.set_xticks(x)
         ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=9)
         ax.legend(loc="upper right", title="Bitwidth")
@@ -876,22 +914,38 @@ class ParetoVisualizer:
         return output_path
 
     def plot_metrics_table(self, output_path: Path) -> Path:
-        """Visual table of solution rankings with key metrics (light theme)."""
+        """Visual table of ALL solution rankings with key metrics.
+
+        Shows every evaluated method sorted by accuracy (highest first).
+        A 'Status' column indicates whether each solution is
+        Pareto-optimal (★) or dominated.  Dominated rows are drawn
+        with a light grey background for at-a-glance distinction.
+        """
         self._setup_style()
+
+        # Sort all solutions by accuracy descending (lowest loss first).
+        sorted_sols = sorted(
+            self.solutions,
+            key=lambda s: s.get("accuracy_loss", 0.0),
+        )
+
         fig, ax = plt.subplots(
-            figsize=(12, max(3, len(self.solutions) * 0.42 + 1.6)),
+            figsize=(14, max(3, len(sorted_sols) * 0.42 + 1.6)),
         )
         ax.axis("off")
 
-        if not self.solutions:
+        if not sorted_sols:
             fig.savefig(output_path)
             plt.close(fig)
             return output_path
 
         headers = ["Rank", "Solution", "Top-1", "Loss", "Size (MiB)",
-                   "Compression", "INT4 %"]
+                   "Compression", "INT4 %", "Status"]
         cell_data = []
-        for i, s in enumerate(self.solutions):
+        is_dominated_flags = []
+        for i, s in enumerate(sorted_sols):
+            dominated = s.get("is_dominated", False)
+            is_dominated_flags.append(dominated)
             cell_data.append([
                 str(i + 1),
                 s["solution_id"],
@@ -900,6 +954,7 @@ class ParetoVisualizer:
                 f"{s.get('model_size_mb', s['ebops_mb']):.2f}",
                 f"{s['compression_ratio']:.1f}x",
                 f"{s['int4_percent']:.0f}%",
+                "Dominated" if dominated else "★ Pareto",
             ])
 
         table = ax.table(
@@ -918,12 +973,21 @@ class ParetoVisualizer:
                 cell.set_facecolor(self.ACCENT["header_bg"])
                 cell.set_text_props(color="white", fontweight="bold")
             else:
-                cell.set_facecolor("#f7f7fa" if row % 2 == 0 else "white")
-                cell.set_text_props(color="#222222")
+                data_idx = row - 1  # row 0 is header
+                if data_idx < len(is_dominated_flags) and is_dominated_flags[data_idx]:
+                    # Dominated rows: light grey
+                    cell.set_facecolor("#f0f0f0")
+                    cell.set_text_props(color="#777777")
+                else:
+                    cell.set_facecolor("#f7f7fa" if row % 2 == 0 else "white")
+                    cell.set_text_props(color="#222222")
             cell.set_edgecolor("#bbbbbb")
 
+        n_pareto = sum(1 for d in is_dominated_flags if not d)
+        n_total = len(sorted_sols)
         ax.set_title(
-            f"Pareto solution rankings — {self.model_name}",
+            f"All solutions — {self.model_name}  "
+            f"({n_pareto} Pareto-optimal / {n_total} total)",
             pad=18,
         )
 

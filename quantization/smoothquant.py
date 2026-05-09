@@ -40,6 +40,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from config import QuantizationConfig, QuantizationResult
+from quantization.alpha_search import (
+    ClusterAmortizer, closed_form_alpha, golden_section_alpha,
+)
 from quantization.base import BaseQuantizer
 from utils.numerics import MAX_MIGRATION, MIN_MIGRATION, MIN_SCALE
 
@@ -77,8 +80,21 @@ class SmoothQuantQuantizer(BaseQuantizer):
         alpha = 1.0: All difficulty migrated to weights
     """
 
-    def __init__(self, model: nn.Module, config: QuantizationConfig) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        config: QuantizationConfig,
+        *,
+        cluster_result: Optional[Dict[str, Any]] = None,
+        hessian_diag: Optional[Dict[str, float]] = None,
+    ) -> None:
         super().__init__(model, config)
+        # Phase 1a outputs (optional). When supplied AND
+        # ``alpha_cluster_amortize`` is on, the per-layer α search runs
+        # only on one representative per Hessian/Fisher cluster and the
+        # winner is broadcast to every other layer in that cluster.
+        self._cluster_result = cluster_result
+        self._hessian_diag = hessian_diag
 
     def apply_smoothing_only(
         self,
@@ -151,27 +167,76 @@ class SmoothQuantQuantizer(BaseQuantizer):
         alpha_grid = list(getattr(
             hp, "smoothquant_alpha_grid", [0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
         ))
+        strategy = str(getattr(
+            hp, "smoothquant_alpha_strategy", "closed_form",
+        )).lower()
+        amortize = bool(getattr(hp, "alpha_cluster_amortize", False))
 
         target_layers = self._find_quantizable_layers(q_model)
         smooth_only = bitwidth is None
         bw_label = "smooth-only" if smooth_only else f"INT{bitwidth}"
         logger.info(
-            "SmoothQuant %s: %d layers, %s α (%s)",
+            "SmoothQuant %s: %d layers, %s α (strategy=%s)",
             bw_label, len(target_layers),
             "per-layer" if per_layer else "global",
-            f"grid={alpha_grid}" if per_layer else f"α={global_alpha:.2f}",
+            strategy if per_layer else "fixed",
         )
 
-        # Step 1: Collect activation statistics + (when grid-searching)
-        # one calibration sample per layer for the α scoring step.
+        # Step 1: Collect activation statistics. Per-layer input samples
+        # are only needed when α is searched against an MSE objective
+        # (``grid`` strategy); the closed-form path skips that pool
+        # entirely, which is half the speedup.
         act_max, weight_max = self._collect_stats(
             q_model, target_layers, calibration_loader, num_batches,
         )
+        need_x_samples = per_layer and strategy == "grid"
         layer_x_samples: Dict[str, torch.Tensor] = {}
-        if per_layer:
+        if need_x_samples:
             layer_x_samples = self._collect_layer_inputs_for_alpha_search(
                 q_model, target_layers, calibration_loader, num_batches,
             )
+
+        # Build the cluster amortizer once. When ``amortize`` is off or
+        # Phase 1a clusters were not provided, every layer becomes its
+        # own cluster and the amortizer is effectively a no-op.
+        amortizer = ClusterAmortizer.from_cluster_result(
+            self._cluster_result if amortize else None,
+            list(target_layers.keys()),
+            hessian_diag=self._hessian_diag,
+        )
+        if per_layer and amortize and self._cluster_result:
+            logger.info(
+                "    cluster-amortized α: %d clusters cover %d layers",
+                amortizer.num_clusters(), len(target_layers),
+            )
+
+        # Two-pass when amortizing: first pick α for every representative
+        # so its value is known before non-rep layers in the same cluster
+        # consume it during the main quantization pass below.
+        broadcast_alphas: Dict[str, float] = {}
+        if per_layer and amortize:
+            rep_alphas: Dict[str, float] = {}
+            for layer_name, module in target_layers.items():
+                if not amortizer.is_representative(layer_name):
+                    continue
+                if layer_name not in act_max:
+                    continue
+                if isinstance(module, nn.Conv2d) and module.groups > 1:
+                    continue
+                a_max = act_max[layer_name].to(self.device)
+                w_max = weight_max[layer_name].to(self.device)
+                if strategy == "closed_form":
+                    rep_alphas[layer_name] = closed_form_alpha(a_max, w_max)
+                elif strategy == "grid" and layer_name in layer_x_samples:
+                    rep_alphas[layer_name] = self._search_layer_alpha(
+                        module,
+                        layer_x_samples[layer_name].to(self.device),
+                        a_max, w_max, alpha_grid,
+                        bitwidth if bitwidth is not None else 8,
+                    )
+                else:
+                    rep_alphas[layer_name] = global_alpha
+            broadcast_alphas = amortizer.broadcast(rep_alphas)
 
         chosen_alpha: Dict[str, float] = {}
 
@@ -204,12 +269,27 @@ class SmoothQuantQuantizer(BaseQuantizer):
             a_max = act_max[layer_name].to(self.device)
             w_max = weight_max[layer_name].to(self.device)
 
-            # Choose α: either per-layer grid search or the global value.
-            # The α search needs a quantizer; when smooth_only is set we
-            # score against the bitwidth that the downstream method
-            # (e.g. GPTQ) will use — assume INT8 as a conservative default.
+            # Choose α. Decision tree:
+            #   1. ``per_layer == False``         → global α (legacy ablation).
+            #   2. amortizer + non-representative → reuse rep's α (filled in
+            #      after this loop) and continue with global α as a stand-in
+            #      for the downstream maths.
+            #   3. ``strategy == 'closed_form'``  → analytical formula. No
+            #      calibration sample needed.
+            #   4. ``strategy == 'grid'``         → exhaustive search.
+            # The α search needs a quantizer bitwidth; when ``smooth_only``
+            # is set we score against the bitwidth the downstream method
+            # (e.g. GPTQ in F4) will use — assume INT8 as a conservative
+            # default.
             search_bw = bitwidth if bitwidth is not None else 8
-            if per_layer and layer_name in layer_x_samples:
+            if not per_layer:
+                alpha = global_alpha
+            elif layer_name in broadcast_alphas:
+                # Cluster amortization: rep already searched above; reuse.
+                alpha = broadcast_alphas[layer_name]
+            elif strategy == "closed_form":
+                alpha = closed_form_alpha(a_max, w_max)
+            elif strategy == "grid" and layer_name in layer_x_samples:
                 alpha = self._search_layer_alpha(
                     module, layer_x_samples[layer_name].to(self.device),
                     a_max, w_max, alpha_grid, search_bw,

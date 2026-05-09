@@ -1,7 +1,5 @@
 # NeuroQuant v2.0
 
-[![tests](https://img.shields.io/badge/tests-169%20passing-brightgreen)]()
-[![coverage](https://img.shields.io/badge/coverage-81%25-brightgreen)]()
 [![python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue)]()
 [![license](https://img.shields.io/badge/license-MIT-green)]()
 
@@ -34,7 +32,7 @@ NeuroQuant takes a pre-trained PyTorch model and produces deployable INT8 / mixe
    └────────────────────────────────────────────────────────────────────────┘
 ```
 
-The pipeline runs to completion in **~60 seconds** on CPU for a CIFAR-class model (verified by [`tests/integration/test_full_pipeline_smoke.py`](tests/integration/test_full_pipeline_smoke.py)).
+The pipeline runs to completion in **~60 seconds** on CPU for a CIFAR-class model.
 
 ---
 
@@ -52,8 +50,7 @@ This framework was built deliberately to avoid the "research prototype" failure 
 | **Strict determinism**          | `set_seed(strict=True)` enforces `CUBLAS_WORKSPACE_CONFIG`, `use_deterministic_algorithms`, `cudnn.deterministic`. |
 | **Safe checkpoints**            | All `torch.load(weights_only=True)`; pickle path is closed. Architectural wrappers persist as JSON manifests.     |
 | **Real W+A QAT**                | INT8 activations always; weight parametrisation via `torch.nn.utils.parametrize` (autograd-aware STE).            |
-| **Validated config**            | Pydantic v2 dataclasses with field validators (Wave 6 L1) — bad values fail at load, not deep in a phase.         |
-| **CI + coverage gate**          | 169 unit tests + 2 integration smokes; coverage gated at ≥80% lines on every PR (Wave 6 K2 + CI workflow).        |
+| **Validated config**            | Pydantic v2 dataclasses with field validators — bad values fail at load, not deep in a phase.                      |
 
 ---
 
@@ -71,9 +68,7 @@ neuroquant --help
 ```bash
 git clone https://github.com/AbdelazizElHelaly11/NeuroQuant
 cd NeuroQuant
-pip install -e ".[dev]"        # editable + test/lint extras
-pytest                         # 169 tests, ~90s
-pytest -m integration --no-cov # 2 end-to-end smokes, ~60s each
+pip install -e ".[dev]"        # editable + dev extras
 ```
 
 GPU users:
@@ -162,17 +157,17 @@ ValueError: Configuration validation failed:
 
 ## Architecture
 
-The framework was built in seven waves, each ending with a strict-format report and tests. Per-wave architecture notes live in [`docs/architecture/`](docs/architecture/):
+The framework was built in seven waves, each ending with a strict-format report. Per-wave architecture notes live in [`docs/architecture/`](docs/architecture/):
 
-| Wave | Theme                          | Notes                                      | Tests |
-| ---- | ------------------------------ | ------------------------------------------ | ----- |
-| 1    | Foundation (security + leakage) | [wave1.md](docs/architecture/wave1.md)     | 30    |
-| 2    | Real W+A QAT pipeline           | [wave2.md](docs/architecture/wave2.md)     | 22    |
-| 3    | Method audits + Fisher          | [wave3.md](docs/architecture/wave3.md)     | 5     |
-| 4    | ONNX + hardware-aware search    | [wave4.md](docs/architecture/wave4.md)     | 20    |
-| 5    | Reporting + MLflow              | [wave5.md](docs/architecture/wave5.md)     | 18    |
-| 6    | Testing + CI + Pydantic         | [wave6.md](docs/architecture/wave6.md)     | 38    |
-| 7    | Packaging + docs                | [wave7.md](docs/architecture/wave7.md)     | 10    |
+| Wave | Theme                          | Notes                                      |
+| ---- | ------------------------------ | ------------------------------------------ |
+| 1    | Foundation (security + leakage) | [wave1.md](docs/architecture/wave1.md)     |
+| 2    | Real W+A QAT pipeline           | [wave2.md](docs/architecture/wave2.md)     |
+| 3    | Method audits + Fisher          | [wave3.md](docs/architecture/wave3.md)     |
+| 4    | ONNX + hardware-aware search    | [wave4.md](docs/architecture/wave4.md)     |
+| 5    | Reporting + MLflow              | [wave5.md](docs/architecture/wave5.md)     |
+| 6    | Config validation (Pydantic)    | [wave6.md](docs/architecture/wave6.md)     |
+| 7    | Packaging + docs                | [wave7.md](docs/architecture/wave7.md)     |
 
 ---
 
@@ -190,18 +185,6 @@ The framework was built in seven waves, each ending with a strict-format report 
 
 ---
 
-## Tests
-
-```bash
-pytest                           # 169 unit tests + coverage gate (≥80%)
-pytest -m integration --no-cov   # full-pipeline smokes (~60s each)
-pytest test_wave4_production.py  # one wave at a time
-```
-
-CI runs the same commands on Linux / Python 3.10–3.12. See [`.github/workflows/tests.yml`](.github/workflows/tests.yml).
-
----
-
 ## License
 
 MIT. See [LICENSE](LICENSE) for the full text.
@@ -210,4 +193,4 @@ MIT. See [LICENSE](LICENSE) for the full text.
 
 ## Acknowledgements
 
-The seven-wave production hardening was specified, implemented, and tested in collaboration with **Claude Opus 4.7 (1M context)**. Every wave's commit ends with a strict-format report and a bundled test suite — see the per-wave docs under [`docs/architecture/`](docs/architecture/) for the decision matrix that drove each iteration.
+The seven-wave production hardening was specified, implemented, and refined in collaboration with **Claude Opus 4.7 (1M context)**. Per-wave architecture notes live under [`docs/architecture/`](docs/architecture/).
