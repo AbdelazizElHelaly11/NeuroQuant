@@ -468,7 +468,15 @@ def export_quantize_and_benchmark(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    fp32_path = out_dir / f"{name}.fp32.onnx"
+    # The FP32 stem keeps a ".fp32" precision suffix only when an INT8
+    # export is being produced alongside it (so the two precisions are
+    # distinguishable on disk). For an FP32-only export we drop the
+    # suffix — ``foo.onnx`` is clearer than ``foo.fp32.onnx`` when
+    # there's nothing else with the same stem.
+    if do_int8:
+        fp32_path = out_dir / f"{name}.fp32.onnx"
+    else:
+        fp32_path = out_dir / f"{name}.onnx"
     int8_path = out_dir / f"{name}.int8.onnx"
 
     info: Dict[str, Any] = {"name": name}

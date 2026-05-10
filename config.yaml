@@ -87,11 +87,21 @@ hyperparams:
   hessian_estimator: "fisher"           # fisher | diag_hessian
 
   # NSGA-II search
-  nsga_population_size: 8
-  nsga_generations: 20
+  nsga_population_size: 32
+  nsga_generations: 30
   nsga_crossover_prob: 0.9
   nsga_mutation_prob: 0.1
   nsga_accuracy_objective: "top1"   # top1 | top5 — objective driving NSGA fitness
+  # Search-space granularity:
+  #   per_layer — one gene per Conv/Linear weight (2^N space, HAWQ-V3 style)
+  #   cluster   — one gene per Hessian tier (2^k legacy / paper-baseline)
+  nsga_search_mode: "per_layer"
+  # Surrogate-assisted search (BRP-NAS / OFA-style).
+  nsga_use_surrogate: true
+  nsga_surrogate_warmup_evals: 30
+  nsga_surrogate_proposed_per_gen: 256
+  # Hessian-aware mutation:
+  nsga_sensitivity_weighted_mutation: true
 
   # FITCompress seed generation
   fit_low_percentile: 0.25          # below → force INT4 (compress)
@@ -165,7 +175,9 @@ hyperparams:
 
   # Wave 4: ONNX export + hardware-aware search (J1/J2/J3/J4/C1/C2)
   onnx_export_enabled: true         # export each quantized result to .onnx + measure ORT latency
-  hardware_aware_search: false      # opt-in: build per-layer LUT and run NSGA in 3-obj mode
+  hardware_aware_search: true       # 3-obj NSGA [acc, size, latency] — default on.
+                                    # Set false for 2-obj paper-baseline ablations
+                                    # or when ONNX runtime is unavailable.
   latency_lut_bitwidths: [4, 8]     # bitwidths the LUT profiles (must be subset of {4, 8})
 
 # ── Phases ───────────────────────────────────────────────────────────────

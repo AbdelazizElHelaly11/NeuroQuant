@@ -499,25 +499,38 @@ class LayerClusterer:
         Group parameters by layer type using shape-based classification.
         Works generically for ANY model architecture.
 
+        Only ``Conv2d`` and ``Linear`` weights are clustered: those are
+        the parameters NSGA-II actually searches over. Including
+        ``BatchNorm``, ``Bias``, or ``Other`` entries here was the source
+        of the search-space collapse — those tensors got their own
+        clusters, but NSGA later filters them out, so e.g. a 2^7
+        nominal space shrank to 2^3 when 4 of the 7 clusters turned out
+        to be all-BN. By excluding them at the source, the cluster
+        count, the ``search_space_size`` statistic, and the actual
+        NSGA gene count all agree.
+
         Returns:
             Dict mapping type name → list of LayerSensitivity entries.
-            Types: 'Conv2d', 'Linear', 'BatchNorm', 'Bias', 'Other'
+            Only ``Conv2d`` and ``Linear`` keys are populated; BN and
+            biases stay FP32 by convention.
         """
         groups: Dict[str, List[LayerSensitivity]] = {
             "Conv2d": [],
             "Linear": [],
-            "BatchNorm": [],
-            "Bias": [],
-            "Other": [],
         }
-
+        skipped = 0
         for name, entry in self.hessian_results.items():
             layer_type = entry["layer_type"]
             if layer_type in groups:
                 groups[layer_type].append(entry)
             else:
-                groups["Other"].append(entry)
-
+                skipped += 1
+        if skipped:
+            logger.info(
+                "  Skipped %d non-quantizable parameters (BN/bias/other) — "
+                "they stay FP32 and are excluded from the search space.",
+                skipped,
+            )
         return groups
 
     def _compute_percentiles(

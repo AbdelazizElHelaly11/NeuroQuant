@@ -64,6 +64,11 @@ dependencies = [
     "onnx>=1.14",
     "onnxruntime>=1.16",
     "onnxscript>=0.1",
+    # Surrogate-assisted NSGA-II (Phase 1c). Used by
+    # ``quantization.surrogate.AccuracySurrogate`` to cheaply rank
+    # mixed-precision candidates before real evaluation; gracefully
+    # disables itself if the install is missing.
+    "scikit-learn>=1.3",
 ]
 
 [project.optional-dependencies]

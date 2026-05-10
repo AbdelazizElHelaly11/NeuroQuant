@@ -197,6 +197,10 @@ class NeuroQuantPipeline:
         self.fit_seed: Dict = {}
         self.pareto_front: Dict = {}
         self.best_config: Dict[str, int] = {}
+        # Separate config used by AdaRound (Phase 1d). May differ from
+        # ``best_config`` when the QAT warmstart points at an all-INT8
+        # solution — see phase_1c_nsga_search for the rationale.
+        self.adaround_config: Dict[str, int] = {}
         self.adaround_result: Dict = {}
         self.qat_result: Dict = {}
         self.method_results: List[Dict] = []
@@ -371,11 +375,16 @@ class NeuroQuantPipeline:
                 )
                 if is_onnx_available():
                     onnx_dir = self.output_dir / "onnx"
+                    # ``name`` becomes the file stem; the helper appends
+                    # ``.fp32.onnx`` / ``.int8.onnx`` as the precision
+                    # suffix. Pass "fp32_baseline" so the resulting file
+                    # is ``fp32_baseline.fp32.onnx`` instead of the
+                    # confusing ``fp32.fp32.onnx``.
                     self.fp32_onnx = export_quantize_and_benchmark(
                         self.model,
                         self.config.input_shape,
                         str(onnx_dir),
-                        name="fp32",
+                        name="fp32_baseline",
                         calibration_loader=None,  # FP32 needs no calibration
                         do_int8=False,
                         batch_size=hp.latency_batch_size,
@@ -632,6 +641,10 @@ class NeuroQuantPipeline:
         nsga = NSGAIIClusterSearch(
             self.model, self.cluster_assignments, self.config,
             latency_lut=latency_lut,
+            # Phase 1a output is forwarded so per-layer mode + the
+            # sensitivity-weighted mutation operator + the surrogate's
+            # Hessian features all share the same source of truth.
+            hessian_diag=getattr(self, "hessian_diag", None),
         )
         # NSGA fitness reads from the held-out ``search`` slice (10% of
         # the original train set, eval-time transforms). Falling back to
@@ -655,6 +668,16 @@ class NeuroQuantPipeline:
         if self.pareto_front["solutions"]:
             ranked = self.pareto_front["solutions"]
             selected = ranked[0]
+            # Prefer the most BALANCED mixed-bitwidth solution — i.e. the
+            # one whose INT4 fraction is closest to 50%. The previous
+            # logic just picked ``mixed_ranked[0]``, which routinely
+            # selected solutions with a single INT4 layer (e.g. only
+            # the classifier head). That made AdaRound a no-op (it
+            # only has weights with bitwidth < 8 to learn-round) and
+            # masked the real mixed-precision behaviour in the headline
+            # numbers. Balance is the right tie-breaker because it
+            # exercises both code paths and gives the downstream
+            # AdaRound / QAT phases something meaningful to do.
             mixed_ranked = [
                 s for s in ranked
                 if self._is_mixed_bitwidth_assignment(
@@ -662,13 +685,26 @@ class NeuroQuantPipeline:
                 )
             ]
             if mixed_ranked:
+                def _balance_score(sol: Dict[str, Any]) -> float:
+                    bw = sol.get("bitwidth_assignment", {}) or {}
+                    int4 = sum(1 for v in bw.values() if int(v) == 4)
+                    total = sum(1 for v in bw.values() if int(v) in (4, 8))
+                    if total == 0:
+                        return 1.0  # worst
+                    return abs(int4 / total - 0.5)
+                mixed_ranked.sort(key=_balance_score)
                 selected = mixed_ranked[0]
+                bw = selected.get("bitwidth_assignment", {})
+                int4 = sum(1 for v in bw.values() if int(v) == 4)
+                int8 = sum(1 for v in bw.values() if int(v) == 8)
                 logger.info(
                     "  Phase 1c: selected mixed PTQ config %s for "
-                    "materialization (acc=%.2f%%, size=%.2f MiB).",
+                    "materialization (acc=%.2f%%, size=%.2f MiB, "
+                    "INT4/INT8 split=%d/%d).",
                     selected.get("solution_id", "unknown"),
                     float(selected.get("accuracy", 0.0)),
                     float(selected.get("model_size_mb", 0.0)),
+                    int4, int8,
                 )
             self.best_config = selected.get("bitwidth_assignment", {})
 
@@ -790,10 +826,51 @@ class NeuroQuantPipeline:
                 warmstart_source, warmstart_pick.get("display_name"),
             )
 
+        # ── Persist a SEPARATE config for AdaRound ──
+        # ``self.best_config`` is now whatever the QAT warmstart resolved
+        # to — which can be an all-INT8 solution if the warmstart source
+        # is ``ptq_best_acc`` and the highest-accuracy NSGA solution is
+        # uniform. AdaRound on an all-INT8 config is a no-op (INT8 is
+        # too close to FP32 for learned rounding to find headroom).
+        # ``adaround_config`` keeps the most-balanced *mixed* solution
+        # from the Pareto front so AdaRound always has real INT4 layers
+        # to work on. Falls back to ``best_config`` when no mixed
+        # solutions exist (e.g. all candidates are uniform INT8).
+        mixed_solutions = [
+            s for s in self.pareto_front.get("solutions", [])
+            if self._is_mixed_bitwidth_assignment(
+                s.get("bitwidth_assignment", {})
+            )
+        ]
+        if mixed_solutions:
+            def _balance_score(sol: Dict[str, Any]) -> float:
+                bw = sol.get("bitwidth_assignment", {}) or {}
+                int4 = sum(1 for v in bw.values() if int(v) == 4)
+                total = sum(1 for v in bw.values() if int(v) in (4, 8))
+                return abs(int4 / total - 0.5) if total > 0 else 1.0
+            mixed_solutions.sort(key=_balance_score)
+            self.adaround_config = dict(
+                mixed_solutions[0].get("bitwidth_assignment") or {}
+            )
+            int4 = sum(1 for v in self.adaround_config.values() if int(v) == 4)
+            int8 = sum(1 for v in self.adaround_config.values() if int(v) == 8)
+            logger.info(
+                "  Phase 1c: AdaRound config from %s "
+                "(INT4/INT8 split=%d/%d).",
+                mixed_solutions[0].get("solution_id", "?"), int4, int8,
+            )
+        else:
+            self.adaround_config = dict(self.best_config)
+            logger.info(
+                "  Phase 1c: no mixed Pareto solution; AdaRound will use "
+                "the warmstart config (uniform-bitwidth no-op)."
+            )
+
         # Checkpoint
         self.ckpt.save_phase_json("phase_1c_nsga_search", {
             "pareto_front": self.pareto_front,
             "best_config": self.best_config,
+            "adaround_config": self.adaround_config,
             "ptq_best_acc_result": ptq_best_acc_result,
             "ptq_best_tradeoff_result": ptq_best_tradeoff_result,
             "qat_warmstart_source": warmstart_source,
@@ -810,9 +887,14 @@ class NeuroQuantPipeline:
 
         from quantization.adaround import AdaroundOptimizer
 
+        # Use ``adaround_config`` (most-balanced mixed Pareto solution)
+        # rather than ``best_config`` (QAT warmstart pick — often
+        # uniform INT8). Falls back to ``best_config`` only when no
+        # mixed solution exists in the Pareto front.
+        ada_cfg = self.adaround_config or self.best_config
         adaround_model = copy.deepcopy(self.model)
         adaround_opt = AdaroundOptimizer(
-            adaround_model, self.best_config, self.config,
+            adaround_model, ada_cfg, self.config,
             calib_loader=self.calib_loader,
         )
         self.adaround_result = adaround_opt.run()
@@ -946,31 +1028,77 @@ class NeuroQuantPipeline:
         # what ``_build_pareto_summary`` consumes — so the headline JSON
         # silently dropped it (n_methods=7 with 8 candidates evaluated).
         # Size + ebops come from ``self.best_config`` (the NSGA-chosen
-        # bitwidth assignment QAT was warmstarted on); QAT does not
-        # currently emit ONNX so the deployment fields stay null.
+        # bitwidth assignment QAT was warmstarted on).
         from utils.common import compute_quantized_size_mb
         qat_bw = self.best_config or {}
-        qat_dom_bw = (
-            self._dominant_bitwidth(qat_bw) if qat_bw
-            else int(self.config.hyperparams.qat_act_bitwidth)
-        )
+        # Use the same MIXED-vs-uniform label rule as the PTQ path: the
+        # warmstart often hands QAT a mixed-bitwidth config (when
+        # ``mixed_ranked`` won the picker), in which case calling the
+        # result "QAT_INT8" hides the real bitwidth distribution.
+        # Tagging it ``QAT_MIXED`` lets the bitwidth-distribution chart
+        # and method tables agree about what's actually quantized.
+        if self._is_mixed_bitwidth_assignment(qat_bw):
+            qat_tag = "MIXED"
+            qat_dom_bw = self._dominant_bitwidth(qat_bw)
+        else:
+            qat_dom_bw = (
+                self._dominant_bitwidth(qat_bw) if qat_bw
+                else int(self.config.hyperparams.qat_act_bitwidth)
+            )
+            qat_tag = f"INT{qat_dom_bw}"
         qat_size_mb = (
             compute_quantized_size_mb(self.model, qat_bw) if qat_bw else 0.0
         )
         qat_ebops = self._ebops_from_bitwidth(qat_bw) if qat_bw else 0.0
-        qat_lat_dict = self.qat_result.get("latency") or {}
         qat_headline_acc = (
             float(qat_test_top1) if qat_test_top1 is not None
             else float(self.qat_result.get("final_val_acc", 0.0) or 0.0)
         )
+
+        # ── ONNX export for QAT ──
+        # Previously skipped: QAT_INT8 had ``onnx_size_mb=null`` in the
+        # public summary, masking deployment fidelity for the highest-
+        # accuracy configuration. The fake-quantized model can be
+        # exported through the same J1+J2+J3 path the phase-1f methods
+        # use; ORT's static_quantize then materialises real INT8 ops.
+        qat_res: Dict[str, Any] = {
+            "display_name": f"QAT_{qat_tag}",
+            "bitwidth_assignment": qat_bw,
+            "model_size_mb": qat_size_mb,
+            "theoretical_size_mb": qat_size_mb,
+            "ebops": qat_ebops,
+        }
+        qat_model = self.qat_result.get("model")
+        if qat_model is not None and isinstance(qat_model, nn.Module):
+            self._export_method_to_onnx(
+                qat_res, qat_model, qat_dom_bw, qat_bw,
+            )
+        # Prefer the ORT-measured latency over the (often missing) PyTorch
+        # one; latency is a deployment metric, so the deployable runtime
+        # number is the right one to surface in the summary table.
+        qat_lat_dict = (
+            qat_res.get("onnx_latency")
+            or self.qat_result.get("latency")
+            or {}
+        )
+
         self._add_summary_row(
-            f"QAT_INT{qat_dom_bw}",
+            f"QAT_{qat_tag}",
             qat_headline_acc,
             float(qat_lat_dict.get("latency_mean_ms", 0.0) or 0.0),
             float(qat_lat_dict.get("throughput_fps", 0.0) or 0.0),
             qat_ebops,
-            qat_size_mb,
+            qat_res.get("model_size_mb", qat_size_mb),
+            onnx_size_mb=qat_res.get("onnx_size_mb"),
+            onnx_latency_ms=qat_lat_dict.get("latency_mean_ms"),
+            onnx_throughput_fps=qat_lat_dict.get("throughput_fps"),
         )
+        # Persist the ONNX deployment fields onto the QAT result so the
+        # checkpoint metadata + MLflow run reflect the export.
+        if qat_res.get("onnx_path"):
+            self.qat_result["onnx_path"] = qat_res["onnx_path"]
+            self.qat_result["onnx_size_mb"] = qat_res.get("onnx_size_mb")
+            self.qat_result["onnx_latency"] = qat_res.get("onnx_latency")
 
         # Checkpoint: save the fine-tuned QAT model and the metric history.
         # The warmstart source (ptq_best_acc / ptq_best_tradeoff) and the
@@ -1092,9 +1220,30 @@ class NeuroQuantPipeline:
                 # Passing ``self.model`` (FP32 namespace) caused every key to
                 # miss in ``compute_ebops`` and silently fall back to 32-bit
                 # accounting → AWQ/SmoothQuant reported FP32 sizes.
+                # When the quantizer didn't return a bitwidth_assignment
+                # (some methods skip this), build one over QUANTIZABLE
+                # weights only — the weight tensors of Conv2d / Linear
+                # modules. Including BatchNorm γ/β, biases, or the
+                # _SmoothInputScale / _AWQInputScale wrapper buffers
+                # (which named_parameters() also walks) inflated the
+                # apparent layer count from 53 to 158 in the bitwidth
+                # distribution chart, falsely showing AWQ/SmoothQuant
+                # as quantizing 3× more layers than they actually do.
+                from torch.nn import Conv1d, Conv2d, Conv3d, Linear
+                _qmod_owners = (Conv1d, Conv2d, Conv3d, Linear)
+                _qmod_index = {
+                    name: mod for name, mod in q_model.named_modules()
+                    if isinstance(mod, _qmod_owners)
+                }
+
+                def _is_quantizable_weight(pname: str) -> bool:
+                    if not pname.endswith(".weight"):
+                        return False
+                    return pname.rsplit(".", 1)[0] in _qmod_index
+
                 bw_assignment = res.get("bitwidth_assignment", {}) or {
                     n: bw for n, _ in q_model.named_parameters()
-                    if "weight" in n
+                    if _is_quantizable_weight(n)
                 }
                 res["bitwidth_assignment"] = bw_assignment
                 theoretical_mb = compute_quantized_size_mb(
@@ -1226,14 +1375,19 @@ class NeuroQuantPipeline:
 
         # ── Quantization Error Attribution ──
         # Compute per-layer activation errors between FP32 and each
-        # quantized model, generating visual diagnostics.
+        # quantized model, generating visual diagnostics. The PNGs land
+        # in their own ``error_attribution/`` subdirectory so the
+        # top-level ``artifacts/`` folder doesn't fan out across N
+        # methods × M plots — the report.py glob still picks them up.
         # Runs BEFORE end_run() so MLflow artifact logging works.
         try:
             from visualization.error_attribution import (
                 compute_layer_errors, plot_error_attribution,
                 plot_error_comparison,
             )
-            ea_dir = str(self.output_dir)
+            ea_subdir = self.output_dir / "error_attribution"
+            ea_subdir.mkdir(parents=True, exist_ok=True)
+            ea_dir = str(ea_subdir)
             all_errors: Dict[str, list] = {}
             for label, q_model in produced_models_by_id.items():
                 if not isinstance(q_model, nn.Module):
@@ -1801,6 +1955,11 @@ class NeuroQuantPipeline:
             self.best_config = self.pareto_front["solutions"][0].get(
                 "bitwidth_assignment", {}
             )
+        # Restore the AdaRound-specific mixed config; older checkpoints
+        # didn't store this field, so fall back to best_config.
+        self.adaround_config = data.get("adaround_config") or dict(
+            self.best_config
+        )
         self.results["pareto_solutions"] = len(
             self.pareto_front.get("solutions", [])
         )
@@ -2319,30 +2478,164 @@ class NeuroQuantPipeline:
                 materialized[best_tradeoff_idx], models[best_tradeoff_idx],
             )
 
+        # ── ONNX export for the PTQ rerank winners ──
+        # Previously skipped, leaving ``onnx_size_mb`` / ``onnx_latency``
+        # null in pareto_summary.json for the two highest-accuracy
+        # configurations. Re-using the centralised helper so PTQ /
+        # phase-1f / QAT all share the same J1+J2+J3 contract.
+        best_bw_acc = self._dominant_bitwidth(
+            materialized[best_acc_idx].get("bitwidth_assignment", {})
+        )
+        self._export_method_to_onnx(
+            materialized[best_acc_idx], models[best_acc_idx], best_bw_acc,
+            materialized[best_acc_idx].get("bitwidth_assignment"),
+        )
+        if not same_pick:
+            best_bw_to = self._dominant_bitwidth(
+                materialized[best_tradeoff_idx].get("bitwidth_assignment", {})
+            )
+            self._export_method_to_onnx(
+                materialized[best_tradeoff_idx],
+                models[best_tradeoff_idx],
+                best_bw_to,
+                materialized[best_tradeoff_idx].get("bitwidth_assignment"),
+            )
+
         return (
             models[best_acc_idx], materialized[best_acc_idx],
             models[best_tradeoff_idx], materialized[best_tradeoff_idx],
         )
 
+    def _export_method_to_onnx(
+        self,
+        res: Dict[str, Any],
+        q_model: nn.Module,
+        bitwidth: int,
+        bw_assignment: Optional[Dict[str, int]] = None,
+    ) -> None:
+        """Run the J1+J2+J3 ONNX export contract on ``q_model`` and
+        update ``res`` with the on-disk size + ORT latency.
+
+        Centralised so PTQ rerank (phase 1c), QAT (phase 1e), and the
+        per-method block in phase 1f all produce the same deployment
+        fields. Without this, the headline ``pareto_summary.json`` had
+        ``onnx_size_mb=null`` for the two highest-accuracy methods
+        (PTQ_MIXED and QAT_INT8), which broke the "deployment-ready"
+        contract.
+
+        Failures are logged as warnings and never abort the caller —
+        the synthetic ``theoretical_size_mb`` remains the public size
+        when the export can't run (e.g. onnxruntime missing).
+        """
+        hp = self.config.hyperparams
+        if not bool(getattr(hp, "onnx_export_enabled", True)):
+            return
+        try:
+            from utils.onnx_export import (
+                export_quantize_and_benchmark, is_onnx_available,
+            )
+        except Exception:
+            return
+        if not is_onnx_available():
+            return
+
+        onnx_dir = self.output_dir / "onnx"
+        try:
+            info = export_quantize_and_benchmark(
+                q_model,
+                self.config.input_shape,
+                str(onnx_dir),
+                name=f"{res['display_name']}",
+                calibration_loader=self.calib_loader,
+                num_batches=min(8, hp.calibration_batches),
+                do_int8=(int(bitwidth) <= 8),
+                batch_size=hp.latency_batch_size,
+                warmup_runs=hp.latency_warmup_runs,
+                measure_runs=hp.latency_measure_runs,
+            )
+        except Exception as exc:
+            logger.warning(
+                "    %s ONNX export failed: %s — falling back to "
+                "theoretical_size_mb. Real on-disk size + ORT "
+                "latency unavailable for this method.",
+                res["display_name"], exc,
+            )
+            return
+
+        if info.get("int8_onnx_size_mb") is not None:
+            res["onnx_size_mb"] = info["int8_onnx_size_mb"]
+            res["onnx_path"] = info["int8_onnx_path"]
+            res["model_size_mb"] = info["int8_onnx_size_mb"]
+        elif info.get("fp32_onnx_size_mb") is not None:
+            res["onnx_size_mb"] = info["fp32_onnx_size_mb"]
+            res["onnx_path"] = info["fp32_onnx_path"]
+            res["model_size_mb"] = info["fp32_onnx_size_mb"]
+        if info.get("onnx_latency"):
+            res["onnx_latency"] = info["onnx_latency"]
+            res["latency_ms"] = info["onnx_latency"]["latency_mean_ms"]
+            res["latency"] = info["onnx_latency"]
+
+        # INT4 packing diagnostic when any weight is below INT8.
+        try:
+            assignment = bw_assignment or res.get("bitwidth_assignment") or {}
+            if int(bitwidth) <= 4 or any(
+                int(v) == 4 for v in assignment.values()
+            ):
+                from utils.onnx_export import estimate_int4_packed_size_mb
+                packing = estimate_int4_packed_size_mb(q_model, assignment)
+                res["int4_packing"] = packing
+        except Exception:
+            pass
+
     @staticmethod
     def _filter_non_dominated_solutions(
         solutions: List[ParetoSolution],
     ) -> List[ParetoSolution]:
-        """Return only non-dominated solutions (minimize loss + ebops)."""
+        """Return only non-dominated solutions.
+
+        Uses the same set of objectives the search consumed:
+          * 2-obj fallback: ``(accuracy_loss, ebops)``
+          * 3-obj when latency is available: ``(accuracy_loss, ebops,
+            latency_mean_ms)`` — kicks in when *every* candidate
+            carries an ORT latency. Falls back to 2-obj otherwise so
+            we don't accidentally tag everything as non-dominated when
+            a single solution lacks a latency reading.
+
+        Standard Pareto definition (minimisation): X dominates Y when
+        ``X[k] ≤ Y[k]`` on all objectives and ``X[k] < Y[k]`` on at
+        least one.
+        """
         if not solutions:
             return []
 
+        # Decide on the objective set once, up-front.
+        all_have_latency = all(
+            s.get("latency_mean_ms") is not None for s in solutions
+        )
+        if all_have_latency:
+            obj_keys: Tuple[str, ...] = ("accuracy_loss", "ebops",
+                                         "latency_mean_ms")
+        else:
+            obj_keys = ("accuracy_loss", "ebops")
+
+        def _objs(sol: ParetoSolution) -> Tuple[float, ...]:
+            return tuple(
+                float(sol.get(k, float("inf"))) for k in obj_keys
+            )
+
         kept: List[ParetoSolution] = []
         for i, sol_i in enumerate(solutions):
+            oi = _objs(sol_i)
             dominated = False
-            li = float(sol_i.get("accuracy_loss", float("inf")))
-            ei = float(sol_i.get("ebops", float("inf")))
             for j, sol_j in enumerate(solutions):
                 if i == j:
                     continue
-                lj = float(sol_j.get("accuracy_loss", float("inf")))
-                ej = float(sol_j.get("ebops", float("inf")))
-                if (lj <= li and ej <= ei) and (lj < li or ej < ei):
+                oj = _objs(sol_j)
+                # j dominates i iff j ≤ i on every axis AND strictly
+                # better on at least one.
+                if all(b <= a for a, b in zip(oi, oj)) and any(
+                    b < a for a, b in zip(oi, oj)
+                ):
                     dominated = True
                     break
             if not dominated:
@@ -2724,6 +3017,41 @@ class NeuroQuantPipeline:
             )
             summary["plot_paths"] = self.pareto_analysis.get("plot_paths", {})
 
+        # ── Latency-backend caveat ──
+        # ORT's QInt8 ops on CPU don't always beat FP32 — especially on
+        # depthwise convs (MobileNet family) and unfused activation/conv
+        # pairs. When that happens here, surface it explicitly in the
+        # summary so consumers don't misread "INT8 = slower" as a
+        # framework regression. The check is data-driven: any quantized
+        # method whose ORT latency exceeds the FP32 baseline triggers
+        # the note.
+        fp32_ort = summary.get("fp32_onnx_latency_ms")
+        if fp32_ort is not None:
+            slower = [
+                r["method"] for r in method_rows
+                if r.get("onnx_latency_ms") is not None
+                and float(r["onnx_latency_ms"]) > float(fp32_ort)
+            ]
+            try:
+                import onnxruntime as _ort
+                providers = list(_ort.get_available_providers())
+            except Exception:
+                providers = []
+            backend_note = {
+                "fp32_baseline_ms": float(fp32_ort),
+                "ort_providers_available": providers,
+                "methods_slower_than_fp32": slower,
+                "note": (
+                    "ORT QInt8 on CPU is not faster than FP32 for every "
+                    "model. Depthwise convolutions in particular lack a "
+                    "fast INT8 kernel, so methods listed in "
+                    "'methods_slower_than_fp32' are slower in this "
+                    "deployment-runtime measurement. Quote the backend "
+                    "(provider) and op family when comparing latencies."
+                ),
+            }
+            summary["latency_backend_note"] = backend_note
+
         return summary
 
     @staticmethod
@@ -2833,6 +3161,38 @@ class NeuroQuantPipeline:
                     print(
                         f"      {r['method']:<22} " + ", ".join(bits)
                     )
+
+        # ── INT4 packing caveat ──
+        # ORT's static_quantize emits QInt8 weights only; INT4 is stored
+        # one-value-per-byte in INT8 containers, so an "INT4" .onnx file
+        # has the same on-disk size as its INT8 sibling. The synthetic
+        # ``size_mb`` (numel × bw / 8) IS halved for INT4, which is why
+        # the ``Size(MiB)`` column in the table above shows 1.07 vs 2.13
+        # while ``ONNX MiB`` is identical. Surface this explicitly so
+        # reviewers don't read the matching ONNX numbers as a bug.
+        int4_methods_with_onnx = [
+            r for r in quantized
+            if r.get("onnx_size_mb") is not None
+            and "INT4" in str(r.get("method", ""))
+        ]
+        if int4_methods_with_onnx:
+            print()
+            print(
+                "    Note: ORT stores INT4 weights in INT8 containers "
+                "(no native INT4 packing),"
+            )
+            print(
+                "          so INT4 / INT8 ``ONNX MiB`` columns match "
+                "for the same method family."
+            )
+            print(
+                "          The ``Size(MiB)`` column reflects the "
+                "true packed cost (numel × bw / 8)."
+            )
+            print(
+                "          TensorRT and OpenVINO support native INT4 "
+                "packing — see ``utils.deployment_export``."
+            )
 
     @staticmethod
     def _resolve_device(device_str: str) -> torch.device:

@@ -221,7 +221,14 @@ class AdaroundOptimizer:
             return isinstance(owner, _quantizable_owners)
 
         # Prioritise low-bit tensors (INT4) where learned rounding matters
-        # most; if none exist, fall back to all quantized weights (<32-bit).
+        # most. Fall back to all quantized weights when:
+        #   * no INT4 weights exist at all, OR
+        #   * only a handful of INT4 weights exist (< 3), since the
+        #     1-second / 1-layer mode produces almost no measurable
+        #     output-reconstruction gain. The ordered traversal still
+        #     focuses optimisation effort on the lowest-bit weights via
+        #     stretch-sigmoid magnitude, but every quantized weight
+        #     contributes a non-trivial recon-error term.
         quantized_weights = [
             name for name in bitwidth_config
             if _is_quantizable_weight(name)
@@ -231,9 +238,11 @@ class AdaroundOptimizer:
             name for name in quantized_weights
             if int(bitwidth_config[name]) < 8
         ]
-        self._target_params: List[str] = (
-            low_bit_weights if low_bit_weights else quantized_weights
-        )
+        _MIN_LOW_BIT_FOR_FOCUSED_PASS = 3
+        if len(low_bit_weights) >= _MIN_LOW_BIT_FOR_FOCUSED_PASS:
+            self._target_params: List[str] = low_bit_weights
+        else:
+            self._target_params = quantized_weights
         self._owner_modules: Dict[str, nn.Module] = {}
         # Cached calibration inputs per layer (filled by collect_activations).
         self._layer_inputs: Dict[str, torch.Tensor] = {}

@@ -22,6 +22,12 @@ mlflow==3.10.1
 # Multi-Objective Optimization (Phase 1c)
 pymoo>=0.6.0
 
+# Surrogate-assisted NSGA-II (Phase 1c, BRP-NAS / OFA style).
+# Powers the GradientBoostingRegressor in
+# ``quantization.surrogate.AccuracySurrogate``; the surrogate falls
+# back to a no-op stub when this is unavailable.
+scikit-learn>=1.3
+
 # ONNX export + static INT8 quantization + ORT latency (Wave 4)
 onnx>=1.14.0
 onnxruntime>=1.16.0

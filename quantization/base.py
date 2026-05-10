@@ -96,13 +96,30 @@ class BaseQuantizer(abc.ABC):
             measure_runs=hp.latency_measure_runs,
         )
 
+        # Build a quantizable-only bitwidth assignment. Iterating every
+        # named_parameter would also catch BatchNorm γ/β, biases, and
+        # the input-scale wrapper buffers (_SmoothInputScale /
+        # _AWQInputScale) — none of which are actually quantized. That
+        # pollution inflated downstream "layer count" charts and made
+        # AWQ/SmoothQuant look like they touched 3× more layers than
+        # they did. Scope to weight tensors of Conv1d/Conv2d/Conv3d/Linear.
+        from torch.nn import Conv1d, Conv2d, Conv3d, Linear
+        _quantizable_owners = (Conv1d, Conv2d, Conv3d, Linear)
+        _module_index = {
+            name: mod for name, mod in model.named_modules()
+            if isinstance(mod, _quantizable_owners)
+        }
+        bw_assignment: Dict[str, int] = {}
+        for pname, _ in model.named_parameters():
+            if not pname.endswith(".weight"):
+                continue
+            if pname.rsplit(".", 1)[0] in _module_index:
+                bw_assignment[pname] = bitwidth
+
         return QuantizationResult(
             config_id=f"{self._get_method_name()}_INT{bitwidth}",
             method=self._get_method_name(),
-            bitwidth_assignment={
-                name: bitwidth for name, _ in model.named_parameters()
-                if _.requires_grad or True
-            },
+            bitwidth_assignment=bw_assignment,
             accuracy=top1,
             top5_accuracy=top5,
             model_size_mb=model_size_mb,

@@ -70,6 +70,22 @@ def plot_sensitivity_heatmap(
     from visualization.style import apply_publication_style
     apply_publication_style()
 
+    # Normalise hessian_diag values to scalar floats. Phase 1a stores
+    # them as ``{layer_name: {"hessian_diag": float, "layer_type": ...}}``;
+    # callers may also pass already-flat ``{layer_name: float}``. Both
+    # forms must work, otherwise sorting fails with
+    # ``'<' not supported between instances of 'dict' and 'dict'``.
+    flat_hessian: Dict[str, float] = {}
+    for name, value in hessian_diag.items():
+        if isinstance(value, dict):
+            v = value.get("hessian_diag", value.get("score", 0.0))
+        else:
+            v = value
+        try:
+            flat_hessian[name] = float(v)
+        except (TypeError, ValueError):
+            flat_hessian[name] = 0.0
+
     # Build tier lookup: layer_name → tier string
     tier_map: Dict[str, str] = {}
     assignments = cluster_result.get("cluster_assignments", [])
@@ -78,9 +94,21 @@ def plot_sensitivity_heatmap(
         for layer_name in cluster.get("layer_names", []):
             tier_map[layer_name] = tier
 
+    # Only show layers that are in the cluster assignments (i.e.
+    # Conv/Linear weights that NSGA actually searches over). BN/bias
+    # parameters have Hessian scores but no tier assignment — showing
+    # them with a "MEDIUM" default creates a visual contradiction with
+    # the tier-distribution pie chart.
+    clustered_hessian = {
+        k: v for k, v in flat_hessian.items() if k in tier_map
+    }
+    if not clustered_hessian:
+        # Fall back to all layers if no cluster assignments found
+        clustered_hessian = flat_hessian
+
     # Sort layers by sensitivity (descending), take top_n
     sorted_layers = sorted(
-        hessian_diag.items(), key=lambda kv: kv[1], reverse=True,
+        clustered_hessian.items(), key=lambda kv: kv[1], reverse=True,
     )[:top_n]
 
     if not sorted_layers:

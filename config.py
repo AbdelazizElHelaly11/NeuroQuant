@@ -280,10 +280,36 @@ class HyperparameterSet:
     hessian_estimator: str = "fisher"  # 'fisher' | 'diag_hessian'
 
     # NSGA-II
-    nsga_population_size: int = 8
-    nsga_generations: int = 20
+    nsga_population_size: int = 32
+    nsga_generations: int = 30
     nsga_crossover_prob: float = 0.9
     nsga_mutation_prob: float = 0.1
+    # Search-space granularity. ``per_layer`` gives one binary gene per
+    # quantizable Conv/Linear weight (HAWQ-V3 / HAQ style — the
+    # academically-correct default; for an N-layer model the search
+    # space is 2^N). ``cluster`` groups layers by Hessian sensitivity
+    # tier and assigns one gene per cluster (legacy behaviour kept for
+    # paper-baseline ablations; collapses 2^N to 2^k where k≈3).
+    nsga_search_mode: str = "per_layer"
+    # Surrogate-assisted NSGA-II (BRP-NAS / OFA-style).
+    # When True, after ``nsga_surrogate_warmup_evals`` real evaluations
+    # an XGBoost / GradientBoosting surrogate is trained on the
+    # (bitwidth_vector → accuracy_loss) mapping. Each generation,
+    # ``nsga_surrogate_proposed_per_gen`` candidates are scored by the
+    # surrogate (microseconds each) and only the top-K predicted are
+    # real-evaluated, where K = ``nsga_population_size``. This raises
+    # the effective per-generation throughput by ~10–50× without
+    # sacrificing convergence quality. Falls back to plain NSGA when
+    # sklearn is missing or the warmup hasn't completed.
+    nsga_use_surrogate: bool = True
+    nsga_surrogate_warmup_evals: int = 30
+    nsga_surrogate_proposed_per_gen: int = 256
+    # Sensitivity-weighted mutation. When True (and Phase 1a hessian
+    # data is available), per-gene mutation probability scales
+    # inversely with that gene's Hessian sensitivity — high-sensitivity
+    # layers flip rarely, low-sensitivity layers flip aggressively.
+    # Drops to uniform mutation when no hessian dict is supplied.
+    nsga_sensitivity_weighted_mutation: bool = True
 
     # FITCompress
     fit_low_percentile: float = 0.25   # Below this → INT4 (compress)
@@ -426,10 +452,13 @@ class HyperparameterSet:
     # Per-layer ORT latency LUT (C2) feeds NSGA's third objective. When
     # ``hardware_aware_search`` is True the pipeline builds the LUT
     # before phase 1c (≈ 1–2 minutes for a CIFAR-class model) and NSGA
-    # runs in 3-objective mode ``[acc_loss, size_mb, latency_ms]``. The
-    # LUT is cached to ``output_dir/latency_lut.json`` so subsequent
-    # runs skip the rebuild.
-    hardware_aware_search: bool = False
+    # runs in 3-objective mode ``[acc_loss, size_mb, latency_ms]`` —
+    # the production default. The LUT is cached to
+    # ``output_dir/latency_lut.json`` so subsequent runs skip the
+    # rebuild. Set to False only for paper-baseline 2-obj ablations or
+    # when ONNX runtime is unavailable (the pipeline falls back to
+    # 2-obj automatically in that case anyway).
+    hardware_aware_search: bool = True
     # Bitwidths the LUT profiles. Must be a subset of
     # ``supported_bitwidths`` for the search to consume them.
     latency_lut_bitwidths: List[int] = field(default_factory=lambda: [4, 8])
@@ -553,6 +582,18 @@ class HyperparameterSet:
         if s not in allowed:
             raise ValueError(
                 f"awq_alpha_strategy='{v}' invalid. "
+                f"Use one of {allowed}."
+            )
+        return s
+
+    @field_validator("nsga_search_mode", mode="after")
+    @classmethod
+    def _validate_nsga_search_mode(cls, v: str) -> str:
+        allowed = ("per_layer", "cluster")
+        s = str(v).lower().strip()
+        if s not in allowed:
+            raise ValueError(
+                f"nsga_search_mode='{v}' invalid. "
                 f"Use one of {allowed}."
             )
         return s

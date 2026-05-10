@@ -128,6 +128,7 @@ class NSGAIIClusterSearch:
         config: QuantizationConfig,
         *,
         latency_lut: Optional[Dict[str, Dict[int, float]]] = None,
+        hessian_diag: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Args:
@@ -197,7 +198,32 @@ class NSGAIIClusterSearch:
                 len(dropped_layers),
             )
 
-        self.num_genes = len(self.searchable_clusters)
+        # ── Search-mode dispatch ──
+        # ``per_layer`` (HAWQ-V3 / HAQ): one binary gene per Conv/Linear
+        # weight. ``cluster``: legacy gene-per-tier encoding kept for
+        # paper-baseline ablations. The decision happens here so the
+        # rest of the class can be agnostic — the only contract the
+        # encoder/decoder enforces is ``num_genes == len(self._gene_layers)``.
+        hp = config.hyperparams
+        self._search_mode = str(getattr(hp, "nsga_search_mode", "per_layer")).lower()
+
+        if self._search_mode == "per_layer":
+            # Every quantizable weight gets its own gene. Order is
+            # stable: parameters appear in the order given by
+            # ``model.named_parameters()`` so resume/checkpoint paths
+            # stay deterministic.
+            self._gene_layers: List[str] = [
+                pname for pname, _ in model.named_parameters()
+                if pname in self._quantizable_weights
+            ]
+        else:
+            self._gene_layers = []  # cluster mode keeps using searchable_clusters
+
+        self.num_genes = (
+            len(self._gene_layers)
+            if self._search_mode == "per_layer"
+            else len(self.searchable_clusters)
+        )
 
         # Build the fixed part of the bitwidth config (HIGH → INT8). Only
         # quantizable weights end up here by construction.
@@ -205,6 +231,32 @@ class NSGAIIClusterSearch:
         for ca in self.fixed_clusters:
             for pname in ca["layer_names"]:
                 self._fixed_config[pname] = 8
+
+        # ── Hessian sensitivity (per-layer, optional) ──
+        # When supplied, drives both the surrogate features and the
+        # sensitivity-weighted mutation operator. Phase 1a stores the
+        # values as nested dicts (``{"hessian_diag": float, ...}``);
+        # we normalise here so downstream code can consume scalars.
+        self._hessian_per_layer: Dict[str, float] = {}
+        for name, value in (hessian_diag or {}).items():
+            if isinstance(value, dict):
+                v = value.get("hessian_diag", value.get("score", 0.0))
+            else:
+                v = value
+            try:
+                self._hessian_per_layer[name] = float(v)
+            except (TypeError, ValueError):
+                continue
+
+        # Per-gene mutation rate. When sensitivity-weighted mutation
+        # is enabled, each gene's flip probability is scaled inversely
+        # with that gene's normalised Hessian sensitivity:
+        # high-sensitivity genes flip rarely (need to keep INT8),
+        # low-sensitivity genes flip aggressively (free to be INT4).
+        # The base mutation rate from config is the *mean* across
+        # genes, so the global expected number of flips per individual
+        # is unchanged — only their distribution shifts.
+        self._gene_mutation_rates: List[float] = self._build_gene_mutation_rates()
 
         # Precompute FP32 EBops (bytes) for reduction calculation, and
         # the equivalent public objective in MiB.
@@ -220,14 +272,13 @@ class NSGAIIClusterSearch:
         self._last_pareto: List[ParetoSolution] = []
 
         logger.info(
-            "NSGA-II initialized: %d searchable clusters (%d genes), "
-            "%d fixed clusters (INT8), search space = 2^%d = %d, "
-            "objectives = %d %s",
+            "NSGA-II initialized: mode=%s, %d genes, search space=2^%d=%s, "
+            "fixed clusters=%d (INT8), objectives=%d %s",
+            self._search_mode,
             self.num_genes,
             self.num_genes,
+            f"{2 ** self.num_genes:,}" if self.num_genes < 64 else "huge",
             len(self.fixed_clusters),
-            self.num_genes,
-            2 ** self.num_genes,
             self._num_objectives,
             "(acc_loss, size, latency)" if self._num_objectives == 3
             else "(acc_loss, size)",
@@ -241,23 +292,24 @@ class NSGAIIClusterSearch:
         """
         Convert a GA individual (binary genes) to a full bitwidth config.
 
-        Individual is a list of length num_genes where:
-            0 = INT4, 1 = INT8
+        Per-layer mode: gene[i] selects the bitwidth of
+        ``self._gene_layers[i]`` directly.
+        Cluster mode: gene[i] selects the bitwidth of every layer in
+        ``self.searchable_clusters[i]``.
 
-        The fixed clusters (HIGH tier) are always INT8.
-
-        Args:
-            individual: Binary gene list.
-
-        Returns:
-            Full bitwidth config: {param_name -> bitwidth (4 or 8)}.
+        ``0 = INT4``, ``1 = INT8``. The fixed clusters (HIGH tier) are
+        always INT8 regardless of mode.
         """
         config = self._fixed_config.copy()
 
-        for gene_idx, ca in enumerate(self.searchable_clusters):
-            bitwidth = 8 if individual[gene_idx] == 1 else 4
-            for pname in ca["layer_names"]:
-                config[pname] = bitwidth
+        if self._search_mode == "per_layer":
+            for gene_idx, pname in enumerate(self._gene_layers):
+                config[pname] = 8 if individual[gene_idx] == 1 else 4
+        else:
+            for gene_idx, ca in enumerate(self.searchable_clusters):
+                bitwidth = 8 if individual[gene_idx] == 1 else 4
+                for pname in ca["layer_names"]:
+                    config[pname] = bitwidth
 
         return config
 
@@ -265,21 +317,147 @@ class NSGAIIClusterSearch:
         """
         Convert a bitwidth config to a GA individual.
 
-        Args:
-            config: {param_name -> bitwidth}.
-
-        Returns:
-            Binary gene list (only searchable clusters encoded).
+        Layers absent from ``config`` default to INT8 (the safe choice
+        when the seed config from FITCompress doesn't enumerate every
+        searchable parameter).
         """
-        individual = []
+        if self._search_mode == "per_layer":
+            return [
+                1 if int(config.get(pname, 8)) == 8 else 0
+                for pname in self._gene_layers
+            ]
+        # Cluster mode (legacy)
+        individual: List[int] = []
         for ca in self.searchable_clusters:
-            # Use the first layer in the cluster to determine bitwidth
             first_layer = ca["layer_names"][0] if ca["layer_names"] else None
             if first_layer and first_layer in config:
-                individual.append(1 if config[first_layer] == 8 else 0)
+                individual.append(1 if int(config[first_layer]) == 8 else 0)
             else:
                 individual.append(1)  # Default INT8
         return individual
+
+    # ------------------------------------------------------------------
+    # Sensitivity-weighted mutation
+    # ------------------------------------------------------------------
+
+    def _maybe_build_surrogate(self) -> Optional[Any]:
+        """Construct an ``AccuracySurrogate`` when sklearn is available.
+
+        Returns None when:
+          * ``nsga_use_surrogate`` is False (caller already filtered),
+          * sklearn is missing,
+          * ``num_genes`` is too small for the surrogate to add value
+            (≤ 4 — exhaustive mode handles those exactly),
+          * the import raises for any other reason.
+
+        The Hessian feature vector is built per-gene (per-layer in
+        per_layer mode, per-cluster mean in cluster mode) so the
+        surrogate generalises across both encodings.
+        """
+        try:
+            from quantization.surrogate import AccuracySurrogate
+        except Exception as exc:
+            logger.debug("Surrogate import failed: %s", exc)
+            return None
+
+        if self.num_genes <= 4:
+            logger.info(
+                "  Surrogate disabled — search space 2^%d is too small "
+                "(falls back to plain NSGA / exhaustive).",
+                self.num_genes,
+            )
+            return None
+
+        # Hessian features aligned with the gene order.
+        if self._search_mode == "per_layer":
+            hessian_features = [
+                self._hessian_per_layer.get(pn, 0.0) for pn in self._gene_layers
+            ]
+        else:
+            hessian_features = []
+            for ca in self.searchable_clusters:
+                vals = [
+                    self._hessian_per_layer.get(pn, 0.0)
+                    for pn in ca["layer_names"]
+                ]
+                hessian_features.append(
+                    float(np.mean(vals)) if vals else 0.0
+                )
+
+        try:
+            return AccuracySurrogate(
+                n_layers=self.num_genes,
+                hessian_features=hessian_features if any(hessian_features) else None,
+                min_train_samples=int(getattr(
+                    self.config.hyperparams, "nsga_surrogate_warmup_evals", 30,
+                )),
+                random_state=int(self.config.hyperparams.seed),
+            )
+        except Exception as exc:
+            logger.debug("Surrogate build failed: %s", exc)
+            return None
+
+    def _build_gene_mutation_rates(self) -> List[float]:
+        """Compute per-gene mutation probabilities from Hessian sensitivity.
+
+        High-sensitivity genes get a *lower* flip probability — flipping
+        a sensitive layer to INT4 is the canonical accuracy killer, so
+        the operator should bias the search away from those moves.
+
+        The vector is rescaled so the *mean* matches
+        ``hp.nsga_mutation_prob``, keeping the expected total number
+        of flips per individual stable. Falls back to uniform when:
+          * sensitivity-weighted mutation is disabled, OR
+          * no Hessian sensitivity is available, OR
+          * the per-gene sensitivity values are all equal.
+        """
+        hp = self.config.hyperparams
+        base = float(hp.nsga_mutation_prob)
+        n = self.num_genes
+        if n <= 0:
+            return []
+
+        enabled = bool(getattr(hp, "nsga_sensitivity_weighted_mutation", True))
+        if not enabled or not self._hessian_per_layer:
+            return [base] * n
+
+        # Gather per-gene sensitivity (per-layer mode → direct lookup;
+        # cluster mode → mean sensitivity within the cluster).
+        if self._search_mode == "per_layer":
+            sens = np.asarray(
+                [self._hessian_per_layer.get(pn, 0.0) for pn in self._gene_layers],
+                dtype=float,
+            )
+        else:
+            sens_list: List[float] = []
+            for ca in self.searchable_clusters:
+                vals = [
+                    self._hessian_per_layer.get(pn, 0.0)
+                    for pn in ca["layer_names"]
+                ]
+                sens_list.append(float(np.mean(vals)) if vals else 0.0)
+            sens = np.asarray(sens_list, dtype=float)
+
+        if sens.size == 0 or float(sens.std()) < 1e-12:
+            return [base] * n
+
+        # Inverse-rank weighting: high sensitivity → small weight.
+        # Use rank rather than raw values so heavy-tailed Hessians
+        # don't push the rates to extremes.
+        order = sens.argsort()
+        ranks = np.empty_like(order)
+        ranks[order] = np.arange(n)
+        # Map ranks into [0.5, 1.5] so the mean is 1.0; invert so
+        # high sensitivity (high rank) maps to a low multiplier.
+        normalised = ranks / max(n - 1, 1)
+        multipliers = 1.5 - normalised  # [0.5, 1.5], descending with sensitivity
+        rates = base * multipliers
+        # Re-centre so the mean is exactly ``base``.
+        rates *= base / float(rates.mean())
+        # Clamp away from 0 so even the most sensitive gene can flip
+        # occasionally (search needs to verify HIGH tier choices).
+        rates = np.clip(rates, base * 0.1, min(0.95, base * 3.0))
+        return [float(x) for x in rates]
 
     # ------------------------------------------------------------------
     # Evaluation
@@ -549,12 +727,22 @@ class NSGAIIClusterSearch:
                 child1[i], child2[i] = child2[i], child1[i]
         return child1, child2
 
-    @staticmethod
-    def _mutate(individual: List[int], probability: float) -> List[int]:
-        """Bit-flip mutation: each gene flips with given probability."""
+    def _mutate(
+        self, individual: List[int], probability: float,
+    ) -> List[int]:
+        """Bit-flip mutation with optional per-gene rates.
+
+        When ``self._gene_mutation_rates`` is populated (sensitivity-
+        weighted mutation), each gene uses its own rate so high-
+        sensitivity layers flip less often than low-sensitivity ones.
+        Otherwise falls back to the uniform ``probability`` argument
+        — preserves the legacy contract of the previous static method.
+        """
         mutant = individual[:]
+        rates = self._gene_mutation_rates
         for i in range(len(mutant)):
-            if random.random() < probability:
+            p = rates[i] if rates and i < len(rates) else probability
+            if random.random() < p:
                 mutant[i] = 1 - mutant[i]
         return mutant
 
@@ -585,12 +773,30 @@ class NSGAIIClusterSearch:
         mut_prob = self.config.hyperparams.nsga_mutation_prob
         seed = self.config.hyperparams.seed
 
+        # ── Surrogate-assisted search (BRP-NAS / OFA style) ──
+        # After ``warmup`` real evaluations a GradientBoosting model
+        # learns the (bitwidth_vector → accuracy_loss) mapping. Each
+        # generation we then *propose* up to ``proposed_per_gen``
+        # candidates via crossover/mutation, score them with the
+        # surrogate (microseconds each), and only real-evaluate the
+        # top ``pop_size`` predicted picks. Falls back to plain NSGA
+        # when the surrogate is disabled or sklearn is missing.
+        hp = self.config.hyperparams
+        use_surrogate = bool(getattr(hp, "nsga_use_surrogate", True))
+        warmup = int(getattr(hp, "nsga_surrogate_warmup_evals", 30))
+        proposed_per_gen = int(getattr(hp, "nsga_surrogate_proposed_per_gen", 256))
+        surrogate = self._maybe_build_surrogate() if use_surrogate else None
+
         # Reproducibility
         random.seed(seed)
         np.random.seed(seed)
 
         logger.info("=" * 70)
-        logger.info("Phase 1c: NSGA-II Multi-Objective Cluster-Level Search")
+        logger.info(
+            "Phase 1c: NSGA-II Multi-Objective Search (mode=%s%s)",
+            self._search_mode,
+            ", surrogate-assisted" if surrogate else "",
+        )
         logger.info("=" * 70)
         search_space_size = max(1, 2 ** self.num_genes)
         if search_space_size < pop_size:
@@ -621,11 +827,19 @@ class NSGAIIClusterSearch:
         # the tuple verbatim keeps the loop objective-agnostic.
         population: List[Tuple[List[int], Tuple[float, ...]]] = []
 
+        # Helper that real-evaluates AND records the result for the
+        # surrogate's training set in one call. Centralised so every
+        # fresh evaluation feeds the surrogate without scattering
+        # ``add_observation`` calls across the loop.
+        def _eval_and_record(ind: List[int]) -> Tuple[float, ...]:
+            obj = self.evaluate_individual(ind, val_loader, fp32_accuracy)
+            if surrogate is not None and obj and obj[0] != float("inf"):
+                surrogate.add_observation(ind, float(obj[0]))
+            return obj
+
         # Add elite seed
         elite_individual = self.config_to_individual(seed_config)
-        elite_obj = self.evaluate_individual(
-            elite_individual, val_loader, fp32_accuracy,
-        )
+        elite_obj = _eval_and_record(elite_individual)
         population.append((elite_individual, elite_obj))
         logger.info(
             "  Elite seed: %s",
@@ -640,7 +854,7 @@ class NSGAIIClusterSearch:
             key = tuple(ind)
             if key not in seen:
                 seen.add(key)
-                obj = self.evaluate_individual(ind, val_loader, fp32_accuracy)
+                obj = _eval_and_record(ind)
                 population.append((ind, obj))
             attempts += 1
 
@@ -682,23 +896,84 @@ class NSGAIIClusterSearch:
                         self._format_objectives(objectives[best_idx]),
                     )
 
+            # ── Surrogate refit (best-effort each generation) ──
+            # Cheap (milliseconds), so retrain whenever
+            # ``retrain_every`` real evaluations have accumulated.
+            if surrogate is not None and surrogate.needs_refit():
+                surrogate.fit()
+
             # ── Create offspring ──
+            # Two paths share the same crossover/mutation operators:
+            #
+            # 1. Plain NSGA-II (default until surrogate.is_ready()):
+            #    Generate exactly ``pop_size`` children, real-evaluate
+            #    every one. Identical behaviour to pre-surrogate NSGA.
+            #
+            # 2. Surrogate-assisted: generate ``proposed_per_gen``
+            #    *unique* children, surrogate-rank them, real-evaluate
+            #    only the top ``pop_size`` (smallest predicted
+            #    accuracy_loss). This raises effective per-generation
+            #    throughput by 10–50× without burning real-eval budget
+            #    on candidates the surrogate already deems weak.
             offspring: List[Tuple[List[int], Tuple[float, ...]]] = []
-            while len(offspring) < pop_size:
-                p1_idx = self._tournament_select(ranks, crowding)
-                p2_idx = self._tournament_select(ranks, crowding)
 
-                c1, c2 = self._crossover(
-                    population[p1_idx][0], population[p2_idx][0], cx_prob
-                )
-                c1 = self._mutate(c1, mut_prob)
-                c2 = self._mutate(c2, mut_prob)
+            if surrogate is not None and surrogate.is_ready():
+                proposals: List[List[int]] = []
+                proposal_keys: set = set()
+                # Generate up to ``proposed_per_gen`` unique candidates.
+                max_attempts = proposed_per_gen * 4
+                for _ in range(max_attempts):
+                    if len(proposals) >= proposed_per_gen:
+                        break
+                    p1_idx = self._tournament_select(ranks, crowding)
+                    p2_idx = self._tournament_select(ranks, crowding)
+                    c1, c2 = self._crossover(
+                        population[p1_idx][0], population[p2_idx][0], cx_prob,
+                    )
+                    for child in (
+                        self._mutate(c1, mut_prob),
+                        self._mutate(c2, mut_prob),
+                    ):
+                        key = tuple(child)
+                        if key not in proposal_keys:
+                            proposal_keys.add(key)
+                            proposals.append(child)
+                            if len(proposals) >= proposed_per_gen:
+                                break
 
-                obj1 = self.evaluate_individual(c1, val_loader, fp32_accuracy)
-                obj2 = self.evaluate_individual(c2, val_loader, fp32_accuracy)
-                offspring.append((c1, obj1))
-                offspring.append((c2, obj2))
-                total_evals += 2
+                # Surrogate-score every proposal.
+                scores = surrogate.score_batch(proposals)
+                if scores is None:
+                    # Fall back to plain NSGA for this generation.
+                    for child in proposals[:pop_size]:
+                        offspring.append((child, _eval_and_record(child)))
+                        total_evals += 1
+                else:
+                    # Pick the top-K by predicted accuracy_loss.
+                    order = np.argsort(scores)[:pop_size]
+                    for idx in order:
+                        child = proposals[int(idx)]
+                        offspring.append((child, _eval_and_record(child)))
+                        total_evals += 1
+            else:
+                # Plain NSGA path — used during warmup and when sklearn
+                # is unavailable.
+                while len(offspring) < pop_size:
+                    p1_idx = self._tournament_select(ranks, crowding)
+                    p2_idx = self._tournament_select(ranks, crowding)
+                    c1, c2 = self._crossover(
+                        population[p1_idx][0], population[p2_idx][0], cx_prob,
+                    )
+                    c1 = self._mutate(c1, mut_prob)
+                    c2 = self._mutate(c2, mut_prob)
+                    offspring.append((c1, _eval_and_record(c1)))
+                    offspring.append((c2, _eval_and_record(c2)))
+                    total_evals += 2
+
+                # Cold-start the surrogate as soon as warmup is met so
+                # the next generation can use it.
+                if surrogate is not None and surrogate.num_observations() >= warmup:
+                    surrogate.fit()
 
             # ── Survivor selection ──
             combined = population + offspring

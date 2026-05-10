@@ -294,49 +294,84 @@ class ParetoAnalyzer:
         """
         Find the knee point: solution with the best balance of both
         objectives (maximum perpendicular distance from the line
-        connecting the two extreme solutions).
+        connecting the two extreme non-dominated solutions, restricted
+        to candidates whose projection onto that line lies inside
+        ``[0, 1]``).
 
-        This is a standard technique in multi-objective optimisation.
+        Two corrections vs the previous implementation:
+
+        1. **Dominated solutions are excluded.** Including them was the
+           reason the picker landed on PTQ_MIXED (worst-accuracy of all
+           10 methods) — the dominated outlier had the largest
+           perpendicular distance because it was *outside* the front.
+        2. **Projection clamping.** A point's perpendicular distance to
+           the extremes line is only meaningful when the perpendicular
+           foot lies between the extremes. Otherwise the picker rewards
+           solutions that "stick out" past the front rather than knee
+           solutions inside it.
         """
-        if len(self.public_solutions) < 3:
+        # Filter to non-dominated solutions (the actual Pareto front).
+        non_dom = [
+            s for s in self.public_solutions
+            if not s.get("is_dominated", False)
+        ]
+        # Drop duplicates by (accuracy_loss, ebops) so the extremes loop
+        # doesn't pair a knee with itself when the same configuration
+        # was rerun.
+        if len(non_dom) < 3:
+            # Not enough points to define a knee; caller falls back to
+            # best-accuracy.
             return None
 
         sorted_sols = sorted(
-            self.public_solutions, key=lambda s: s.get("accuracy_loss", 0.0)
+            non_dom, key=lambda s: s.get("accuracy_loss", 0.0)
         )
 
-        # Extreme points: best accuracy (lowest loss) and best EBops
         best_acc = sorted_sols[0]
         best_ebops = min(sorted_sols, key=lambda s: s.get("ebops", float("inf")))
 
-        # Line from best_acc to best_ebops
+        if best_acc is best_ebops:
+            return None
+
         x1, y1 = best_acc.get("accuracy_loss", 0), best_acc.get("ebops", 0)
         x2, y2 = best_ebops.get("accuracy_loss", 0), best_ebops.get("ebops", 0)
 
-        # Normalise
         x_range = max(abs(x2 - x1), EPS_GEOMETRIC)
         y_range = max(abs(y2 - y1), EPS_GEOMETRIC)
 
+        # Pre-normalise the line direction so we don't recompute it per
+        # candidate. Coordinates are scaled into [0, 1]-ish ranges; the
+        # exact magnitudes don't matter, only the relative geometry.
+        x2n = (x2 - x1) / x_range
+        y2n = (y2 - y1) / y_range
+        line_len_sq = x2n * x2n + y2n * y2n
+        if line_len_sq < EPS_GEOMETRIC:
+            return best_acc
+
         max_dist = -1.0
-        knee = None
+        knee: Optional[Dict[str, Any]] = None
 
         for sol in sorted_sols:
             x = (sol.get("accuracy_loss", 0) - x1) / x_range
             y = (sol.get("ebops", 0) - y1) / y_range
-            x2n = (x2 - x1) / x_range
-            y2n = (y2 - y1) / y_range
 
-            # Perpendicular distance from point to line
-            line_len = math.sqrt(x2n ** 2 + y2n ** 2)
-            if line_len < EPS_GEOMETRIC:
+            # Projection of (x, y) onto the line in [0, 1]. Skip points
+            # whose foot lies outside the extremes — they are not
+            # "between" the extreme solutions in any meaningful sense.
+            t = (x * x2n + y * y2n) / line_len_sq
+            if t < 0.0 or t > 1.0:
                 continue
-            dist = abs(x * y2n - y * x2n) / line_len
 
+            # Perpendicular distance.
+            dist = abs(x * y2n - y * x2n) / math.sqrt(line_len_sq)
             if dist > max_dist:
                 max_dist = dist
                 knee = sol
 
-        return knee
+        # Fall back to the highest-accuracy non-dominated solution if
+        # no candidate sits inside the extremes line (this can happen
+        # with a 2-point Pareto front).
+        return knee or best_acc
 
     def find_extreme_solutions(self) -> Dict[str, Optional[Dict]]:
         """Identify extreme solutions and the balanced knee point."""
@@ -666,6 +701,33 @@ class ParetoVisualizer:
         nd_solutions = [s for s in public_solutions if not s.get("is_dominated", False)]
         dom_solutions = [s for s in public_solutions if s.get("is_dominated", False)]
 
+        # ── Latency encoding ──
+        # When ORT latency is recorded on every public solution, use it
+        # as the third visual channel: marker size ∝ latency (slow =
+        # bigger bubble), so the user can read "fast vs slow" at a
+        # glance alongside accuracy and size. When latency is missing
+        # we keep the compression-ratio bubble sizing for backward
+        # compatibility.
+        latencies = [
+            s.get("latency_mean_ms") for s in public_solutions
+            if s.get("latency_mean_ms") is not None
+        ]
+        has_latency = len(latencies) >= 2 and (max(latencies) - min(latencies)) > 1e-6
+        if has_latency:
+            lat_min, lat_max = float(min(latencies)), float(max(latencies))
+
+            def _bubble_size(sol: Dict[str, Any]) -> float:
+                lat = sol.get("latency_mean_ms")
+                if lat is None:
+                    return 80.0
+                # Map latency to [80, 380] linearly.
+                t = (float(lat) - lat_min) / max(lat_max - lat_min, 1e-9)
+                return float(80.0 + 300.0 * t)
+        else:
+            def _bubble_size(sol: Dict[str, Any]) -> float:
+                comp = sol.get("compression_ratio", 1.0) or 1.0
+                return float(max(60, min(comp * 28, 320)))
+
         # Frontier connector — only non-dominated, ordered by model size.
         if nd_solutions:
             sorted_pts = sorted(
@@ -685,8 +747,7 @@ class ParetoVisualizer:
             tag = s.get("solution_id", "")
             fam = family_of(tag)
             color, marker = style_for(tag)
-            comp = s.get("compression_ratio", 1.0) or 1.0
-            size = float(max(60, min(comp * 28, 320)))
+            size = _bubble_size(s)
             label_dom = f"{fam} (dominated)" if fam not in plotted_families_dom else None
             plotted_families_dom.add(fam)
             ax.scatter(
@@ -712,8 +773,7 @@ class ParetoVisualizer:
             tag = s.get("solution_id", "")
             fam = family_of(tag)
             color, marker = style_for(tag)
-            comp = s.get("compression_ratio", 1.0) or 1.0
-            size = float(max(60, min(comp * 28, 320)))
+            size = _bubble_size(s)
             label = fam if fam not in plotted_families_nd else None
             plotted_families_nd.add(fam)
             ax.scatter(
@@ -766,9 +826,36 @@ class ParetoVisualizer:
             pad=12,
         )
         # Marker-size legend hint as caption.
+        if has_latency:
+            caption = (
+                f"marker size ∝ ORT latency "
+                f"({lat_min:.2f}–{lat_max:.2f} ms) · faded = dominated"
+            )
+            # Add a discrete latency size-legend in the upper-left
+            # so readers can decode bubble area into milliseconds.
+            handles_size = []
+            labels_size = []
+            for frac, lab in [(0.0, f"fast ({lat_min:.2f} ms)"),
+                              (0.5, f"~{(lat_min + lat_max) / 2:.2f} ms"),
+                              (1.0, f"slow ({lat_max:.2f} ms)")]:
+                size = 80.0 + 300.0 * frac
+                handles_size.append(
+                    plt.scatter([], [], s=size, c="#888888",
+                                edgecolor="white", alpha=0.85)
+                )
+                labels_size.append(lab)
+            size_legend = ax.legend(
+                handles_size, labels_size,
+                loc="upper left", title="ORT latency (size)",
+                fontsize=8, title_fontsize=9, framealpha=0.92,
+                labelspacing=1.2, borderpad=0.7, handletextpad=1.1,
+                scatterpoints=1,
+            )
+            ax.add_artist(size_legend)
+        else:
+            caption = "marker size ∝ compression ratio · faded = dominated"
         ax.text(
-            0.99, 0.02,
-            "marker size ∝ compression ratio · faded = dominated",
+            0.99, 0.02, caption,
             transform=ax.transAxes, ha="right", va="bottom",
             fontsize=9, color="#666666",
             bbox=dict(boxstyle="round,pad=0.3", fc="white",
@@ -875,10 +962,19 @@ class ParetoVisualizer:
         return output_path
 
     def plot_bitwidth_distribution(self, output_path: Path) -> Path:
-        """Stacked bar chart of INT4 vs INT8 layer counts per solution."""
+        """Stacked bar chart of INT4 + INT8 layer counts per solution.
+
+        One bar per method; each bar is split into INT4 (orange,
+        bottom) and INT8 (blue, top). For uniform-bitwidth solutions
+        only one colour shows; for mixed-bitwidth solutions the bar is
+        visually mixed — exactly the read the user asked for. INT4
+        share is annotated inside the bar (when the segment is large
+        enough to fit the label) and the absolute total sits on top.
+        """
         self._setup_style()
+        n = len(self.solutions)
         fig, ax = plt.subplots(
-            figsize=(max(8.0, 0.45 * max(len(self.solutions), 1) + 4), 5),
+            figsize=(max(8.0, 0.55 * max(n, 1) + 4), 5.2),
         )
 
         if not self.solutions:
@@ -887,17 +983,62 @@ class ParetoVisualizer:
             return output_path
 
         labels = [s["solution_id"] for s in self.solutions]
-        int4_counts = [s["int4_count"] for s in self.solutions]
-        int8_counts = [s["int8_count"] for s in self.solutions]
-        x = np.arange(len(labels))
+        int4_counts = np.asarray(
+            [s.get("int4_count", 0) for s in self.solutions], dtype=float,
+        )
+        int8_counts = np.asarray(
+            [s.get("int8_count", 0) for s in self.solutions], dtype=float,
+        )
+        totals = int4_counts + int8_counts
+        x = np.arange(n)
 
-        bar_width = 0.62
-        ax.bar(x, int4_counts, bar_width,
-               label="INT4", color="#ef8a62",
-               edgecolor="white", linewidth=0.7)
-        ax.bar(x, int8_counts, bar_width, bottom=int4_counts,
-               label="INT8", color="#1f77b4",
-               edgecolor="white", linewidth=0.7)
+        bar_width = 0.66
+        bars_int4 = ax.bar(
+            x, int4_counts, bar_width,
+            label="INT4", color="#ef8a62",
+            edgecolor="white", linewidth=0.7,
+        )
+        bars_int8 = ax.bar(
+            x, int8_counts, bar_width, bottom=int4_counts,
+            label="INT8", color="#1f77b4",
+            edgecolor="white", linewidth=0.7,
+        )
+
+        # ── Annotations ──
+        # 1. Inside each segment: percent of layers at that bitwidth, when
+        #    the segment is tall enough to fit a label cleanly.
+        # 2. Above each bar: the total layer count for the method.
+        max_total = float(totals.max()) if totals.size else 1.0
+        for i in range(n):
+            tot = totals[i]
+            if tot <= 0:
+                continue
+            int4_pct = 100.0 * int4_counts[i] / tot
+            int8_pct = 100.0 * int8_counts[i] / tot
+
+            # Label INT4 segment
+            if int4_counts[i] > 0 and int4_counts[i] / max_total > 0.06:
+                ax.text(
+                    x[i], int4_counts[i] / 2,
+                    f"{int4_pct:.0f}% INT4",
+                    ha="center", va="center", fontsize=8,
+                    color="white", fontweight="bold",
+                )
+            # Label INT8 segment
+            if int8_counts[i] > 0 and int8_counts[i] / max_total > 0.06:
+                ax.text(
+                    x[i], int4_counts[i] + int8_counts[i] / 2,
+                    f"{int8_pct:.0f}% INT8",
+                    ha="center", va="center", fontsize=8,
+                    color="white", fontweight="bold",
+                )
+            # Total above bar
+            ax.text(
+                x[i], tot + max_total * 0.015,
+                f"{int(tot)}",
+                ha="center", va="bottom", fontsize=8.5,
+                color="#333333",
+            )
 
         ax.set_xlabel("Solution")
         ax.set_ylabel("Layer count")
@@ -906,6 +1047,7 @@ class ParetoVisualizer:
         ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=9)
         ax.legend(loc="upper right", title="Bitwidth")
         ax.grid(True, axis="y", alpha=0.4)
+        ax.set_ylim(0, max(max_total * 1.15, 1.0))
 
         fig.tight_layout()
         fig.savefig(output_path)
@@ -939,23 +1081,42 @@ class ParetoVisualizer:
             plt.close(fig)
             return output_path
 
-        headers = ["Rank", "Solution", "Top-1", "Loss", "Size (MiB)",
-                   "Compression", "INT4 %", "Status"]
+        # Latency is the third NSGA objective when the LUT / ONNX
+        # runtime measurement is available. Add a Latency column when
+        # any solution carries a real number so the table reflects
+        # the same objectives the dominance check uses; rows without
+        # latency render "-".
+        has_latency = any(
+            s.get("latency_mean_ms") is not None for s in sorted_sols
+        )
+        if has_latency:
+            headers = ["Rank", "Solution", "Top-1", "Loss", "Size (MiB)",
+                       "ORT(ms)", "Compression", "INT4 %", "Status"]
+        else:
+            headers = ["Rank", "Solution", "Top-1", "Loss", "Size (MiB)",
+                       "Compression", "INT4 %", "Status"]
+
         cell_data = []
         is_dominated_flags = []
         for i, s in enumerate(sorted_sols):
             dominated = s.get("is_dominated", False)
             is_dominated_flags.append(dominated)
-            cell_data.append([
+            row = [
                 str(i + 1),
                 s["solution_id"],
                 f"{s['accuracy']:.2f}%",
                 f"{s['accuracy_loss']:.2f}%",
                 f"{s.get('model_size_mb', s['ebops_mb']):.2f}",
+            ]
+            if has_latency:
+                lat = s.get("latency_mean_ms")
+                row.append(f"{lat:.2f}" if lat is not None else "-")
+            row.extend([
                 f"{s['compression_ratio']:.1f}x",
                 f"{s['int4_percent']:.0f}%",
                 "Dominated" if dominated else "★ Pareto",
             ])
+            cell_data.append(row)
 
         table = ax.table(
             cellText=cell_data,

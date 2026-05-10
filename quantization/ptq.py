@@ -309,34 +309,27 @@ class PTQQuantizer(BaseQuantizer):
                 if bw >= 32:
                     continue  # no-op
 
-                observer = self._observers.get(owner)
-                threshold = observer.threshold if observer is not None else None
-
-                if threshold is not None and threshold > 0.0:
-                    # Use the calibration-derived symmetric threshold as
-                    # the quantization range. Same bitwidth on both strategies,
-                    # but different threshold → different scale → different q.
-                    qmax = 2 ** (bw - 1) - 1
-                    qmin = -(2 ** (bw - 1))
-                    scale = max(float(threshold) / max(qmax, 1), EPS_PROB)
-                    q = (param.data / scale).round().clamp(qmin, qmax)
-                    param.data = q * scale
-                else:
-                    # Deterministic fallback: per-channel for Conv2d,
-                    # per-tensor for Linear. Warn once per layer.
-                    if observer is None:
-                        logger.warning(
-                            "  [PTQ] No calibration for %s — falling back to "
-                            "max-scale %s quantization.",
-                            owner,
-                            "per-channel" if isinstance(module, nn.Conv2d)
-                            else "per-tensor",
-                        )
-                    per_channel = isinstance(module, nn.Conv2d)
-                    param.data = self.quantize_tensor(
-                        param.data, bitwidth=bw,
-                        per_channel=per_channel, channel_dim=0,
-                    )
+                # Weight quantization always uses the weight tensor's own
+                # statistics (per-channel max for Conv2d, per-tensor max
+                # for Linear).
+                #
+                # The activation observer thresholds (KL/MSE-calibrated)
+                # capture INPUT activation distributions and are relevant
+                # for activation quantization. However, this is a
+                # weight-only PTQ path — applying an activation-derived
+                # threshold as the weight quantization scale is a known
+                # error: activation ranges (~1-10) are much larger than
+                # typical weight ranges (~0.001-0.1), so the resulting
+                # scale makes most weights round to zero.
+                #
+                # The calibration observer is retained for diagnostics
+                # and as a future hook for activation quantization, but
+                # it must NOT drive the weight scale.
+                per_channel = isinstance(module, nn.Conv2d)
+                param.data = self.quantize_tensor(
+                    param.data, bitwidth=bw,
+                    per_channel=per_channel, channel_dim=0,
+                )
         return q_model
 
     def quantize_with_config(

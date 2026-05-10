@@ -143,11 +143,19 @@ def _build_html(
 
     # ── Quantization Error Attribution (if exists) ──
     # Per-method files are saved as ``error_attribution_<method>.png``;
-    # the cross-method comparison is ``error_comparison.png``. Surface
-    # the comparison first (single overview chart) and follow with each
-    # per-method bar chart in alphabetical order.
-    cmp_img = _find_image(out, "error_comparison.png")
-    per_method = sorted(out.glob("error_attribution_*.png"))
+    # the cross-method comparison is ``error_comparison.png``. As of the
+    # latest pipeline change these live under
+    # ``artifacts/error_attribution/`` rather than the artifacts root,
+    # so we look in the subdirectory first and fall back to root for
+    # older runs.
+    ea_subdir = out / "error_attribution"
+    cmp_img = _find_image(out, "error_comparison.png", subdir="error_attribution")
+    if cmp_img is None:
+        cmp_img = _find_image(out, "error_comparison.png")
+    if ea_subdir.is_dir():
+        per_method = sorted(ea_subdir.glob("error_attribution_*.png"))
+    else:
+        per_method = sorted(out.glob("error_attribution_*.png"))
     if cmp_img or per_method:
         sections.append('<div class="section"><h2>🎯 Quantization Error Attribution</h2>')
         if cmp_img:
