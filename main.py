@@ -1373,51 +1373,6 @@ class NeuroQuantPipeline:
                 onnx_throughput_fps=onnx_lat.get("throughput_fps"),
             )
 
-        # ── Quantization Error Attribution ──
-        # Compute per-layer activation errors between FP32 and each
-        # quantized model, generating visual diagnostics. The PNGs land
-        # in their own ``error_attribution/`` subdirectory so the
-        # top-level ``artifacts/`` folder doesn't fan out across N
-        # methods × M plots — the report.py glob still picks them up.
-        # Runs BEFORE end_run() so MLflow artifact logging works.
-        try:
-            from visualization.error_attribution import (
-                compute_layer_errors, plot_error_attribution,
-                plot_error_comparison,
-            )
-            ea_subdir = self.output_dir / "error_attribution"
-            ea_subdir.mkdir(parents=True, exist_ok=True)
-            ea_dir = str(ea_subdir)
-            all_errors: Dict[str, list] = {}
-            for label, q_model in produced_models_by_id.items():
-                if not isinstance(q_model, nn.Module):
-                    continue
-                try:
-                    errors = compute_layer_errors(
-                        self.model, q_model, self.calib_loader,
-                        self.device, num_batches=3,
-                    )
-                    if errors:
-                        all_errors[label] = errors
-                        ea_path = plot_error_attribution(
-                            errors, ea_dir,
-                            method_name=label,
-                            model_name=self.config.model_name,
-                        )
-                        if ea_path:
-                            self.tracker.log_artifact(ea_path, "plots")
-                except Exception as exc:
-                    logger.debug("  Error attribution for %s: %s", label, exc)
-            if len(all_errors) > 1:
-                cmp_path = plot_error_comparison(
-                    all_errors, ea_dir,
-                    model_name=self.config.model_name,
-                )
-                if cmp_path:
-                    self.tracker.log_artifact(cmp_path, "plots")
-        except Exception as exc:
-            logger.warning("  Error attribution skipped: %s", exc)
-
         self.tracker.end_run()
 
         # Short per-method report line (best of each family).
@@ -1749,6 +1704,56 @@ class NeuroQuantPipeline:
 
         if xai_dir.exists():
             self.tracker.log_artifact(str(xai_dir), "xai")
+
+        # ── Quantization Error Attribution ──
+        # Compute per-layer activation errors between FP32 and every
+        # bitwidth-tagged quantized model the pipeline produced
+        # (PTQ_INT8/PTQ_MIXED, QAT_*, all phase-1f methods). Reusing
+        # the ``quant_models`` dict the XAI generator already received
+        # keeps the per-method coverage in lockstep with the public
+        # technique × sample matrix — error attribution and Grad-CAM
+        # always cover the same set of methods. PNGs land in their own
+        # ``error_attribution/`` subdirectory so the top-level
+        # ``artifacts/`` folder does not fan out across N methods × M
+        # plots; report.py's glob still picks them up. Runs BEFORE
+        # ``end_run()`` so MLflow artifact logging works.
+        try:
+            from visualization.error_attribution import (
+                compute_layer_errors, plot_error_attribution,
+                plot_error_comparison,
+            )
+            ea_subdir = self.output_dir / "error_attribution"
+            ea_subdir.mkdir(parents=True, exist_ok=True)
+            ea_dir = str(ea_subdir)
+            all_errors: Dict[str, list] = {}
+            for label, q_model in quant_models.items():
+                if not isinstance(q_model, nn.Module):
+                    continue
+                try:
+                    errors = compute_layer_errors(
+                        self.model, q_model, self.calib_loader,
+                        self.device, num_batches=3,
+                    )
+                    if errors:
+                        all_errors[label] = errors
+                        ea_path = plot_error_attribution(
+                            errors, ea_dir,
+                            method_name=label,
+                            model_name=self.config.model_name,
+                        )
+                        if ea_path:
+                            self.tracker.log_artifact(ea_path, "plots")
+                except Exception as exc:
+                    logger.debug("  Error attribution for %s: %s", label, exc)
+            if len(all_errors) > 1:
+                cmp_path = plot_error_comparison(
+                    all_errors, ea_dir,
+                    model_name=self.config.model_name,
+                )
+                if cmp_path:
+                    self.tracker.log_artifact(cmp_path, "plots")
+        except Exception as exc:
+            logger.warning("  Error attribution skipped: %s", exc)
 
         self.tracker.end_run()
 
