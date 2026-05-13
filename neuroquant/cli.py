@@ -490,9 +490,13 @@ class NeuroQuantPipeline:
         from neuroquant.quantization.hessian_clustering import HessianComputer, LayerClusterer
 
         hessian_comp = HessianComputer(self.model, self.config)
+        # Hessian needs a task-aware ``(model, x, y) -> scalar_loss`` bridge
+        # so detection/segmentation calibration batches don't get fed into
+        # a hardcoded CrossEntropyLoss they were never meant for.
         self.hessian_diag = hessian_comp.compute_hessian(
-            self.calib_loader, nn.CrossEntropyLoss(),
+            self.calib_loader,
             num_batches=self.config.hyperparams.hessian_batches,
+            loss_fn=self._build_task_loss_fn(),
         )
 
         clusterer = LayerClusterer(self.model, self.hessian_diag, self.config)
@@ -2164,6 +2168,85 @@ class NeuroQuantPipeline:
         self.ckpt.load_phase_json("phase_4_mlflow")
 
     # ==================================================================
+    # Task-aware Loss Bridge
+    # ==================================================================
+
+    def _build_task_loss_fn(self):
+        """Return a ``(model, x, y) -> scalar_loss`` callable for the
+        configured task. Used wherever the pipeline needs to compute a
+        loss without knowing what the model's forward contract looks
+        like — Phase 1a Hessian sensitivity and ``_train_model``.
+
+        Dispatches on ``self.config.task``:
+
+        * ``classification``: ``CrossEntropyLoss(model(x), y)`` — the
+          canonical logits-vs-labels path.
+        * ``detection``: torchvision detectors return a
+          ``Dict[str, Tensor]`` of named losses when called with both
+          ``images`` and ``targets`` in ``train()`` mode. We sum the
+          dict values into a single scalar.
+        * ``segmentation``: torchvision seg models return
+          ``OrderedDict({"out": Tensor[B, C, H, W]})`` plus an optional
+          ``"aux"`` head. We pull ``out`` and apply a pixel-wise
+          ``CrossEntropyLoss(ignore_index=255)`` so the standard
+          ignore-label convention used by Pascal VOC / Cityscapes
+          works out of the box.
+
+        Every variant returns a scalar tensor that autograd can
+        differentiate, so downstream consumers (Hessian, QAT-style
+        training) stay task-agnostic.
+        """
+        task = getattr(self.config, "task", "classification")
+
+        if task == "detection":
+            def _detection_loss(model: nn.Module, x: Any, y: Any) -> torch.Tensor:
+                # torchvision detection contract: ``model(images, targets)``
+                # in ``train()`` returns a dict of named scalar losses.
+                # Forcing ``train()`` here is safe because the caller has
+                # already set up gradient flow; eval would return
+                # predictions instead of losses.
+                if not model.training:
+                    model.train()
+                losses = model(x, y)
+                if isinstance(losses, dict):
+                    return sum(losses.values())
+                # Defensive: a custom detection model that already returns
+                # a scalar — treat it as the loss directly.
+                return losses
+
+            return _detection_loss
+
+        if task == "segmentation":
+            seg_criterion = nn.CrossEntropyLoss(ignore_index=255)
+
+            def _segmentation_loss(model: nn.Module, x: Any, y: Any) -> torch.Tensor:
+                output = model(x)
+                # torchvision returns an OrderedDict with "out" (main
+                # head) and optionally "aux" (deep-supervision head).
+                # We use the main head only; the aux loss is omitted
+                # because it's training-time-only and not part of the
+                # deployment graph.
+                if isinstance(output, dict):
+                    logits = output.get("out", next(iter(output.values())))
+                else:
+                    logits = output
+                # Segmentation labels are ``Tensor[B, H, W]`` of class
+                # indices (or ``Tensor[B, 1, H, W]`` from some loaders).
+                if y.dim() == 4 and y.size(1) == 1:
+                    y = y.squeeze(1)
+                return seg_criterion(logits, y.long())
+
+            return _segmentation_loss
+
+        # Default: classification.
+        cls_criterion = nn.CrossEntropyLoss()
+
+        def _classification_loss(model: nn.Module, x: Any, y: Any) -> torch.Tensor:
+            return cls_criterion(model(x), y)
+
+        return _classification_loss
+
+    # ==================================================================
     # Training Helper
     # ==================================================================
 
@@ -2174,9 +2257,20 @@ class NeuroQuantPipeline:
         val_loader: DataLoader,
         epochs: int,
     ) -> float:
-        """Train the model and return best validation top-1 accuracy."""
+        """Train the model and return best validation accuracy.
+
+        Task-aware: classification uses Top-1; detection and segmentation
+        skip the accuracy logging (returning 0.0 best_acc) because they
+        don't have a single scalar accuracy metric that the rest of the
+        pipeline consumes here. The training loop itself works for all
+        three task families thanks to the shared ``_build_task_loss_fn``
+        bridge, so ``--epochs N`` is no longer classification-only.
+        """
+        task = getattr(self.config, "task", "classification")
+        loss_fn = self._build_task_loss_fn()
+
+        model.to(self.device)
         model.train()
-        criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.SGD(
             model.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4,
         )
@@ -2189,32 +2283,64 @@ class NeuroQuantPipeline:
             model.train()
             running_loss = 0.0
             correct = total = 0
+            samples_seen = 0
 
-            for images, labels in train_loader:
-                images, labels = images.to(self.device), labels.to(self.device)
+            for batch in train_loader:
+                x, y = batch[0], batch[1]
+                # Move inputs to device — detection yields a tuple of
+                # tensors (variable-size images), other tasks a single
+                # batched tensor.
+                if isinstance(x, (list, tuple)):
+                    x = [t.to(self.device) for t in x]
+                    batch_size = len(x)
+                else:
+                    x = x.to(self.device)
+                    batch_size = x.size(0)
+                if isinstance(y, (list, tuple)) and len(y) > 0 and isinstance(y[0], dict):
+                    y = [
+                        {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                         for k, v in t.items()}
+                        for t in y
+                    ]
+                else:
+                    y = y.to(self.device)
+
                 optimizer.zero_grad()
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+                loss = loss_fn(model, x, y)
                 loss.backward()
                 optimizer.step()
 
-                running_loss += loss.item() * labels.size(0)
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
+                running_loss += float(loss.item()) * batch_size
+                samples_seen += batch_size
 
-            train_acc = correct / max(total, 1) * 100
-            train_loss = running_loss / max(total, 1)
+                # Classification-only Top-1 accumulator (cheap, harmless to
+                # skip when forward output isn't a logits tensor).
+                if task == "classification":
+                    with torch.no_grad():
+                        outputs = model(x)
+                        _, predicted = outputs.max(1)
+                        total += y.size(0)
+                        correct += predicted.eq(y).sum().item()
 
-            val_dict = evaluate_model(model, val_loader, self.device)
-            val_acc = val_dict["top1"]
-            best_acc = max(best_acc, val_acc)
+            train_loss = running_loss / max(samples_seen, 1)
+
+            if task == "classification":
+                train_acc = correct / max(total, 1) * 100
+                val_dict = evaluate_model(model, val_loader, self.device)
+                val_acc = val_dict["top1"]
+                best_acc = max(best_acc, val_acc)
+                logger.info(
+                    "  Epoch %d/%d: loss=%.4f, train_acc=%.2f%%, val_acc=%.2f%%",
+                    epoch, epochs, train_loss, train_acc, val_acc,
+                )
+            else:
+                # No single scalar accuracy for detection/segmentation
+                # at this layer of the pipeline; log only the loss.
+                logger.info(
+                    "  Epoch %d/%d: loss=%.4f (task=%s)",
+                    epoch, epochs, train_loss, task,
+                )
             scheduler.step()
-
-            logger.info(
-                "  Epoch %d/%d: loss=%.4f, train_acc=%.2f%%, val_acc=%.2f%%",
-                epoch, epochs, train_loss, train_acc, val_acc,
-            )
 
         return best_acc
 

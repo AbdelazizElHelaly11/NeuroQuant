@@ -104,6 +104,23 @@ print(predictions[0]["boxes"].shape, predictions[0]["scores"].max())
     canonical `List[Dict[str, Tensor]]` and downstream eval / NMS /
     Grad-CAM all work unchanged.
 
+!!! warning "AWQ is not supported on detection models"
+
+    Use `PTQQuantizer`, `GPTQQuantizer`, or `QATTrainer` for detection.
+    AWQ's per-layer α search concatenates calibration activations
+    along the batch axis, which assumes a **static activation shape**
+    across batches. Detection models (Faster R-CNN, RetinaNet, …) emit
+    variable-size tensors from the RPN / RoI heads — the number of
+    proposals depends on the image, so `torch.cat` along the batch
+    dimension fails. This is a property of the AWQ algorithm itself
+    (designed for static-shape LLM / vision-backbone graphs), not a
+    bug in NeuroQuant. Calling `AWQQuantizer(...).quantize(...)` with
+    `task="detection"` raises a clear `NotImplementedError` pointing
+    you back to PTQ / QAT.
+
+    Segmentation is fine — `OrderedDict({"out": ...})` has a static
+    spatial shape per batch, so AWQ applies normally.
+
 ## 4 · Segmentation example — DeepLabV3 + Grad-CAM
 
 ```python

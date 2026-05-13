@@ -17,12 +17,21 @@ Works for ANY PyTorch nn.Module — no model-specific assumptions.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
+# Type alias: a task-aware loss function takes ``(model, batch_x, batch_y)``
+# and returns a scalar loss tensor. This indirection lets the same Hessian
+# estimator drive classification, detection, and segmentation: classification
+# uses ``criterion(model(x), y)``; detection runs the torchvision detector
+# in train mode so ``model(x, y)`` returns a dict of named losses that we
+# sum; segmentation pulls ``model(x)["out"]`` before passing it to a
+# pixel-wise CE. Default ``None`` preserves the classification-only flow.
+LossFn = Callable[[nn.Module, Any, Any], torch.Tensor]
 
 from neuroquant.config import (
     ClusterAssignment,
@@ -78,10 +87,29 @@ class HessianComputer:
     def compute_hessian(
         self,
         data_loader: DataLoader,
-        criterion: nn.Module,
+        criterion: Optional[nn.Module] = None,
         num_batches: int = 20,
+        *,
+        loss_fn: Optional[LossFn] = None,
     ) -> Dict[str, LayerSensitivity]:
         """Compute per-parameter sensitivity scores.
+
+        Args:
+            data_loader: Calibration DataLoader.
+            criterion: Classification loss module (e.g. ``CrossEntropyLoss``).
+                Ignored when ``loss_fn`` is supplied. Kept as a positional
+                argument for backwards compatibility with callers that
+                pass classification criteria directly.
+            num_batches: How many batches to draw from ``data_loader``.
+            loss_fn: Task-aware ``(model, x, y) -> scalar_loss`` callable.
+                When provided, fully replaces the default
+                ``criterion(model(x), y)`` flow — required for detection
+                (model returns a loss dict from ``model(x, y)`` in train
+                mode) and segmentation (output is
+                ``OrderedDict({"out": ...})``). When both ``criterion``
+                and ``loss_fn`` are ``None`` we default to
+                ``CrossEntropyLoss`` so legacy classification callers keep
+                working without modification.
 
         Dispatches on ``config.hyperparams.hessian_estimator``:
 
@@ -99,6 +127,18 @@ class HessianComputer:
         ``LayerSensitivity`` with a non-negative ``hessian_diag`` field —
         downstream clustering / NSGA code is unchanged.
         """
+        if loss_fn is None:
+            if criterion is None:
+                criterion = nn.CrossEntropyLoss()
+            _criterion = criterion
+
+            def _default_loss_fn(model: nn.Module, x: Any, y: Any) -> torch.Tensor:
+                return _criterion(model(x), y)
+
+            effective_loss_fn: LossFn = _default_loss_fn
+        else:
+            effective_loss_fn = loss_fn
+
         estimator = getattr(
             self.config.hyperparams, "hessian_estimator", "fisher",
         )
@@ -108,10 +148,10 @@ class HessianComputer:
         )
         if estimator == "diag_hessian":
             return self._compute_diag_hessian(
-                data_loader, criterion, num_batches,
+                data_loader, effective_loss_fn, num_batches,
             )
         return self._compute_fisher(
-            data_loader, criterion, num_batches,
+            data_loader, effective_loss_fn, num_batches,
         )
 
     # ------------------------------------------------------------------
@@ -121,7 +161,7 @@ class HessianComputer:
     def _compute_fisher(
         self,
         data_loader: DataLoader,
-        criterion: nn.Module,
+        loss_fn: LossFn,
         num_batches: int,
     ) -> Dict[str, LayerSensitivity]:
         """Compute the empirical Fisher diagonal ``E[(∂L/∂w)²]``.
@@ -130,9 +170,21 @@ class HessianComputer:
         with it at the maximum-likelihood point of the cross-entropy
         loss. One backward pass per batch; no graph retention beyond
         the standard autograd lifetime.
+
+        ``loss_fn`` is invoked as ``loss_fn(model, x, y) -> scalar``,
+        so detection/segmentation can wire in their own (model, input,
+        target) → loss bridge without this function knowing about the
+        task type.
         """
         self.model.to(self.device)
-        self.model.eval()
+        # torchvision detectors require ``train()`` mode to return a loss
+        # dict from ``model(x, y)``; in ``eval()`` they return predictions
+        # which cannot be back-propagated. For classification and
+        # segmentation the loss is computed from forward outputs so
+        # ``train()`` is still safe — BatchNorm just updates running
+        # stats over a handful of calibration batches, which is harmless
+        # for a sensitivity probe.
+        self.model.train()
         for p in self.model.parameters():
             p.requires_grad_(True)
 
@@ -144,17 +196,25 @@ class HessianComputer:
         for batch_idx, (x, y) in enumerate(data_loader):
             if batch_idx >= num_batches:
                 break
-            x = x.to(self.device)
-            y = y.to(self.device)
+            x = [i.to(self.device) for i in x] if isinstance(x, (tuple, list)) else x.to(self.device)
+            if isinstance(y, (tuple, list)) and len(y) > 0 and isinstance(y[0], dict):
+                y = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in y]
+            else:
+                y = y.to(self.device)
             self.model.zero_grad(set_to_none=True)
-            output = self.model(x)
-            loss = criterion(output, y)
-            grads = torch.autograd.grad(loss, param_list)
+            loss = loss_fn(self.model, x, y)
+            grads = torch.autograd.grad(loss, param_list, allow_unused=True)
             for name, g in zip(param_names, grads):
+                # ``allow_unused=True`` returns None for parameters that
+                # didn't participate in the loss graph (e.g. a detection
+                # model's RPN head when targets exclude proposals at this
+                # scale). Skip them — their Fisher contribution is 0.
+                if g is None:
+                    continue
                 # Mean of squared gradient is the Fisher diag estimate.
                 accum[name] += g.detach().pow(2).mean().item()
             batches_used += 1
-            del grads, loss, output
+            del grads, loss
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
             if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == num_batches:
@@ -190,19 +250,26 @@ class HessianComputer:
     def _compute_diag_hessian(
         self,
         data_loader: DataLoader,
-        criterion: nn.Module,
+        loss_fn: LossFn,
         num_batches: int,
     ) -> Dict[str, LayerSensitivity]:
         """Original double-backprop diagonal Hessian estimator.
 
         Algorithm (per calibration batch):
-          1. Forward pass  → loss
+          1. Forward pass via ``loss_fn(model, x, y)`` → scalar loss
           2. First gradient  (∂loss/∂w) with create_graph=True
           3. Second gradient (∂²loss/∂w²) = gradient of sum(grad_1)
           4. Accumulate |H_ii| mean per parameter
+
+        ``loss_fn`` abstracts the forward pass so detection/segmentation
+        models that need ``model(x, y)`` (loss-dict path) or
+        ``model(x)["out"]`` (segmentation logits) work without this
+        estimator hard-coding any task assumptions.
         """
         self.model.to(self.device)
-        self.model.eval()  # BN in eval mode, but grads still flow
+        # See ``_compute_fisher`` for the same rationale: detection
+        # criteria require ``train()`` so the model returns a loss dict.
+        self.model.train()
 
         # Ensure all parameters require gradients for double backprop.
         for p in self.model.parameters():
@@ -220,41 +287,57 @@ class HessianComputer:
             if batch_idx >= num_batches:
                 break
 
-            x = x.to(self.device)
-            y = y.to(self.device)
+            x = [i.to(self.device) for i in x] if isinstance(x, (tuple, list)) else x.to(self.device)
+            if isinstance(y, (tuple, list)) and len(y) > 0 and isinstance(y[0], dict):
+                y = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in y]
+            else:
+                y = y.to(self.device)
 
-            # ── Forward pass ──
-            output = self.model(x)
-            loss = criterion(output, y)
+            # ── Forward pass via task-aware loss bridge ──
+            loss = loss_fn(self.model, x, y)
 
             # ── First gradient (∂loss/∂w_i) ──
             # create_graph=True so we can differentiate through grad_1.
+            # ``allow_unused=True`` because detection sub-heads can be
+            # silent on batches whose targets don't activate them.
             grad_1 = torch.autograd.grad(
                 loss,
                 param_list,
                 create_graph=True,
                 retain_graph=True,
+                allow_unused=True,
             )
 
             # ── Second gradient (∂²loss/∂w_i²) ──
-            # sum(g.sum()) aggregates all first-order gradients into a scalar;
-            # differentiating that scalar w.r.t. each param gives H_ii.
-            grad_1_scalar = sum(g.sum() for g in grad_1)
+            # Filter out the None entries before reducing — a None gradient
+            # contributes nothing to the second-order term.
+            active_grad_1 = [g for g in grad_1 if g is not None]
+            if not active_grad_1:
+                # Nothing in the model participated in this batch's loss;
+                # this is degenerate but possible (empty detection targets).
+                batches_used += 1
+                del grad_1, loss
+                torch.cuda.empty_cache() if self.device.type == "cuda" else None
+                continue
+            grad_1_scalar = sum(g.sum() for g in active_grad_1)
             grad_2 = torch.autograd.grad(
                 grad_1_scalar,
                 param_list,
                 retain_graph=False,
+                allow_unused=True,
             )
 
             # ── Accumulate ──
             for idx, (name, g2) in enumerate(zip(param_names, grad_2)):
+                if g2 is None:
+                    continue
                 h_value = g2.abs().mean().item()
                 hessian_accum[name] += h_value
 
             batches_used += 1
 
             # Free the computation graph to reclaim GPU memory.
-            del grad_1, grad_2, grad_1_scalar, loss, output
+            del grad_1, grad_2, grad_1_scalar, loss
             torch.cuda.empty_cache() if self.device.type == "cuda" else None
 
             if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == num_batches:

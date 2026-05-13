@@ -92,6 +92,12 @@ mlflow.db-journal
 logs/
 outputs/
 
+# ── MkDocs build output ──────────────────────────────────────────────────
+# ``mkdocs build`` renders the static site into ``site/``; we ship the
+# sources under ``docs/`` and let GitHub Pages (or a fresh ``mkdocs
+# gh-deploy``) rebuild on publish.
+site/
+
 # ── Model checkpoints (large binary files) ───────────────────────────────
 *.pth
 *.pt

@@ -114,6 +114,26 @@ class AWQQuantizer(BaseQuantizer):
         bitwidth: int = 4,
         num_batches: int = 10,
     ) -> nn.Module:
+        # AWQ's per-layer α search relies on activation tensors that share
+        # a stable shape across the calibration batches — the algorithm
+        # concatenates them with ``torch.cat`` and computes per-input-channel
+        # statistics. torchvision detection models break that invariant:
+        # the ROI / box head emits ``[num_proposals_i, ...]`` per image
+        # where ``num_proposals_i`` varies, so concatenation along the
+        # batch axis fails outright. This is a property of the algorithm,
+        # not a fixable bug — AWQ was designed for LLM / vision-backbone
+        # static shapes. Fail fast with a clear pointer to PTQ / QAT,
+        # which both handle dynamic-shape models correctly.
+        task = getattr(self.config, "task", "classification")
+        if task == "detection":
+            raise NotImplementedError(
+                "AWQ does not support detection models: it requires "
+                "static activation shapes for the per-layer α search, "
+                "but torchvision detectors emit variable-size tensors "
+                "from the RPN / RoI heads. Use PTQQuantizer or "
+                "QATTrainer for detection — both handle dynamic shapes."
+            )
+
         start = time.time()
         q_model = copy.deepcopy(self.model)
         q_model.to(self.device)
@@ -303,7 +323,11 @@ class AWQQuantizer(BaseQuantizer):
                 for i, batch in enumerate(data_loader):
                     if i >= num_batches:
                         break
-                    images = batch[0].to(self.device)
+                    images = batch[0]
+                    if isinstance(images, (list, tuple)):
+                        images = [img.to(self.device) for img in images]
+                    else:
+                        images = images.to(self.device)
                     model(images)
         finally:
             for h in hooks:
@@ -348,7 +372,11 @@ class AWQQuantizer(BaseQuantizer):
                 for i, batch in enumerate(data_loader):
                     if i >= num_batches:
                         break
-                    images = batch[0].to(self.device)
+                    images = batch[0]
+                    if isinstance(images, (list, tuple)):
+                        images = [img.to(self.device) for img in images]
+                    else:
+                        images = images.to(self.device)
                     model(images)
         finally:
             for h in hooks:

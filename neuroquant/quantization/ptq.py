@@ -449,7 +449,11 @@ class PTQQuantizer(BaseQuantizer):
                 for i, batch in enumerate(calibration_loader):
                     if i >= num_batches:
                         break
-                    images = batch[0].to(self.device)
+                    images = batch[0]
+                    if isinstance(images, (list, tuple)):
+                        images = [img.to(self.device) for img in images]
+                    else:
+                        images = images.to(self.device)
                     self.model(images)
         finally:
             for h in hooks:
@@ -551,7 +555,11 @@ class PTQQuantizer(BaseQuantizer):
                 for i, batch in enumerate(calibration_loader):
                     if i >= num_batches:
                         break
-                    images = batch[0].to(self.device)
+                    images = batch[0]
+                    if isinstance(images, (list, tuple)):
+                        images = [img.to(self.device) for img in images]
+                    else:
+                        images = images.to(self.device)
                     self.model(images)
         finally:
             for h in hooks:
