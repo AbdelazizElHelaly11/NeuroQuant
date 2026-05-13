@@ -14,20 +14,33 @@
 model:
   name: "mobilenetv2"           # any torchvision name (e.g. mobilenetv2, resnet18,
                                 #  resnet50, vgg16, efficientnet_b0) OR empty/null
-                                #  if you supply ``class`` below. For task=detection
-                                #  use a torchvision.models.detection name such as
-                                #  ``fasterrcnn_resnet50_fpn`` or ``ssd300_vgg16``.
+                                #  if you supply ``class`` below.
+                                #  - task=detection: use a
+                                #    ``torchvision.models.detection`` name such as
+                                #    ``fasterrcnn_resnet50_fpn`` or ``ssd300_vgg16``.
+                                #  - task=segmentation: use a
+                                #    ``torchvision.models.segmentation`` name such as
+                                #    ``fcn_resnet50``, ``deeplabv3_resnet101``, or
+                                #    ``lraspp_mobilenet_v3_large``.
   path: null                    # optional: path to pre-trained weights (.pth)
   class: null                   # optional: fully-qualified "pkg.mod.ClassName"
                                 #  for a custom torch.nn.Module
   num_classes: 10
   input_shape: [3, 32, 32]      # (C, H, W)
-  task: "classification"        # classification | detection
+  task: "classification"        # classification | detection | segmentation
                                 #  - classification: standard last-Linear head
-                                #    swap + first-Conv stride tweak for small inputs
+                                #    swap + first-Conv stride tweak for small inputs.
+                                #    Forward outputs ``[B, num_classes]`` logits.
                                 #  - detection: load from torchvision.models.detection;
                                 #    head adaptation is automatic only for the
-                                #    Faster/Mask/Keypoint R-CNN family.
+                                #    Faster/Mask/Keypoint R-CNN family. Forward
+                                #    outputs a list of dicts (boxes/labels/scores).
+                                #  - segmentation: load from
+                                #    torchvision.models.segmentation with
+                                #    num_classes propagated through the
+                                #    constructor. Forward outputs an OrderedDict
+                                #    with ``out: [B, num_classes, H, W]`` (and
+                                #    optionally ``aux``).
 
 # ── Dataset ──────────────────────────────────────────────────────────────
 dataset:
@@ -102,10 +115,6 @@ hyperparams:
   nsga_surrogate_proposed_per_gen: 256
   # Hessian-aware mutation:
   nsga_sensitivity_weighted_mutation: true
-
-  # FITCompress seed generation
-  fit_low_percentile: 0.25          # below → force INT4 (compress)
-  fit_high_percentile: 0.75         # above → force INT8 (preserve)
 
   # AdaRound
   adaround_epochs: 100
@@ -186,7 +195,6 @@ hyperparams:
 # Valid phase IDs:
 #   phase_0_preparation
 #   phase_1a_hessian_clustering
-#   phase_1b_fitcompress
 #   phase_1c_nsga_search
 #   phase_1d_adaround
 #   phase_1e_qat
@@ -197,7 +205,6 @@ hyperparams:
 phases:
   - phase_0_preparation
   - phase_1a_hessian_clustering
-  - phase_1b_fitcompress
   - phase_1c_nsga_search
   - phase_1d_adaround
   - phase_1e_qat

@@ -8,10 +8,10 @@
 #   * Coverage report thresholds and exclusions.
 #
 # Coverage target: ≥80% line coverage on the production packages
-# (quantization, utils, tracking, visualization, config). The gate is
-# enforced by pytest-cov via the ``--cov-fail-under`` flag below. CI
-# (.github/workflows/tests.yml) runs the same command, so a regression
-# below 80% breaks the build, not just the local report.
+# under ``neuroquant.*`` (quantization, utils, tracking, visualization,
+# config). The gate is enforced by pytest-cov via the ``--cov-fail-under``
+# flag below. CI (.github/workflows/tests.yml) runs the same command,
+# so a regression below 80% breaks the build, not just the local report.
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -65,9 +65,9 @@ dependencies = [
     "onnxruntime>=1.16",
     "onnxscript>=0.1",
     # Surrogate-assisted NSGA-II (Phase 1c). Used by
-    # ``quantization.surrogate.AccuracySurrogate`` to cheaply rank
-    # mixed-precision candidates before real evaluation; gracefully
-    # disables itself if the install is missing.
+    # ``neuroquant.quantization.surrogate.AccuracySurrogate`` to
+    # cheaply rank mixed-precision candidates before real evaluation;
+    # gracefully disables itself if the install is missing.
     "scikit-learn>=1.3",
 ]
 
@@ -82,6 +82,15 @@ dev = [
 xai = [
     "shap>=0.42.0",
 ]
+# Docs toolchain — MkDocs Material theme plus the mkdocstrings Python
+# handler that auto-generates the API reference page from our
+# docstrings. Install with ``pip install -e .[docs]`` and then run
+# ``mkdocs serve`` from the repo root.
+docs = [
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.25",
+    "pymdown-extensions>=10.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/AbdelazizElHelaly11/NeuroQuant"
@@ -89,33 +98,29 @@ Documentation = "https://github.com/AbdelazizElHelaly11/NeuroQuant/blob/main/REA
 Repository = "https://github.com/AbdelazizElHelaly11/NeuroQuant"
 Issues = "https://github.com/AbdelazizElHelaly11/NeuroQuant/issues"
 
-# Wave 7 O3: console-script entry point. Installs ``neuroquant`` as a
-# command on PATH so users do not have to invoke ``python main.py``;
-# ``main:main`` is the existing argparse-driven entry point that
-# already handles config loading, CLI overrides, and pipeline
-# execution.
+# Console-script entry point. Installs ``neuroquant`` as a command on
+# PATH so users do not have to invoke ``python -m neuroquant.cli``;
+# ``neuroquant.cli:main`` is the argparse-driven entry point that
+# handles config loading, CLI overrides, and pipeline execution.
 [project.scripts]
-neuroquant = "main:main"
+neuroquant = "neuroquant.cli:main"
 
 [tool.setuptools]
-packages = [
-    "quantization",
-    "utils",
-    "tracking",
-    "visualization",
-    "data",
-    "models",
-    "xai",
-]
-# Top-level modules that aren't inside a package — they need explicit
-# inclusion so the wheel ships them.
-py-modules = ["config", "main"]
+# Everything lives under the single top-level ``neuroquant`` package
+# now. ``include-package-data = true`` lets the build pick up
+# non-Python files declared below.
 include-package-data = true
+
+# Auto-discover every ``neuroquant.*`` subpackage so adding a new
+# subpackage doesn't require editing this list.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["neuroquant*"]
 
 [tool.setuptools.package-data]
 # Ship the bundled default config inside the wheel so ``neuroquant --init``
 # can copy it to the user's working directory after a fresh ``pip install``.
-# The file lives inside the ``quantization`` package and is loaded via
-# ``importlib.resources`` (see ``main._run_init_command``).
-"quantization" = ["_default_config.yaml"]
+# The file lives inside the ``neuroquant.quantization`` package and is
+# loaded via ``importlib.resources`` (see ``neuroquant.cli._run_init_command``).
+"neuroquant.quantization" = ["_default_config.yaml"]
 

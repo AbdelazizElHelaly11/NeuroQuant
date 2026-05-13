@@ -1,0 +1,166 @@
+# NeuroQuant — MkDocs site configuration
+#
+# Build locally:   mkdocs serve         (live reload on http://127.0.0.1:8000)
+# Build static:    mkdocs build         (outputs to ./site)
+# Deploy:          mkdocs gh-deploy     (publishes to gh-pages branch)
+#
+# Install the docs toolchain with:  pip install -e .[docs]
+
+site_name: NeuroQuant
+site_description: >-
+  Production-grade neural-network quantization framework with
+  Surrogate-Assisted NSGA-II search, ONNX deployment fidelity, and
+  Grad-CAM / SHAP explainability across classification, detection,
+  and segmentation.
+site_url: https://AbdelazizElHelaly11.github.io/NeuroQuant/
+repo_url: https://github.com/AbdelazizElHelaly11/NeuroQuant
+repo_name: AbdelazizElHelaly11/NeuroQuant
+edit_uri: edit/main/docs/
+copyright: Copyright &copy; NeuroQuant Authors — MIT License
+
+# ──────────────────────────────────────────────────────────────────────────
+# Theme — Material for MkDocs
+# ──────────────────────────────────────────────────────────────────────────
+theme:
+  name: material
+  language: en
+  features:
+    - announce.dismiss
+    - content.code.annotate
+    - content.code.copy
+    - content.tabs.link
+    - content.tooltips
+    - navigation.indexes
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.sections
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.top
+    - navigation.tracking
+    - search.highlight
+    - search.share
+    - search.suggest
+    - toc.follow
+  font:
+    text: Inter
+    code: JetBrains Mono
+  icon:
+    repo: fontawesome/brands/github
+    edit: material/pencil
+    view: material/eye
+  # Slate (dark) + Indigo (light) palette with a toggle so the docs read
+  # well at both ends of the spectrum. Defaults to dark because that's
+  # where ML engineers spend their day.
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+
+# ──────────────────────────────────────────────────────────────────────────
+# Plugins
+# ──────────────────────────────────────────────────────────────────────────
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          # Auto-discover docstrings from the installed (or in-tree)
+          # ``neuroquant`` package. mkdocstrings will follow imports and
+          # render every class / function the API page references.
+          paths: [.]
+          options:
+            docstring_style: google
+            docstring_section_style: table
+            show_root_heading: true
+            show_root_toc_entry: true
+            show_source: true
+            show_signature: true
+            show_signature_annotations: true
+            separate_signature: true
+            signature_crossrefs: true
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            members_order: source
+            merge_init_into_class: true
+            heading_level: 2
+            filters:
+              # Hide private helpers (anything starting with ``_``) from
+              # the public API tables; keep ``__init__`` because the
+              # mkdocstrings ``merge_init_into_class`` flag uses it.
+              - "!^_"
+              - "^__init__$"
+
+# ──────────────────────────────────────────────────────────────────────────
+# Markdown extensions — give pages first-class code blocks, admonitions,
+# tabs, and math support.
+# ──────────────────────────────────────────────────────────────────────────
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.snippets:
+      check_paths: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+# ──────────────────────────────────────────────────────────────────────────
+# Navigation tree
+# ──────────────────────────────────────────────────────────────────────────
+nav:
+  - Home: index.md
+  - Getting Started: getting_started.md
+  - Using the CLI Pipeline (For Researchers): pipeline_mode.md
+  - Using the Python Library (For Developers): library_mode.md
+  - API Reference: api_reference.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/AbdelazizElHelaly11/NeuroQuant
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/neuroquant/
+  generator: false
