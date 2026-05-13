@@ -191,6 +191,4 @@ MIT. See [LICENSE](LICENSE) for the full text.
 
 ---
 
-## Acknowledgements
 
-The seven-wave production hardening was specified, implemented, and refined in collaboration with **Claude Opus 4.7 (1M context)**. Per-wave architecture notes live under [`docs/architecture/`](docs/architecture/).
