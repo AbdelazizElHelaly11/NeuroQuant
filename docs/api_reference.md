@@ -180,6 +180,23 @@ doesn't apply).
     options:
       show_bases: false
 
+### `AttentionRolloutExplainer`
+
+> Added in v2.1.
+
+Vision-Transformer-compatible heatmap generator using
+Attention Rollout (Abnar & Zuidema, 2020). `XAIGenerator.run`
+auto-detects ViTs via `is_vision_transformer` and routes here
+instead of Grad-CAM (which requires a Conv2d feature map).
+
+::: neuroquant.xai.explainability.AttentionRolloutExplainer
+    options:
+      show_bases: false
+
+::: neuroquant.xai.explainability.is_vision_transformer
+    options:
+      heading_level: 4
+
 ---
 
 ## Pareto Analysis & Visualisation
@@ -201,6 +218,23 @@ plots used in the HTML report and the `pareto_summary.json`.
 ::: neuroquant.visualization.pareto_analysis.ParetoVisualizer
     options:
       show_bases: false
+
+### Regression metrics
+
+> Added in v2.1.
+
+`compute_regression_metrics` reports RMSE / MAE / R² for
+`task="regression"` runs. The dispatcher `evaluate_primary_metric`
+routes between classification and regression so NSGA-II can stay
+task-agnostic.
+
+::: neuroquant.utils.metrics.compute_regression_metrics
+    options:
+      heading_level: 4
+
+::: neuroquant.utils.metrics.evaluate_primary_metric
+    options:
+      heading_level: 4
 
 ### Error attribution helpers
 

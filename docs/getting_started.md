@@ -45,13 +45,14 @@ NeuroQuant is published on PyPI as **`neuroquant`** and works on Python 3.10+.
 NeuroQuant keeps its core install small. Heavier deps that only a subset
 of users need are exposed as extras:
 
-| Extras            | Installs                                  | When you need it                                                               |
-| ----------------- | ----------------------------------------- | ------------------------------------------------------------------------------ |
-| `neuroquant[xai]` | `shap`                                    | Phase 3 SHAP attribution (Grad-CAM works without it).                          |
-| `neuroquant[dev]` | `ruff`, `build`                           | Linting and wheel building for contributors.                                   |
-| `neuroquant[docs]`| `mkdocs-material`, `mkdocstrings[python]` | Building / serving this documentation site.                                    |
+| Extras            | Installs                                       | When you need it                                                               |
+| ----------------- | ---------------------------------------------- | ------------------------------------------------------------------------------ |
+| `neuroquant[xai]` | `shap`                                         | Phase 3 SHAP attribution (Grad-CAM works without it).                          |
+| `neuroquant[nlp]` | `transformers`, `datasets`, `tokenizers`       | `task: nlp` and `dataset_name: hf:<name>` HuggingFace integration (v2.1+).     |
+| `neuroquant[dev]` | `ruff`, `build`, `pytest`, `pytest-cov`        | Linting, wheel building, and running the test suite.                           |
+| `neuroquant[docs]`| `mkdocs-material`, `mkdocstrings[python]`      | Building / serving this documentation site.                                    |
 
-Combine them with comma syntax: `pip install neuroquant[xai,dev]`.
+Combine them with comma syntax: `pip install neuroquant[xai,nlp,dev]`.
 
 ## 3 · Verify the install
 

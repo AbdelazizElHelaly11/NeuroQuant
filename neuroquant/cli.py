@@ -2191,6 +2191,16 @@ class NeuroQuantPipeline:
           ``CrossEntropyLoss(ignore_index=255)`` so the standard
           ignore-label convention used by Pascal VOC / Cityscapes
           works out of the box.
+        * ``regression``: ``MSELoss(model(x), y)`` after flattening so
+          single-output and multi-output heads share one path. Output
+          dicts (e.g. transformer regressors) are unwrapped via
+          ``output["out"]`` / first-value fallback.
+        * ``nlp``: HuggingFace contract. The batch's ``x`` arrives as
+          a ``Dict[str, Tensor]`` already containing tokenizer outputs
+          (``input_ids`` / ``attention_mask`` / …); we splat it into
+          the model as ``model(**x, labels=y)`` and read ``.loss`` off
+          the returned ``ModelOutput`` namedtuple. Any HF model that
+          accepts ``labels=`` works without adapter code.
 
         Every variant returns a scalar tensor that autograd can
         differentiate, so downstream consumers (Hessian, QAT-style
@@ -2237,6 +2247,59 @@ class NeuroQuantPipeline:
                 return seg_criterion(logits, y.long())
 
             return _segmentation_loss
+
+        if task == "regression":
+            reg_criterion = nn.MSELoss()
+
+            def _regression_loss(model: nn.Module, x: Any, y: Any) -> torch.Tensor:
+                output = model(x)
+                # Some transformer regressors wrap outputs in dicts; pull
+                # the canonical ``out`` key (or first value) and flatten
+                # so the criterion works on single-output and
+                # multi-output regressions alike.
+                if isinstance(output, dict):
+                    output = output.get("out", next(iter(output.values())))
+                pred = output.reshape(-1).float()
+                target = y.reshape(-1).float()
+                if pred.numel() != target.numel():
+                    m = min(pred.numel(), target.numel())
+                    pred = pred[:m]
+                    target = target[:m]
+                return reg_criterion(pred, target)
+
+            return _regression_loss
+
+        if task == "nlp":
+            def _nlp_loss(model: nn.Module, x: Any, y: Any) -> torch.Tensor:
+                # HuggingFace forward contract: ``model(**inputs, labels=...)``
+                # returns an object whose ``.loss`` is the scalar cross-
+                # entropy (or task-appropriate) loss. ``x`` is expected
+                # to be the tokenizer-output dict (input_ids,
+                # attention_mask, optionally token_type_ids). If the
+                # dataloader bundled labels into the dict, the explicit
+                # ``labels=y`` argument is allowed to be ``None`` and
+                # the model will look in ``x`` itself.
+                if not isinstance(x, dict):
+                    raise TypeError(
+                        "task='nlp' expects calibration batches to "
+                        "produce dict inputs (tokenizer outputs); got "
+                        f"{type(x).__name__}. Either fix the data loader "
+                        "or switch task to 'classification'."
+                    )
+                out = model(**x, labels=y) if y is not None else model(**x)
+                if hasattr(out, "loss") and out.loss is not None:
+                    return out.loss
+                # Defensive: some HF models return raw tuples; treat
+                # the first tensor as the loss.
+                if isinstance(out, (tuple, list)) and out and isinstance(out[0], torch.Tensor):
+                    return out[0]
+                raise RuntimeError(
+                    "NLP model did not expose ``.loss`` on its output; "
+                    "ensure ``labels`` are passed (either positional or "
+                    "inside the input dict) so the model computes a loss."
+                )
+
+            return _nlp_loss
 
         # Default: classification.
         cls_criterion = nn.CrossEntropyLoss()
@@ -2286,13 +2349,33 @@ class NeuroQuantPipeline:
             samples_seen = 0
 
             for batch in train_loader:
-                x, y = batch[0], batch[1]
-                # Move inputs to device — detection yields a tuple of
-                # tensors (variable-size images), other tasks a single
-                # batched tensor.
+                # NLP loaders sometimes pack everything into a single
+                # dict (tokenizer output + labels in one batch); peel
+                # the labels out so the loss bridge receives them
+                # separately. CV loaders use the usual ``(x, y)`` pair.
+                if isinstance(batch, dict):
+                    y = batch.pop("labels", None)
+                    x = batch
+                else:
+                    x, y = batch[0], batch[1]
+                # Move inputs to device:
+                #   * list/tuple → detection (one tensor per image)
+                #   * dict       → HuggingFace tokenizer output
+                #   * tensor     → classification / segmentation /
+                #                  regression
                 if isinstance(x, (list, tuple)):
                     x = [t.to(self.device) for t in x]
                     batch_size = len(x)
+                elif isinstance(x, dict):
+                    x = {
+                        k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                        for k, v in x.items()
+                    }
+                    # Heuristic for HF: ``input_ids`` always carries the
+                    # batch dim; fall back to "1" if the dict is empty
+                    # so accumulators don't divide by zero.
+                    sentinel = x.get("input_ids", next(iter(x.values()), None))
+                    batch_size = sentinel.size(0) if isinstance(sentinel, torch.Tensor) else 1
                 else:
                     x = x.to(self.device)
                     batch_size = x.size(0)
@@ -2302,7 +2385,7 @@ class NeuroQuantPipeline:
                          for k, v in t.items()}
                         for t in y
                     ]
-                else:
+                elif isinstance(y, torch.Tensor):
                     y = y.to(self.device)
 
                 optimizer.zero_grad()
@@ -2314,8 +2397,11 @@ class NeuroQuantPipeline:
                 samples_seen += batch_size
 
                 # Classification-only Top-1 accumulator (cheap, harmless to
-                # skip when forward output isn't a logits tensor).
-                if task == "classification":
+                # skip when forward output isn't a logits tensor). ``y``
+                # must be a tensor here — for NLP / detection / regression
+                # we either don't have a Top-1 notion or ``y`` is a list
+                # of dicts.
+                if task == "classification" and isinstance(y, torch.Tensor):
                     with torch.no_grad():
                         outputs = model(x)
                         _, predicted = outputs.max(1)

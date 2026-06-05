@@ -85,6 +85,15 @@ dev = [
 xai = [
     "shap>=0.42.0",
 ]
+# NLP / HuggingFace stack — optional because ``transformers`` +
+# ``datasets`` together pull ~500MB of transitive deps that pure-CV
+# users don't need. Install with ``pip install neuroquant[nlp]`` to
+# unlock ``task: nlp`` and ``dataset_name: hf:<name>``.
+nlp = [
+    "transformers>=4.30",
+    "datasets>=2.14",
+    "tokenizers>=0.13",
+]
 # Docs toolchain — MkDocs Material theme plus the mkdocstrings Python
 # handler that auto-generates the API reference page from our
 # docstrings. Install with ``pip install -e .[docs]`` and then run

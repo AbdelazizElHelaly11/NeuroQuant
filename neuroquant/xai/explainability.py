@@ -562,6 +562,201 @@ def auto_detect_target_layer(model: nn.Module) -> Tuple[str, nn.Module]:
     return last_conv_name, last_conv_module
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Vision Transformer detection + Attention Rollout
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def is_vision_transformer(model: nn.Module) -> bool:
+    """Heuristic ViT detector.
+
+    Rule: ``num_attention_blocks >= num_conv2d``. This handles three
+    common cases correctly:
+
+    * Pure CNN (ResNet, MobileNet, …) — 0 attention vs dozens of
+      Conv2d → CNN path.
+    * Pure ViT (timm, HuggingFace, hand-rolled) — many attention
+      blocks vs 0 Conv2d → ViT path.
+    * Torchvision-style ViT (``vit_b_16``, ``vit_l_16``, Swin,
+      DeiT, …) — 12+ attention blocks vs **one** Conv2d patch
+      embedder → ViT path. The single Conv2d at the very start
+      is a tokenizer, not a feature-map producer, so Grad-CAM on
+      it produces useless 14×14 single-channel heatmaps.
+
+    Hybrid models (ConvNeXt + 1-2 attention heads, CoAtNet) have
+    many more conv layers than attention blocks and intentionally
+    fall through to the CNN Grad-CAM path — the convolutional stages
+    still produce meaningful attribution there.
+    """
+    num_attention = 0
+    num_conv2d = 0
+    for module in model.modules():
+        if isinstance(module, nn.MultiheadAttention):
+            num_attention += 1
+        elif isinstance(module, nn.Conv2d):
+            num_conv2d += 1
+    return num_attention > 0 and num_attention >= num_conv2d
+
+
+def _find_attention_blocks(model: nn.Module) -> List[nn.Module]:
+    """Return every ``nn.MultiheadAttention`` instance in source order.
+
+    Source order is what Attention Rollout needs — the rollout matrix
+    multiplication is ``A_L · A_{L-1} · … · A_1``, but the per-layer
+    capture happens in forward order; we reverse only at multiplication
+    time.
+    """
+    return [m for m in model.modules() if isinstance(m, nn.MultiheadAttention)]
+
+
+class AttentionRolloutExplainer:
+    """ViT-compatible heatmap generator (Abnar & Zuidema, 2020).
+
+    Attention Rollout replaces Grad-CAM for Vision Transformers, which
+    have no 2D conv feature maps to back-propagate onto. The algorithm:
+
+      1. Hook every attention block; on forward, store the attention
+         weights (shape ``[B, heads, N, N]``, with ``N = patches + 1``
+         for the CLS token).
+      2. After forward, average across heads and add an identity
+         matrix to model the residual connection:
+         ``A_layer = 0.5 · (A_layer + I)``, then row-normalise.
+      3. Multiply rollout from layer 1 → L (top of stack):
+         ``R = A_L · A_{L-1} · … · A_1``.
+      4. Extract the CLS-token row's patch entries (drop the
+         CLS-to-CLS self-attention), reshape to ``[grid_h, grid_w]``,
+         upsample to the original image size.
+
+    No new dependencies; runs in one forward pass; produces the same
+    ``np.ndarray[H, W] ∈ [0, 1]`` shape the existing ``overlay_heatmap``
+    helper consumes — so the rest of the XAI pipeline (saving,
+    consistency scoring, comparison grid) needs zero changes.
+    """
+
+    def __init__(self, model: nn.Module, device: torch.device) -> None:
+        self.model = model
+        self.device = device
+        self._attention_maps: List[torch.Tensor] = []
+        self._hooks: List[torch.utils.hooks.RemovableHandle] = []
+
+    def _make_hook(self) -> Any:
+        """Forward hook that captures ``attn_output_weights`` per layer.
+
+        ``nn.MultiheadAttention.forward`` returns a 2-tuple ``(output,
+        attn_weights)`` when ``need_weights=True`` (the default). We
+        slice the second element and detach it from the graph so the
+        rollout multiplication doesn't keep gradient state alive across
+        the whole model.
+        """
+        def hook(_module: nn.Module, _inputs: Any, output: Any) -> None:
+            if isinstance(output, tuple) and len(output) >= 2 and output[1] is not None:
+                # ``output[1]`` shape: ``[B, N, N]`` (averaged across
+                # heads by torch's default) or ``[B, heads, N, N]``
+                # depending on ``average_attn_weights``. We handle both.
+                self._attention_maps.append(output[1].detach())
+        return hook
+
+    def compute(
+        self,
+        image: torch.Tensor,
+        target_class: Optional[int] = None,
+    ) -> np.ndarray:
+        """Generate a rollout heatmap for a single image.
+
+        Args:
+            image: ``Tensor[1, C, H, W]``, already normalised.
+            target_class: Unused — Attention Rollout is class-agnostic
+                (it visualises *what* the model attended to, not *why*).
+                Kept in the signature for parity with ``GradCAMExplainer``.
+
+        Returns:
+            ``np.ndarray[H, W]`` in ``[0, 1]`` ready for ``overlay_heatmap``.
+        """
+        del target_class  # parity with GradCAMExplainer; ignored
+        self._attention_maps = []
+
+        blocks = _find_attention_blocks(self.model)
+        if not blocks:
+            raise ValueError(
+                "No nn.MultiheadAttention modules found — model does "
+                "not look like a Vision Transformer."
+            )
+
+        self._hooks = [b.register_forward_hook(self._make_hook()) for b in blocks]
+
+        try:
+            self.model.eval()
+            image = image.to(self.device)
+            with torch.no_grad():
+                self.model(image)
+        finally:
+            for h in self._hooks:
+                h.remove()
+            self._hooks = []
+
+        if not self._attention_maps:
+            raise RuntimeError(
+                "Attention hooks captured no weights — the ViT may "
+                "have been instantiated with ``need_weights=False``."
+            )
+
+        # ── Normalise per-layer matrices: average heads + add identity
+        # for the residual, row-normalise so each row sums to 1. ──
+        rolled = None
+        for attn in self._attention_maps:
+            if attn.dim() == 4:
+                # ``[B, heads, N, N]`` → mean over heads
+                attn = attn.mean(dim=1)
+            # ``attn`` is now ``[B, N, N]``; use batch index 0
+            a = attn[0]
+            n = a.size(0)
+            a = a + torch.eye(n, device=a.device)
+            a = a / a.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+            rolled = a if rolled is None else a @ rolled
+
+        if rolled is None:
+            raise RuntimeError("Attention rollout produced empty matrix.")
+
+        # CLS-to-patch row = rolled[0, 1:]; drop the CLS column itself.
+        cls_attn = rolled[0, 1:].detach().cpu().float().numpy()
+        n_patches = cls_attn.shape[0]
+
+        # Guess the patch grid: prefer the square root, fall back to a
+        # near-square factorisation. Most ViTs are square but DeiT-S/16
+        # at 224×224 has 196 patches → 14×14, and DeiT-S/16 at 384×384
+        # has 576 → 24×24, both square.
+        grid = int(round(np.sqrt(n_patches)))
+        if grid * grid != n_patches:
+            # Non-square ViT (rare) — fall back to factor pair closest
+            # to a square root, e.g. 192 → 12×16.
+            for d in range(grid, 0, -1):
+                if n_patches % d == 0:
+                    grid_h, grid_w = d, n_patches // d
+                    break
+            else:
+                grid_h = grid_w = grid
+        else:
+            grid_h = grid_w = grid
+
+        heatmap = cls_attn.reshape(grid_h, grid_w)
+        # Resize to input spatial dims so the existing overlay code path
+        # (which expects ``[H, W]`` matching the image) works unchanged.
+        _, _, img_h, img_w = image.shape
+        heatmap_tensor = torch.from_numpy(heatmap)[None, None, :, :]
+        upsampled = F.interpolate(
+            heatmap_tensor, size=(img_h, img_w), mode="bilinear", align_corners=False,
+        )
+        out = upsampled.squeeze().numpy()
+
+        # Normalise to [0, 1].
+        out_min, out_max = float(out.min()), float(out.max())
+        if out_max - out_min > 1e-12:
+            out = (out - out_min) / (out_max - out_min)
+        else:
+            out = np.zeros_like(out)
+        return out
+
+
 def find_layer_by_name(model: nn.Module, name: str) -> Optional[nn.Module]:
     """Find a module by its dotted name path."""
     for n, m in model.named_modules():
@@ -713,8 +908,16 @@ class XAIGenerator:
         logger.info("  Class names: %s",
                     "supplied" if class_names else "fallback to indices")
 
-        # Auto-detect target layer from FP32 model
-        if target_layer_name is None:
+        # Auto-detect target layer or fall back to Attention Rollout for
+        # Vision Transformers (no Conv2d → Grad-CAM is meaningless).
+        use_rollout = is_vision_transformer(fp32_model)
+        if use_rollout:
+            layer_name = "<attention_rollout>"
+            logger.info(
+                "  Detected Vision Transformer — using Attention Rollout "
+                "instead of Grad-CAM (no Conv2d feature maps available)."
+            )
+        elif target_layer_name is None:
             layer_name, _ = auto_detect_target_layer(fp32_model)
             logger.info("  Auto-detected target layer: '%s'", layer_name)
         else:
@@ -725,8 +928,9 @@ class XAIGenerator:
         if background_data is None:
             background_data = test_images[:min(50, len(test_images))]
 
-        # ── Generate Grad-CAM heatmaps + record predictions ──
-        logger.info("  Generating Grad-CAM heatmaps + predictions ...")
+        # ── Generate Grad-CAM (or Attention Rollout) heatmaps + record predictions ──
+        method_label = "Attention Rollout" if use_rollout else "Grad-CAM"
+        logger.info("  Generating %s heatmaps + predictions ...", method_label)
         all_heatmaps: Dict[str, List[np.ndarray]] = {}
         grad_cam_paths: Dict[str, List[str]] = {}
         # predictions[model_id][i] = {pred_idx, pred_name, confidence,
@@ -737,15 +941,21 @@ class XAIGenerator:
             model.to(self.device)
             model.eval()
 
-            target_module = find_layer_by_name(model, layer_name)
-            if target_module is None:
-                try:
-                    _, target_module = auto_detect_target_layer(model)
-                except ValueError:
-                    logger.warning("    No conv layer in '%s', skipping", model_id)
-                    continue
+            # CNN path needs the resolved target layer; ViT path goes
+            # through AttentionRolloutExplainer which works module-globally.
+            if use_rollout:
+                explainer: Any = AttentionRolloutExplainer(model, self.device)
+                target_module = None
+            else:
+                target_module = find_layer_by_name(model, layer_name)
+                if target_module is None:
+                    try:
+                        _, target_module = auto_detect_target_layer(model)
+                    except ValueError:
+                        logger.warning("    No conv layer in '%s', skipping", model_id)
+                        continue
+                explainer = GradCAMExplainer(model, self.device)
 
-            grad_cam = GradCAMExplainer(model, self.device)
             heatmaps: List[np.ndarray] = []
             paths: List[str] = []
             preds: List[Dict[str, Any]] = []
@@ -768,9 +978,12 @@ class XAIGenerator:
                 }
                 preds.append(pred_meta)
 
-                heatmap = grad_cam.compute(
-                    img, target_module, target_class=gt_idx,
-                )
+                if use_rollout:
+                    heatmap = explainer.compute(img, target_class=gt_idx)
+                else:
+                    heatmap = explainer.compute(
+                        img, target_module, target_class=gt_idx,
+                    )
                 heatmaps.append(heatmap)
 
                 if HAS_MATPLOTLIB:

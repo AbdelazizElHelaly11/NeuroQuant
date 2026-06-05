@@ -63,12 +63,25 @@ ones:
       name: "mobilenetv2"
       num_classes: 10
       input_shape: [3, 32, 32]
-      task: "classification"   # classification | detection | segmentation
+      task: "classification"   # classification | detection | segmentation | regression | nlp
     ```
 
     The `task` field is what makes NeuroQuant task-agnostic — the
-    model loader, the XAI backward pass, and the data-loader's
-    collate function all dispatch on this single value.
+    model loader, the loss bridge, the Hessian estimator, the XAI
+    backward pass, and the data-loader's collate function all
+    dispatch on this single value.
+
+    | task | Loss bridge | Primary metric (NSGA) | XAI |
+    | --- | --- | --- | --- |
+    | `classification` | `CrossEntropyLoss` | Top-1 (higher better) | Grad-CAM |
+    | `detection` | sum of torchvision loss-dict | Top-1 surrogate | Task-aware Grad-CAM |
+    | `segmentation` | pixel-wise CE (`ignore_index=255`) | Top-1 surrogate | Task-aware Grad-CAM |
+    | `regression` | `MSELoss` | `-RMSE` (higher = lower error) | Grad-CAM (CNN) / Rollout (ViT) |
+    | `nlp` (v2.1+) | `model(**x, labels=y).loss` | Top-1 (higher better) | n/a |
+
+    Vision Transformer models are auto-detected (any `nn.MultiheadAttention`
+    without `nn.Conv2d`) and routed through **Attention Rollout** in
+    Phase 3 — no Grad-CAM required.
 
 === "Dataset"
 
@@ -84,6 +97,22 @@ ones:
     Anything else is treated as a `torchvision.datasets.<Name>` class
     name. Set `dataset.class` to a fully-qualified Python path if you
     need a custom `torch.utils.data.Dataset`.
+
+    **HuggingFace integration (v2.1+)** — prefix `name` with `hf:`
+    to pull a tokenised dataset via `datasets.load_dataset`. Requires
+    the `[nlp]` extras. Example:
+
+    ```yaml
+    model:
+      name: "distilbert-base-uncased"
+      task: "nlp"
+      num_classes: 2
+    dataset:
+      name: "hf:imdb"        # or "hf:glue/sst2"
+      batch_size: 16
+    hyperparams:
+      nlp_max_seq_len: 128
+    ```
 
 === "NSGA-II search"
 

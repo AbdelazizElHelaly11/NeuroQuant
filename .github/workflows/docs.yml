@@ -1,0 +1,74 @@
+name: docs
+
+# Builds the MkDocs Material site and publishes it to the ``gh-pages``
+# branch on every push to ``main``. GitHub Pages then serves the
+# rendered HTML from that branch at
+# https://abdelazizelhelaly11.github.io/NeuroQuant/.
+#
+# First-time setup (one click each):
+#   1. After this workflow lands and runs once, the ``gh-pages``
+#      branch will exist.
+#   2. In GitHub: Settings → Pages → Source: ``Deploy from a branch``
+#      → Branch: ``gh-pages`` / ``(root)``. Save.
+#   3. The next push to ``main`` triggers a deploy; site goes live
+#      within ~30 seconds of the workflow finishing.
+
+on:
+  push:
+    branches: [main]
+  # Allow a manual rebuild from the Actions tab — useful when docs
+  # need to be republished without a code change.
+  workflow_dispatch:
+
+# Cancel an in-flight docs build if a new push lands while it's
+# running; we only ever need the latest content.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    # The default GITHUB_TOKEN gets ``contents: write`` so it can push
+    # to ``gh-pages`` without an additional PAT.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          # mkdocs gh-deploy needs the full history of ``gh-pages`` so
+          # it can produce a clean diff; ``fetch-depth: 0`` includes it.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install docs extras
+        # The ``[docs]`` extras pull mkdocs-material + mkdocstrings.
+        # We avoid installing the full project (which would pull torch
+        # and friends) because the docs site only renders markdown +
+        # the mkdocstrings auto-generated API reference; the source
+        # tree is already on disk after checkout.
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-deps -e .
+          pip install -e .[docs]
+
+      - name: Configure git author
+        # ``mkdocs gh-deploy`` needs an author identity to commit the
+        # built site to ``gh-pages``. Use the github-actions[bot]
+        # identity GitHub already trusts on this repo.
+        run: |
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Build + deploy to gh-pages
+        # ``--force`` overwrites the previous deploy commit so the
+        # branch never accumulates redundant history; ``--clean``
+        # discards stale files from prior builds.
+        run: mkdocs gh-deploy --force --clean --verbose

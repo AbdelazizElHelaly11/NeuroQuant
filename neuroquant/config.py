@@ -271,6 +271,13 @@ class HyperparameterSet:
     # backprop for ablations or when an exact diagonal is needed.
     hessian_estimator: str = "fisher"  # 'fisher' | 'diag_hessian'
 
+    # ── NLP / HuggingFace tokenizer ──
+    # Max sequence length used by the ``_load_huggingface_dataset``
+    # branch when the task is ``nlp``. 128 is the most common default
+    # in the BERT-family fine-tuning recipes; bump for long-form tasks
+    # (sentiment essays, multi-doc QA) at the cost of compute.
+    nlp_max_seq_len: int = 128
+
     # NSGA-II
     nsga_population_size: int = 32
     nsga_generations: int = 30
@@ -611,7 +618,18 @@ class QuantizationConfig:
     #     the constructor. Skips classification-specific adapters; the
     #     backbone is left intact. Forward outputs an
     #     ``OrderedDict({"out": [B, num_classes, H, W], ...})``.
-    task: str = "classification"  # 'classification' | 'detection' | 'segmentation'
+    #   * ``regression`` — continuous-output models (price/age/depth
+    #     prediction). Forward outputs ``[B, output_dim]`` raw values;
+    #     training uses MSE, evaluation reports RMSE / MAE / R². NSGA-II
+    #     minimises ``(quant_rmse − fp32_rmse)`` so the existing
+    #     "lower-is-better" objective semantics carry over unchanged.
+    #   * ``nlp`` — HuggingFace-style transformer tasks (text
+    #     classification, masked LM fine-tunes, etc.). Calibration
+    #     batches arrive as ``Dict[str, Tensor]`` ({"input_ids":, ...})
+    #     and the loss bridge invokes ``model(**inputs, labels=labels)``
+    #     so any HF model that exposes ``.loss`` on its output works
+    #     out of the box.
+    task: str = "classification"  # 'classification' | 'detection' | 'segmentation' | 'regression' | 'nlp'
 
     # ── Dataset ──
     dataset_name: str = "cifar10"
@@ -676,10 +694,10 @@ class QuantizationConfig:
     @field_validator("task", mode="after")
     @classmethod
     def _validate_task(cls, v: str) -> str:
-        if v not in ("classification", "detection", "segmentation"):
+        if v not in ("classification", "detection", "segmentation", "regression", "nlp"):
             raise ValueError(
-                f"task='{v}' invalid. "
-                "Use 'classification', 'detection', or 'segmentation'."
+                f"task='{v}' invalid. Use one of "
+                "'classification', 'detection', 'segmentation', 'regression', 'nlp'."
             )
         return v
 
@@ -947,10 +965,10 @@ class QuantizationConfig:
             errors.append("num_classes must be >= 2.")
 
         # ── Task ──
-        if self.task not in ("classification", "detection", "segmentation"):
+        if self.task not in ("classification", "detection", "segmentation", "regression", "nlp"):
             errors.append(
-                f"task='{self.task}' invalid. "
-                "Use 'classification', 'detection', or 'segmentation'."
+                f"task='{self.task}' invalid. Use one of "
+                "'classification', 'detection', 'segmentation', 'regression', 'nlp'."
             )
 
         # ── Batch size ──

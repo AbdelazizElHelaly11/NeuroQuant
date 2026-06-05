@@ -4,11 +4,12 @@ hide:
   - navigation
 ---
 
-# NeuroQuant v2.0
+# NeuroQuant v2.1
 
 > **Production-grade neural-network quantization** with multi-objective search,
 > ONNX deployment fidelity, and built-in explainability — for **classification,
-> object detection, and semantic segmentation** alike.
+> object detection, segmentation, regression, and HuggingFace NLP** alike,
+> with **Attention Rollout** XAI for Vision Transformers.
 
 <p align="center">
   <em>One framework. Two front doors.</em>
@@ -69,18 +70,22 @@ hide:
     population scan tens of thousands of candidates per generation
     instead of dozens.
 
--   :material-image-multiple:{ .lg .middle } **Three vision paradigms**
+-   :material-image-multiple:{ .lg .middle } **Five task families**
 
     Native support for **classification**, **detection**
-    (Faster R-CNN, SSD, RetinaNet, FCOS, …), and **segmentation**
-    (FCN, DeepLabV3, LRASPP). One pipeline, three task families.
+    (Faster R-CNN, SSD, RetinaNet, FCOS, …), **segmentation**
+    (FCN, DeepLabV3, LRASPP), **regression** (RMSE/MAE/R²
+    objectives), and **NLP** (any HuggingFace model via the
+    optional `[nlp]` extras). One pipeline, five task families.
 
 -   :material-eye-outline:{ .lg .middle } **Task-aware XAI**
 
     Grad-CAM and SHAP-style attribution that dispatch on the
     model's output shape: classification logits, detection
     score lists, *and* segmentation `OrderedDict({"out": …})`
-    masks — all from the same call.
+    masks — all from the same call. **Vision Transformers**
+    automatically route to *Attention Rollout* instead of
+    Grad-CAM (no Conv2d feature maps needed).
 
 -   :material-chart-line:{ .lg .middle } **Pareto + deployment fidelity**
 

@@ -72,6 +72,28 @@ def detection_collate_fn(batch: List[Any]) -> Tuple[Tuple[Any, ...], ...]:
     return tuple(zip(*batch))
 
 
+class _HFDictDataset(Dataset):
+    """Adapter so a HuggingFace ``Dataset`` plays nicely with PyTorch's
+    ``DataLoader``.
+
+    HF datasets in ``set_format("torch")`` mode return a dict per row,
+    which the default ``torch.utils.data.default_collate`` happily
+    stacks key-by-key into a single dict-of-tensors per batch — exactly
+    what the NLP loss bridge expects. We wrap the HF dataset so
+    ``__len__`` and ``__getitem__`` come from PyTorch's protocol
+    rather than ``datasets.Dataset``'s slightly different one.
+    """
+
+    def __init__(self, hf_dataset: Any) -> None:
+        self._ds = hf_dataset
+
+    def __len__(self) -> int:
+        return len(self._ds)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        return self._ds[int(idx)]
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Per-dataset normalisation statistics (correct constants, not assumptions)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -126,6 +148,13 @@ class GenericDatasetLoader:
 
     def _load(self) -> None:
         """Load the dataset based on config."""
+        # HuggingFace ``datasets`` integration is gated on the ``[nlp]``
+        # extras (``transformers`` + ``datasets``). Activated when the
+        # dataset name starts with ``hf:`` (e.g. ``hf:imdb``) so it
+        # never collides with torchvision's namespace.
+        if self.dataset_name.startswith("hf:") or getattr(self.config, "task", "") == "nlp":
+            self._load_huggingface_dataset()
+            return
         if self.dataset_class:
             self._load_custom_dataset_class()
         elif self.dataset_name == "cifar10":
@@ -651,6 +680,127 @@ class GenericDatasetLoader:
             "Loaded synthetic dataset: train=%d, search=%d, val=%d, test=%d "
             "(shape=%s, classes=%d)",
             n_tr, n_search, n_val, n_test, self.input_shape, num_classes,
+        )
+
+    # ------------------------------------------------------------------
+    # HuggingFace dataset loader (optional [nlp] extras)
+    # ------------------------------------------------------------------
+
+    def _load_huggingface_dataset(self) -> None:
+        """Load a tokenised HuggingFace dataset for NLP-task pipelines.
+
+        Activated when ``dataset_name`` starts with ``hf:`` (e.g.
+        ``hf:imdb`` or ``hf:glue/sst2``) or when ``task == "nlp"``.
+        Requires the optional ``[nlp]`` extras:
+
+        ```
+        pip install neuroquant[nlp]
+        ```
+
+        Behaviour:
+          * Strips the ``hf:`` prefix and splits on ``/`` into
+            ``(dataset, subset)``. ``hf:imdb`` → ``load_dataset("imdb")``;
+            ``hf:glue/sst2`` → ``load_dataset("glue", "sst2")``.
+          * Picks the tokenizer from ``config.model_name`` so the
+            framework follows the same single-source-of-truth convention
+            it uses for CV (model and dataset can be swapped together).
+          * Tokenises ``text`` / ``sentence`` (auto-detected) into
+            ``input_ids`` + ``attention_mask`` and stores the original
+            ``label`` field as ``labels``.
+          * Wraps each split in a ``_HFDictDataset`` that yields the
+            tokenizer-output dict so the NLP loss bridge in
+            ``cli.py:_build_task_loss_fn`` can splat it into the model
+            unchanged.
+
+        The ImportError is propagated with an actionable hint instead
+        of swallowed — the user *asked* for NLP, so silently downgrading
+        to a synthetic dataset would mask the missing dep.
+        """
+        try:
+            from datasets import load_dataset  # type: ignore[import-not-found]
+            from transformers import AutoTokenizer  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError(
+                "HuggingFace datasets / transformers not installed. "
+                "Run `pip install neuroquant[nlp]` to add them, or set "
+                "task back to 'classification' and use a torchvision "
+                "dataset."
+            ) from exc
+
+        spec = self.dataset_name.removeprefix("hf:") or self.dataset_name
+        if "/" in spec:
+            ds_name, subset = spec.split("/", 1)
+            raw = load_dataset(ds_name, subset)
+        else:
+            raw = load_dataset(spec)
+
+        # Resolve the tokenizer from ``model.name``. Defaults to
+        # bert-base-uncased so the loader works for ``hf:imdb`` even
+        # when the user hasn't picked a model — they can override via
+        # ``config.model_name``.
+        model_name = getattr(self.config, "model_name", None) or "bert-base-uncased"
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        # Detect the text column — HF datasets are inconsistent:
+        # imdb uses ``text``, sst2 uses ``sentence``, etc.
+        sample = raw[next(iter(raw))][0]
+        text_col = next(
+            (k for k in ("text", "sentence", "premise", "question") if k in sample),
+            None,
+        )
+        if text_col is None:
+            raise ValueError(
+                f"Could not auto-detect text column in HF dataset "
+                f"'{spec}'. Available columns: {list(sample.keys())}. "
+                "Pre-tokenise manually and pass via dataset_class instead."
+            )
+
+        max_len = int(getattr(self.config.hyperparams, "nlp_max_seq_len", 128))
+
+        def _tokenize(example: Dict[str, Any]) -> Dict[str, Any]:
+            enc = tokenizer(
+                example[text_col],
+                truncation=True,
+                padding="max_length",
+                max_length=max_len,
+                return_tensors=None,
+            )
+            return enc
+
+        tokenised = raw.map(_tokenize, batched=True)
+        tokenised = tokenised.rename_column("label", "labels") \
+            if "label" in tokenised[next(iter(tokenised))].column_names \
+            else tokenised
+        tokenised.set_format(
+            type="torch",
+            columns=["input_ids", "attention_mask", "labels"],
+        )
+
+        # Pick canonical splits, falling back to the first available
+        # name if a dataset uses something custom.
+        split_keys = list(tokenised.keys())
+        train_key = "train" if "train" in split_keys else split_keys[0]
+        val_key = next((k for k in ("validation", "valid", "dev") if k in split_keys), None)
+        test_key = "test" if "test" in split_keys else None
+
+        self._train_dataset = _HFDictDataset(tokenised[train_key])
+        if val_key:
+            self._val_dataset = _HFDictDataset(tokenised[val_key])
+        if test_key:
+            self._test_dataset = _HFDictDataset(tokenised[test_key])
+        else:
+            # No test split — reuse val so the rest of the pipeline
+            # has something to evaluate on.
+            self._test_dataset = self._val_dataset or self._train_dataset
+        self._search_dataset = self._val_dataset
+
+        logger.info(
+            "Loaded HuggingFace dataset '%s' (tokenizer=%s, max_len=%d). "
+            "Splits: train=%d, val=%s, test=%s",
+            spec, model_name, max_len,
+            len(self._train_dataset),
+            len(self._val_dataset) if self._val_dataset else "n/a",
+            len(self._test_dataset) if self._test_dataset else "n/a",
         )
 
     # ------------------------------------------------------------------

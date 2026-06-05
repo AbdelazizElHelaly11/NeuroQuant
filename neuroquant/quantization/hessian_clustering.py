@@ -193,14 +193,19 @@ class HessianComputer:
         accum: Dict[str, float] = {name: 0.0 for name in param_names}
         batches_used = 0
 
-        for batch_idx, (x, y) in enumerate(data_loader):
+        for batch_idx, batch in enumerate(data_loader):
             if batch_idx >= num_batches:
                 break
-            x = [i.to(self.device) for i in x] if isinstance(x, (tuple, list)) else x.to(self.device)
-            if isinstance(y, (tuple, list)) and len(y) > 0 and isinstance(y[0], dict):
-                y = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in y]
+            # NLP data loaders may yield a single dict with ``labels``
+            # bundled in; peel them out so the same loss-fn signature
+            # works for CV and NLP.
+            if isinstance(batch, dict):
+                y = batch.pop("labels", None)
+                x = batch
             else:
-                y = y.to(self.device)
+                x, y = batch[0], batch[1]
+            x = self._move_to_device(x)
+            y = self._move_to_device(y)
             self.model.zero_grad(set_to_none=True)
             loss = loss_fn(self.model, x, y)
             grads = torch.autograd.grad(loss, param_list, allow_unused=True)
@@ -283,15 +288,19 @@ class HessianComputer:
         hessian_accum: Dict[str, float] = {name: 0.0 for name in param_names}
         batches_used = 0
 
-        for batch_idx, (x, y) in enumerate(data_loader):
+        for batch_idx, batch in enumerate(data_loader):
             if batch_idx >= num_batches:
                 break
 
-            x = [i.to(self.device) for i in x] if isinstance(x, (tuple, list)) else x.to(self.device)
-            if isinstance(y, (tuple, list)) and len(y) > 0 and isinstance(y[0], dict):
-                y = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in y]
+            # NLP path: a single dict carrying tokenizer outputs + optional
+            # ``labels``. Everything else is the conventional ``(x, y)``.
+            if isinstance(batch, dict):
+                y = batch.pop("labels", None)
+                x = batch
             else:
-                y = y.to(self.device)
+                x, y = batch[0], batch[1]
+            x = self._move_to_device(x)
+            y = self._move_to_device(y)
 
             # ── Forward pass via task-aware loss bridge ──
             loss = loss_fn(self.model, x, y)
@@ -377,6 +386,42 @@ class HessianComputer:
     # ------------------------------------------------------------------
     # Helpers (private)
     # ------------------------------------------------------------------
+
+    def _move_to_device(self, batch_part: Any) -> Any:
+        """Recursively shift a batch fragment onto ``self.device``.
+
+        Handles every shape NeuroQuant data loaders can produce:
+
+        * ``torch.Tensor`` — standard ``.to(device)``.
+        * ``list`` / ``tuple`` of tensors — detection-style ragged
+          batches (one tensor per image).
+        * ``list`` / ``tuple`` of dicts — detection targets.
+        * ``dict`` of tensors — HuggingFace tokenizer outputs.
+        * ``None`` — passes through (NLP loss bridge tolerates this).
+        """
+        if batch_part is None:
+            return None
+        if isinstance(batch_part, torch.Tensor):
+            return batch_part.to(self.device)
+        if isinstance(batch_part, dict):
+            return {
+                k: (v.to(self.device) if isinstance(v, torch.Tensor) else v)
+                for k, v in batch_part.items()
+            }
+        if isinstance(batch_part, (list, tuple)):
+            moved: List[Any] = []
+            for item in batch_part:
+                if isinstance(item, torch.Tensor):
+                    moved.append(item.to(self.device))
+                elif isinstance(item, dict):
+                    moved.append(
+                        {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                         for k, v in item.items()}
+                    )
+                else:
+                    moved.append(item)
+            return type(batch_part)(moved) if isinstance(batch_part, tuple) else moved
+        return batch_part
 
     @staticmethod
     def _classify_param_type(name: str, param: torch.Tensor) -> str:

@@ -533,14 +533,22 @@ class NSGAIIClusterSearch:
         self, model: nn.Module, data_loader: DataLoader
     ) -> float:
         """
-        Compute accuracy on a dataset for NSGA-II fitness.
+        Compute primary metric on a dataset for NSGA-II fitness.
 
-        Uses config.hyperparams.nsga_accuracy_objective ('top1' or 'top5')
-        to select which accuracy metric drives the search.
-        Default: top-1 (better discrimination on small datasets like CIFAR-10).
+        The contract is "higher is better" regardless of task: NSGA
+        minimises ``fp32 - quant`` as the accuracy_loss objective.
+        ``evaluate_primary_metric`` enforces this by negating RMSE for
+        regression so that ``fp32_top1 - quant_top1`` evaluates to
+        ``(-fp32_rmse) - (-quant_rmse) = quant_rmse - fp32_rmse``,
+        which is exactly "extra error introduced by quantization" —
+        the regression analogue of accuracy loss.
+
+        Uses ``config.hyperparams.nsga_accuracy_objective`` ('top1' or
+        'top5') to select which scalar drives the search.
         """
-        from neuroquant.utils.metrics import compute_topk_accuracy
-        acc = compute_topk_accuracy(model, data_loader, self.device)
+        from neuroquant.utils.metrics import evaluate_primary_metric
+        task = getattr(self.config, "task", "classification")
+        acc = evaluate_primary_metric(model, data_loader, self.device, task=task)
         objective = getattr(self.config.hyperparams, 'nsga_accuracy_objective', 'top1')
         return acc.get(objective, acc["top1"])
 

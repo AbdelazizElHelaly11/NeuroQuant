@@ -87,6 +87,120 @@ def compute_topk_accuracy(
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Regression Metrics (RMSE / MAE / R²)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def compute_regression_metrics(
+    model: nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Compute RMSE, MAE, and R² on a regression dataset.
+
+    Returns a dict shaped so the NSGA-II search can keep its
+    "lower-is-better, scalar primary" contract:
+
+    * ``rmse`` — root mean squared error (primary objective). Used by
+      ``evaluate_primary_metric`` to populate the same slot
+      classification uses for top-1, so the rest of the pipeline stays
+      task-agnostic.
+    * ``mae``  — mean absolute error (secondary diagnostic).
+    * ``r2``   — coefficient of determination, included for parity with
+      sklearn / statsmodels reporting.
+    * ``top1`` — set to ``-rmse`` (negated) so any legacy caller that
+      reads ``["top1"]`` and expects "higher is better" sees
+      monotonically-correct rankings. Documented contract:
+      ``higher_better=True`` for ``top1`` in *every* task family.
+    """
+    model.eval()
+    model.to(device)
+
+    sum_sq_err = 0.0
+    sum_abs_err = 0.0
+    sum_targets = 0.0
+    sum_targets_sq = 0.0
+    n = 0
+
+    with torch.no_grad():
+        for batch in data_loader:
+            x, y = batch[0], batch[1]
+            if isinstance(x, (list, tuple)):
+                x = [t.to(device) for t in x]
+            else:
+                x = x.to(device)
+            y = y.to(device).float()
+            out = model(x)
+            if isinstance(out, dict):
+                out = out.get("out", next(iter(out.values())))
+            # Flatten to ``[B*K]`` so single-output and multi-output
+            # regressions share the same accumulator path.
+            out_flat = out.reshape(-1).float()
+            y_flat = y.reshape(-1).float()
+            if out_flat.numel() != y_flat.numel():
+                # Defensive: if the model has multiple regression heads
+                # but the target only covers one, slice to match.
+                m = min(out_flat.numel(), y_flat.numel())
+                out_flat = out_flat[:m]
+                y_flat = y_flat[:m]
+
+            err = out_flat - y_flat
+            sum_sq_err += float((err * err).sum().item())
+            sum_abs_err += float(err.abs().sum().item())
+            sum_targets += float(y_flat.sum().item())
+            sum_targets_sq += float((y_flat * y_flat).sum().item())
+            n += int(y_flat.numel())
+
+    if n == 0:
+        return {"rmse": 0.0, "mae": 0.0, "r2": 0.0, "top1": 0.0, "top5": 0.0}
+
+    mse = sum_sq_err / n
+    rmse = float(np.sqrt(mse))
+    mae = sum_abs_err / n
+    mean_y = sum_targets / n
+    ss_tot = sum_targets_sq - n * mean_y * mean_y
+    r2 = 1.0 - (sum_sq_err / ss_tot) if ss_tot > 1e-12 else 0.0
+
+    return {
+        "rmse": rmse,
+        "mae": mae,
+        "r2": float(r2),
+        # ``top1`` / ``top5`` slots are populated with ``-rmse`` so any
+        # task-agnostic caller that pulls ``["top1"]`` and treats higher
+        # as better stays correct on regression too.
+        "top1": -rmse,
+        "top5": -rmse,
+    }
+
+
+def evaluate_primary_metric(
+    model: nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+    *,
+    task: str = "classification",
+) -> Dict[str, float]:
+    """Single entry point for "evaluate a model and give me a scalar".
+
+    Routes to :func:`compute_topk_accuracy` for classification (and
+    its degenerate-but-safe behaviour on detection/segmentation when
+    the upstream caller already extracted a logits view), and to
+    :func:`compute_regression_metrics` for regression. The returned
+    dict *always* carries a ``top1`` key whose value is "higher is
+    better" — that's the invariant NSGA-II's ``_evaluate_accuracy``
+    relies on to keep its objective math task-agnostic.
+    """
+    if task == "regression":
+        return compute_regression_metrics(model, data_loader, device)
+    # classification / detection / segmentation / nlp all funnel through
+    # the topk path. For detection/segmentation the caller is expected
+    # to compute task-native metrics separately (mAP, mIoU); the topk
+    # number is only used by NSGA's surrogate when explicit labels are
+    # present.
+    return compute_topk_accuracy(model, data_loader, device)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Latency Benchmarking
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

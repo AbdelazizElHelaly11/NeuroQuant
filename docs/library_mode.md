@@ -196,7 +196,189 @@ qat_result = qat.run(
 final_model = qat_result["model"]
 ```
 
-## 6 · Mixing library + pipeline
+## 6 · Regression — continuous outputs
+
+> Added in v2.1.
+
+NeuroQuant's task router treats regression as a first-class task. The
+loss bridge swaps `CrossEntropyLoss` for `MSELoss`, the metrics layer
+emits `RMSE` / `MAE` / `R²` instead of Top-1, and NSGA-II keeps its
+`fp32 − quant` objective math unchanged because the metric helper puts
+`-RMSE` in the canonical `top1` slot (so "higher is better" still
+holds and quantization-induced RMSE growth becomes the equivalent of
+accuracy loss).
+
+```python
+import torch, torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from neuroquant import PTQQuantizer, QuantizationConfig
+from neuroquant.utils.metrics import compute_regression_metrics
+
+# 1. A regression head — anything that outputs ``[B, K]`` continuous values.
+model = nn.Sequential(
+    nn.Flatten(),
+    nn.Linear(3 * 32 * 32, 64),
+    nn.ReLU(),
+    nn.Linear(64, 1),                       # single continuous output
+)
+
+# 2. Bind ``task='regression'`` so the loss bridge and metric router
+#    pick MSE + RMSE instead of CE + Top-1.
+cfg = QuantizationConfig(task="regression")
+
+# 3. Calibration + eval loaders — the targets are floats, not class ids.
+calib_loader = DataLoader(
+    TensorDataset(torch.randn(256, 3, 32, 32), torch.randn(256, 1)),
+    batch_size=32,
+)
+eval_loader = DataLoader(
+    TensorDataset(torch.randn(64, 3, 32, 32), torch.randn(64, 1)),
+    batch_size=32,
+)
+
+# 4. Quantize. Same library API, same three-line shape.
+q_model = PTQQuantizer(model, cfg).quantize(calib_loader, bitwidth=8)
+
+# 5. Headline metrics include RMSE / MAE / R²; ``top1`` is ``-RMSE``
+#    so any task-agnostic caller still sees "higher = better".
+metrics = compute_regression_metrics(q_model, eval_loader, torch.device("cpu"))
+print(f"RMSE={metrics['rmse']:.4f}  MAE={metrics['mae']:.4f}  R²={metrics['r2']:.3f}")
+```
+
+!!! note "Why the `-RMSE` trick"
+
+    NSGA-II's accuracy-loss objective is `fp32_top1 − quant_top1`.
+    Storing `-RMSE` in `top1` makes that expression evaluate to
+    `(-fp32_rmse) − (-quant_rmse) = quant_rmse − fp32_rmse` — exactly
+    "extra error introduced by quantization", with the same
+    "lower-is-better" semantics. Zero NSGA code had to change.
+
+## 7 · NLP / HuggingFace transformers
+
+> Added in v2.1. Requires the optional `[nlp]` extras.
+
+```bash
+pip install neuroquant[nlp]
+```
+
+NLP support hooks into the same task-aware bridge: set `task='nlp'`
+and the loss function becomes `model(**inputs, labels=labels).loss`
+(the canonical HuggingFace contract). The data layer ships a tiny
+HuggingFace dataset loader that activates whenever `dataset_name`
+starts with `hf:` or `task == 'nlp'`.
+
+```python
+from neuroquant import PTQQuantizer, QuantizationConfig
+from neuroquant.data import GenericDatasetLoader      # uses [nlp] extras when needed
+from transformers import AutoModelForSequenceClassification
+
+# 1. Load any HuggingFace classifier — BERT, RoBERTa, DistilBERT, …
+model = AutoModelForSequenceClassification.from_pretrained(
+    "distilbert-base-uncased", num_labels=2,
+)
+
+# 2. Configure the NLP task. ``dataset_name="hf:imdb"`` tells the loader
+#    to pull IMDB via ``datasets.load_dataset``; the tokenizer is
+#    inferred from ``model_name`` (defaults to bert-base-uncased
+#    if not set).
+cfg = QuantizationConfig(
+    task="nlp",
+    model_name="distilbert-base-uncased",
+    dataset_name="hf:imdb",
+    num_classes=2,
+    batch_size=16,
+)
+cfg.hyperparams.nlp_max_seq_len = 128         # default; bump for long-form text
+
+# 3. Build the calibration loader. Each batch is a single dict
+#    ``{"input_ids": ..., "attention_mask": ..., "labels": ...}``
+#    — exactly what HF models consume natively.
+loader = GenericDatasetLoader(cfg).get_calibration_loader(num_batches=20)
+
+# 4. Quantize. The loss bridge auto-splats the dict into
+#    ``model(**x, labels=y)`` and reads ``.loss`` off the output.
+q_model = PTQQuantizer(model, cfg).quantize(loader, bitwidth=8)
+```
+
+!!! tip "Custom HuggingFace pipelines"
+
+    You don't have to use the bundled HF loader — any iterable that
+    yields `({"input_ids": …, "attention_mask": …}, labels)` tuples
+    or a single dict with `labels` inside it will work. The Hessian
+    estimator and Phase 1c NSGA evaluator both call the same
+    task-aware bridge, so swap in a custom DataLoader and everything
+    downstream just works.
+
+!!! warning "AWQ on transformers"
+
+    AWQ works on transformer **encoders** with static sequence
+    lengths (BERT, DistilBERT, …) but fails on decoder LLMs whose
+    KV-cache changes the activation shape across calibration
+    batches — same root cause as the detection guard. Prefer
+    `PTQQuantizer` or `GPTQQuantizer` for causal LM quantization
+    if you hit `torch.cat` errors.
+
+## 8 · Vision Transformers (ViT) and Attention Rollout
+
+> Added in v2.1.
+
+`XAIGenerator` auto-detects when the FP32 model is a Vision Transformer
+(presence of `nn.MultiheadAttention` plus absence of `nn.Conv2d`) and
+swaps Grad-CAM for **Attention Rollout** (Abnar & Zuidema, 2020). One
+forward pass, no extra dependencies, no Conv2d required — and the
+output is the same `np.ndarray[H, W] ∈ [0, 1]` heatmap that the rest
+of the XAI pipeline already consumes.
+
+```python
+import torch
+from neuroquant import PTQQuantizer, QuantizationConfig, XAIGenerator
+from torchvision.models import vit_b_16
+
+# 1. Any ViT — torchvision, timm, or a custom one.
+model = vit_b_16(weights=None, num_classes=10)
+
+# 2. Quantize as usual.
+cfg = QuantizationConfig(task="classification", num_classes=10)
+q_model = PTQQuantizer(model, cfg).quantize(calib_loader, bitwidth=8)
+
+# 3. Run XAI. The generator detects the ViT and routes to Attention
+#    Rollout automatically — Grad-CAM would crash because there's no
+#    last Conv2d to hook.
+xai = XAIGenerator(cfg)
+result = xai.run(
+    fp32_model=model,
+    quantized_models={"PTQ_INT8": q_model},
+    test_images=sample_batch,           # [N, 3, 224, 224]
+    test_labels=sample_labels,
+    output_dir="./xai_vit",
+)
+print(result["consistency_scores"])
+# {'PTQ_INT8': 0.93}  ← Pearson correlation vs FP32 rollout
+```
+
+You can also drive the explainer directly when you want one heatmap
+without spinning up the full pipeline:
+
+```python
+from neuroquant.xai.explainability import (
+    AttentionRolloutExplainer, is_vision_transformer,
+)
+
+assert is_vision_transformer(model)             # sanity check
+rollout = AttentionRolloutExplainer(model, device=torch.device("cuda"))
+heatmap = rollout.compute(image_tensor)         # [H, W] in [0, 1]
+```
+
+!!! info "Hybrid models (Conv-stem + transformer body)"
+
+    Models that mix Conv2d with attention (ConvNeXt-style hybrids,
+    Swin's patch-embed Conv layer) intentionally fall through to the
+    Grad-CAM path — the convolutional stem produces a more useful
+    spatial signal than rollout on a partially-attended forward.
+    Override via `XAIGenerator.run(target_layer_name="...")` if you
+    want to force Grad-CAM on a specific module.
+
+## 9 · Mixing library + pipeline
 
 Library and pipeline are *complementary*, not exclusive. A common
 pattern: drive the heavy phases (clustering + NSGA + QAT) from the CLI
@@ -220,7 +402,7 @@ Or the inverse direction: do a quick standalone notebook experiment to
 pick a baseline, then commit those choices to `config.yaml` and run the
 full pipeline.
 
-## 7 · Where each class lives
+## 10 · Where each class lives
 
 Even though the flat import works, knowing the underlying layout helps
 when you read the API reference:
