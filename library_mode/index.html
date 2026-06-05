@@ -573,10 +573,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#6-mixing-library-pipeline" class="md-nav__link">
+  <a href="#6-regression-continuous-outputs" class="md-nav__link">
     <span class="md-ellipsis">
       
-        6 · Mixing library + pipeline
+        6 · Regression — continuous outputs
       
     </span>
   </a>
@@ -584,10 +584,43 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#7-where-each-class-lives" class="md-nav__link">
+  <a href="#7-nlp-huggingface-transformers" class="md-nav__link">
     <span class="md-ellipsis">
       
-        7 · Where each class lives
+        7 · NLP / HuggingFace transformers
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-vision-transformers-vit-and-attention-rollout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8 · Vision Transformers (ViT) and Attention Rollout
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-mixing-library-pipeline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        9 · Mixing library + pipeline
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#10-where-each-class-lives" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        10 · Where each class lives
       
     </span>
   </a>
@@ -711,10 +744,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#6-mixing-library-pipeline" class="md-nav__link">
+  <a href="#6-regression-continuous-outputs" class="md-nav__link">
     <span class="md-ellipsis">
       
-        6 · Mixing library + pipeline
+        6 · Regression — continuous outputs
       
     </span>
   </a>
@@ -722,10 +755,43 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#7-where-each-class-lives" class="md-nav__link">
+  <a href="#7-nlp-huggingface-transformers" class="md-nav__link">
     <span class="md-ellipsis">
       
-        7 · Where each class lives
+        7 · NLP / HuggingFace transformers
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-vision-transformers-vit-and-attention-rollout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8 · Vision Transformers (ViT) and Attention Rollout
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-mixing-library-pipeline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        9 · Mixing library + pipeline
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#10-where-each-class-lives" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        10 · Where each class lives
       
     </span>
   </a>
@@ -844,6 +910,22 @@ never touches the head / heads. So the model still emits the
 canonical <code>List[Dict[str, Tensor]]</code> and downstream eval / NMS /
 Grad-CAM all work unchanged.</p>
 </div>
+<div class="admonition warning">
+<p class="admonition-title">AWQ is not supported on detection models</p>
+<p>Use <code>PTQQuantizer</code>, <code>GPTQQuantizer</code>, or <code>QATTrainer</code> for detection.
+AWQ's per-layer α search concatenates calibration activations
+along the batch axis, which assumes a <strong>static activation shape</strong>
+across batches. Detection models (Faster R-CNN, RetinaNet, …) emit
+variable-size tensors from the RPN / RoI heads — the number of
+proposals depends on the image, so <code>torch.cat</code> along the batch
+dimension fails. This is a property of the AWQ algorithm itself
+(designed for static-shape LLM / vision-backbone graphs), not a
+bug in NeuroQuant. Calling <code>AWQQuantizer(...).quantize(...)</code> with
+<code>task="detection"</code> raises a clear <code>NotImplementedError</code> pointing
+you back to PTQ / QAT.</p>
+<p>Segmentation is fine — <code>OrderedDict({"out": ...})</code> has a static
+spatial shape per batch, so AWQ applies normally.</p>
+</div>
 <h2 id="4-segmentation-example-deeplabv3-grad-cam">4 · Segmentation example — DeepLabV3 + Grad-CAM<a class="headerlink" href="#4-segmentation-example-deeplabv3-grad-cam" title="Permanent link">&para;</a></h2>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 </span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torchvision</span>
@@ -912,43 +994,211 @@ training script:</p>
 </span><span id="__span-4-31"><a id="__codelineno-4-31" name="__codelineno-4-31" href="#__codelineno-4-31"></a><span class="p">)</span>
 </span><span id="__span-4-32"><a id="__codelineno-4-32" name="__codelineno-4-32" href="#__codelineno-4-32"></a><span class="n">final_model</span> <span class="o">=</span> <span class="n">qat_result</span><span class="p">[</span><span class="s2">&quot;model&quot;</span><span class="p">]</span>
 </span></code></pre></div>
-<h2 id="6-mixing-library-pipeline">6 · Mixing library + pipeline<a class="headerlink" href="#6-mixing-library-pipeline" title="Permanent link">&para;</a></h2>
+<h2 id="6-regression-continuous-outputs">6 · Regression — continuous outputs<a class="headerlink" href="#6-regression-continuous-outputs" title="Permanent link">&para;</a></h2>
+<blockquote>
+<p>Added in v2.1.</p>
+</blockquote>
+<p>NeuroQuant's task router treats regression as a first-class task. The
+loss bridge swaps <code>CrossEntropyLoss</code> for <code>MSELoss</code>, the metrics layer
+emits <code>RMSE</code> / <code>MAE</code> / <code>R²</code> instead of Top-1, and NSGA-II keeps its
+<code>fp32 − quant</code> objective math unchanged because the metric helper puts
+<code>-RMSE</code> in the canonical <code>top1</code> slot (so "higher is better" still
+holds and quantization-induced RMSE growth becomes the equivalent of
+accuracy loss).</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span><span class="o">,</span><span class="w"> </span><span class="nn">torch.nn</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">nn</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch.utils.data</span><span class="w"> </span><span class="kn">import</span> <span class="n">DataLoader</span><span class="p">,</span> <span class="n">TensorDataset</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">neuroquant</span><span class="w"> </span><span class="kn">import</span> <span class="n">PTQQuantizer</span><span class="p">,</span> <span class="n">QuantizationConfig</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="kn">from</span><span class="w"> </span><span class="nn">neuroquant.utils.metrics</span><span class="w"> </span><span class="kn">import</span> <span class="n">compute_regression_metrics</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="c1"># 1. A regression head — anything that outputs ``[B, K]`` continuous values.</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="n">model</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Sequential</span><span class="p">(</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    <span class="n">nn</span><span class="o">.</span><span class="n">Flatten</span><span class="p">(),</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>    <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="mi">3</span> <span class="o">*</span> <span class="mi">32</span> <span class="o">*</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">),</span>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>    <span class="n">nn</span><span class="o">.</span><span class="n">ReLU</span><span class="p">(),</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>    <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="mi">64</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>                       <span class="c1"># single continuous output</span>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="p">)</span>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="c1"># 2. Bind ``task=&#39;regression&#39;`` so the loss bridge and metric router</span>
+</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a><span class="c1">#    pick MSE + RMSE instead of CE + Top-1.</span>
+</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a><span class="n">cfg</span> <span class="o">=</span> <span class="n">QuantizationConfig</span><span class="p">(</span><span class="n">task</span><span class="o">=</span><span class="s2">&quot;regression&quot;</span><span class="p">)</span>
+</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a>
+</span><span id="__span-5-18"><a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a><span class="c1"># 3. Calibration + eval loaders — the targets are floats, not class ids.</span>
+</span><span id="__span-5-19"><a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a><span class="n">calib_loader</span> <span class="o">=</span> <span class="n">DataLoader</span><span class="p">(</span>
+</span><span id="__span-5-20"><a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a>    <span class="n">TensorDataset</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">256</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">32</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">256</span><span class="p">,</span> <span class="mi">1</span><span class="p">)),</span>
+</span><span id="__span-5-21"><a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a>    <span class="n">batch_size</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+</span><span id="__span-5-22"><a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a><span class="p">)</span>
+</span><span id="__span-5-23"><a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a><span class="n">eval_loader</span> <span class="o">=</span> <span class="n">DataLoader</span><span class="p">(</span>
+</span><span id="__span-5-24"><a id="__codelineno-5-24" name="__codelineno-5-24" href="#__codelineno-5-24"></a>    <span class="n">TensorDataset</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">64</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">32</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">64</span><span class="p">,</span> <span class="mi">1</span><span class="p">)),</span>
+</span><span id="__span-5-25"><a id="__codelineno-5-25" name="__codelineno-5-25" href="#__codelineno-5-25"></a>    <span class="n">batch_size</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+</span><span id="__span-5-26"><a id="__codelineno-5-26" name="__codelineno-5-26" href="#__codelineno-5-26"></a><span class="p">)</span>
+</span><span id="__span-5-27"><a id="__codelineno-5-27" name="__codelineno-5-27" href="#__codelineno-5-27"></a>
+</span><span id="__span-5-28"><a id="__codelineno-5-28" name="__codelineno-5-28" href="#__codelineno-5-28"></a><span class="c1"># 4. Quantize. Same library API, same three-line shape.</span>
+</span><span id="__span-5-29"><a id="__codelineno-5-29" name="__codelineno-5-29" href="#__codelineno-5-29"></a><span class="n">q_model</span> <span class="o">=</span> <span class="n">PTQQuantizer</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">cfg</span><span class="p">)</span><span class="o">.</span><span class="n">quantize</span><span class="p">(</span><span class="n">calib_loader</span><span class="p">,</span> <span class="n">bitwidth</span><span class="o">=</span><span class="mi">8</span><span class="p">)</span>
+</span><span id="__span-5-30"><a id="__codelineno-5-30" name="__codelineno-5-30" href="#__codelineno-5-30"></a>
+</span><span id="__span-5-31"><a id="__codelineno-5-31" name="__codelineno-5-31" href="#__codelineno-5-31"></a><span class="c1"># 5. Headline metrics include RMSE / MAE / R²; ``top1`` is ``-RMSE``</span>
+</span><span id="__span-5-32"><a id="__codelineno-5-32" name="__codelineno-5-32" href="#__codelineno-5-32"></a><span class="c1">#    so any task-agnostic caller still sees &quot;higher = better&quot;.</span>
+</span><span id="__span-5-33"><a id="__codelineno-5-33" name="__codelineno-5-33" href="#__codelineno-5-33"></a><span class="n">metrics</span> <span class="o">=</span> <span class="n">compute_regression_metrics</span><span class="p">(</span><span class="n">q_model</span><span class="p">,</span> <span class="n">eval_loader</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;cpu&quot;</span><span class="p">))</span>
+</span><span id="__span-5-34"><a id="__codelineno-5-34" name="__codelineno-5-34" href="#__codelineno-5-34"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;RMSE=</span><span class="si">{</span><span class="n">metrics</span><span class="p">[</span><span class="s1">&#39;rmse&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">  MAE=</span><span class="si">{</span><span class="n">metrics</span><span class="p">[</span><span class="s1">&#39;mae&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">  R²=</span><span class="si">{</span><span class="n">metrics</span><span class="p">[</span><span class="s1">&#39;r2&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</span></code></pre></div>
+<div class="admonition note">
+<p class="admonition-title">Why the <code>-RMSE</code> trick</p>
+<p>NSGA-II's accuracy-loss objective is <code>fp32_top1 − quant_top1</code>.
+Storing <code>-RMSE</code> in <code>top1</code> makes that expression evaluate to
+<code>(-fp32_rmse) − (-quant_rmse) = quant_rmse − fp32_rmse</code> — exactly
+"extra error introduced by quantization", with the same
+"lower-is-better" semantics. Zero NSGA code had to change.</p>
+</div>
+<h2 id="7-nlp-huggingface-transformers">7 · NLP / HuggingFace transformers<a class="headerlink" href="#7-nlp-huggingface-transformers" title="Permanent link">&para;</a></h2>
+<blockquote>
+<p>Added in v2.1. Requires the optional <code>[nlp]</code> extras.</p>
+</blockquote>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>pip<span class="w"> </span>install<span class="w"> </span>neuroquant<span class="o">[</span>nlp<span class="o">]</span>
+</span></code></pre></div>
+<p>NLP support hooks into the same task-aware bridge: set <code>task='nlp'</code>
+and the loss function becomes <code>model(**inputs, labels=labels).loss</code>
+(the canonical HuggingFace contract). The data layer ships a tiny
+HuggingFace dataset loader that activates whenever <code>dataset_name</code>
+starts with <code>hf:</code> or <code>task == 'nlp'</code>.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">neuroquant</span><span class="w"> </span><span class="kn">import</span> <span class="n">PTQQuantizer</span><span class="p">,</span> <span class="n">QuantizationConfig</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">neuroquant.data</span><span class="w"> </span><span class="kn">import</span> <span class="n">GenericDatasetLoader</span>      <span class="c1"># uses [nlp] extras when needed</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoModelForSequenceClassification</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="c1"># 1. Load any HuggingFace classifier — BERT, RoBERTa, DistilBERT, …</span>
+</span><span id="__span-7-6"><a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForSequenceClassification</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+</span><span id="__span-7-7"><a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a>    <span class="s2">&quot;distilbert-base-uncased&quot;</span><span class="p">,</span> <span class="n">num_labels</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+</span><span id="__span-7-8"><a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a><span class="p">)</span>
+</span><span id="__span-7-9"><a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a>
+</span><span id="__span-7-10"><a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a><span class="c1"># 2. Configure the NLP task. ``dataset_name=&quot;hf:imdb&quot;`` tells the loader</span>
+</span><span id="__span-7-11"><a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a><span class="c1">#    to pull IMDB via ``datasets.load_dataset``; the tokenizer is</span>
+</span><span id="__span-7-12"><a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a><span class="c1">#    inferred from ``model_name`` (defaults to bert-base-uncased</span>
+</span><span id="__span-7-13"><a id="__codelineno-7-13" name="__codelineno-7-13" href="#__codelineno-7-13"></a><span class="c1">#    if not set).</span>
+</span><span id="__span-7-14"><a id="__codelineno-7-14" name="__codelineno-7-14" href="#__codelineno-7-14"></a><span class="n">cfg</span> <span class="o">=</span> <span class="n">QuantizationConfig</span><span class="p">(</span>
+</span><span id="__span-7-15"><a id="__codelineno-7-15" name="__codelineno-7-15" href="#__codelineno-7-15"></a>    <span class="n">task</span><span class="o">=</span><span class="s2">&quot;nlp&quot;</span><span class="p">,</span>
+</span><span id="__span-7-16"><a id="__codelineno-7-16" name="__codelineno-7-16" href="#__codelineno-7-16"></a>    <span class="n">model_name</span><span class="o">=</span><span class="s2">&quot;distilbert-base-uncased&quot;</span><span class="p">,</span>
+</span><span id="__span-7-17"><a id="__codelineno-7-17" name="__codelineno-7-17" href="#__codelineno-7-17"></a>    <span class="n">dataset_name</span><span class="o">=</span><span class="s2">&quot;hf:imdb&quot;</span><span class="p">,</span>
+</span><span id="__span-7-18"><a id="__codelineno-7-18" name="__codelineno-7-18" href="#__codelineno-7-18"></a>    <span class="n">num_classes</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+</span><span id="__span-7-19"><a id="__codelineno-7-19" name="__codelineno-7-19" href="#__codelineno-7-19"></a>    <span class="n">batch_size</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span>
+</span><span id="__span-7-20"><a id="__codelineno-7-20" name="__codelineno-7-20" href="#__codelineno-7-20"></a><span class="p">)</span>
+</span><span id="__span-7-21"><a id="__codelineno-7-21" name="__codelineno-7-21" href="#__codelineno-7-21"></a><span class="n">cfg</span><span class="o">.</span><span class="n">hyperparams</span><span class="o">.</span><span class="n">nlp_max_seq_len</span> <span class="o">=</span> <span class="mi">128</span>         <span class="c1"># default; bump for long-form text</span>
+</span><span id="__span-7-22"><a id="__codelineno-7-22" name="__codelineno-7-22" href="#__codelineno-7-22"></a>
+</span><span id="__span-7-23"><a id="__codelineno-7-23" name="__codelineno-7-23" href="#__codelineno-7-23"></a><span class="c1"># 3. Build the calibration loader. Each batch is a single dict</span>
+</span><span id="__span-7-24"><a id="__codelineno-7-24" name="__codelineno-7-24" href="#__codelineno-7-24"></a><span class="c1">#    ``{&quot;input_ids&quot;: ..., &quot;attention_mask&quot;: ..., &quot;labels&quot;: ...}``</span>
+</span><span id="__span-7-25"><a id="__codelineno-7-25" name="__codelineno-7-25" href="#__codelineno-7-25"></a><span class="c1">#    — exactly what HF models consume natively.</span>
+</span><span id="__span-7-26"><a id="__codelineno-7-26" name="__codelineno-7-26" href="#__codelineno-7-26"></a><span class="n">loader</span> <span class="o">=</span> <span class="n">GenericDatasetLoader</span><span class="p">(</span><span class="n">cfg</span><span class="p">)</span><span class="o">.</span><span class="n">get_calibration_loader</span><span class="p">(</span><span class="n">num_batches</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span>
+</span><span id="__span-7-27"><a id="__codelineno-7-27" name="__codelineno-7-27" href="#__codelineno-7-27"></a>
+</span><span id="__span-7-28"><a id="__codelineno-7-28" name="__codelineno-7-28" href="#__codelineno-7-28"></a><span class="c1"># 4. Quantize. The loss bridge auto-splats the dict into</span>
+</span><span id="__span-7-29"><a id="__codelineno-7-29" name="__codelineno-7-29" href="#__codelineno-7-29"></a><span class="c1">#    ``model(**x, labels=y)`` and reads ``.loss`` off the output.</span>
+</span><span id="__span-7-30"><a id="__codelineno-7-30" name="__codelineno-7-30" href="#__codelineno-7-30"></a><span class="n">q_model</span> <span class="o">=</span> <span class="n">PTQQuantizer</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">cfg</span><span class="p">)</span><span class="o">.</span><span class="n">quantize</span><span class="p">(</span><span class="n">loader</span><span class="p">,</span> <span class="n">bitwidth</span><span class="o">=</span><span class="mi">8</span><span class="p">)</span>
+</span></code></pre></div>
+<div class="admonition tip">
+<p class="admonition-title">Custom HuggingFace pipelines</p>
+<p>You don't have to use the bundled HF loader — any iterable that
+yields <code>({"input_ids": …, "attention_mask": …}, labels)</code> tuples
+or a single dict with <code>labels</code> inside it will work. The Hessian
+estimator and Phase 1c NSGA evaluator both call the same
+task-aware bridge, so swap in a custom DataLoader and everything
+downstream just works.</p>
+</div>
+<div class="admonition warning">
+<p class="admonition-title">AWQ on transformers</p>
+<p>AWQ works on transformer <strong>encoders</strong> with static sequence
+lengths (BERT, DistilBERT, …) but fails on decoder LLMs whose
+KV-cache changes the activation shape across calibration
+batches — same root cause as the detection guard. Prefer
+<code>PTQQuantizer</code> or <code>GPTQQuantizer</code> for causal LM quantization
+if you hit <code>torch.cat</code> errors.</p>
+</div>
+<h2 id="8-vision-transformers-vit-and-attention-rollout">8 · Vision Transformers (ViT) and Attention Rollout<a class="headerlink" href="#8-vision-transformers-vit-and-attention-rollout" title="Permanent link">&para;</a></h2>
+<blockquote>
+<p>Added in v2.1.</p>
+</blockquote>
+<p><code>XAIGenerator</code> auto-detects when the FP32 model is a Vision Transformer
+(presence of <code>nn.MultiheadAttention</code> plus absence of <code>nn.Conv2d</code>) and
+swaps Grad-CAM for <strong>Attention Rollout</strong> (Abnar &amp; Zuidema, 2020). One
+forward pass, no extra dependencies, no Conv2d required — and the
+output is the same <code>np.ndarray[H, W] ∈ [0, 1]</code> heatmap that the rest
+of the XAI pipeline already consumes.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">neuroquant</span><span class="w"> </span><span class="kn">import</span> <span class="n">PTQQuantizer</span><span class="p">,</span> <span class="n">QuantizationConfig</span><span class="p">,</span> <span class="n">XAIGenerator</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torchvision.models</span><span class="w"> </span><span class="kn">import</span> <span class="n">vit_b_16</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>
+</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="c1"># 1. Any ViT — torchvision, timm, or a custom one.</span>
+</span><span id="__span-8-6"><a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="n">model</span> <span class="o">=</span> <span class="n">vit_b_16</span><span class="p">(</span><span class="n">weights</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">num_classes</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+</span><span id="__span-8-7"><a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a>
+</span><span id="__span-8-8"><a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a><span class="c1"># 2. Quantize as usual.</span>
+</span><span id="__span-8-9"><a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a><span class="n">cfg</span> <span class="o">=</span> <span class="n">QuantizationConfig</span><span class="p">(</span><span class="n">task</span><span class="o">=</span><span class="s2">&quot;classification&quot;</span><span class="p">,</span> <span class="n">num_classes</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+</span><span id="__span-8-10"><a id="__codelineno-8-10" name="__codelineno-8-10" href="#__codelineno-8-10"></a><span class="n">q_model</span> <span class="o">=</span> <span class="n">PTQQuantizer</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">cfg</span><span class="p">)</span><span class="o">.</span><span class="n">quantize</span><span class="p">(</span><span class="n">calib_loader</span><span class="p">,</span> <span class="n">bitwidth</span><span class="o">=</span><span class="mi">8</span><span class="p">)</span>
+</span><span id="__span-8-11"><a id="__codelineno-8-11" name="__codelineno-8-11" href="#__codelineno-8-11"></a>
+</span><span id="__span-8-12"><a id="__codelineno-8-12" name="__codelineno-8-12" href="#__codelineno-8-12"></a><span class="c1"># 3. Run XAI. The generator detects the ViT and routes to Attention</span>
+</span><span id="__span-8-13"><a id="__codelineno-8-13" name="__codelineno-8-13" href="#__codelineno-8-13"></a><span class="c1">#    Rollout automatically — Grad-CAM would crash because there&#39;s no</span>
+</span><span id="__span-8-14"><a id="__codelineno-8-14" name="__codelineno-8-14" href="#__codelineno-8-14"></a><span class="c1">#    last Conv2d to hook.</span>
+</span><span id="__span-8-15"><a id="__codelineno-8-15" name="__codelineno-8-15" href="#__codelineno-8-15"></a><span class="n">xai</span> <span class="o">=</span> <span class="n">XAIGenerator</span><span class="p">(</span><span class="n">cfg</span><span class="p">)</span>
+</span><span id="__span-8-16"><a id="__codelineno-8-16" name="__codelineno-8-16" href="#__codelineno-8-16"></a><span class="n">result</span> <span class="o">=</span> <span class="n">xai</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+</span><span id="__span-8-17"><a id="__codelineno-8-17" name="__codelineno-8-17" href="#__codelineno-8-17"></a>    <span class="n">fp32_model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
+</span><span id="__span-8-18"><a id="__codelineno-8-18" name="__codelineno-8-18" href="#__codelineno-8-18"></a>    <span class="n">quantized_models</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;PTQ_INT8&quot;</span><span class="p">:</span> <span class="n">q_model</span><span class="p">},</span>
+</span><span id="__span-8-19"><a id="__codelineno-8-19" name="__codelineno-8-19" href="#__codelineno-8-19"></a>    <span class="n">test_images</span><span class="o">=</span><span class="n">sample_batch</span><span class="p">,</span>           <span class="c1"># [N, 3, 224, 224]</span>
+</span><span id="__span-8-20"><a id="__codelineno-8-20" name="__codelineno-8-20" href="#__codelineno-8-20"></a>    <span class="n">test_labels</span><span class="o">=</span><span class="n">sample_labels</span><span class="p">,</span>
+</span><span id="__span-8-21"><a id="__codelineno-8-21" name="__codelineno-8-21" href="#__codelineno-8-21"></a>    <span class="n">output_dir</span><span class="o">=</span><span class="s2">&quot;./xai_vit&quot;</span><span class="p">,</span>
+</span><span id="__span-8-22"><a id="__codelineno-8-22" name="__codelineno-8-22" href="#__codelineno-8-22"></a><span class="p">)</span>
+</span><span id="__span-8-23"><a id="__codelineno-8-23" name="__codelineno-8-23" href="#__codelineno-8-23"></a><span class="nb">print</span><span class="p">(</span><span class="n">result</span><span class="p">[</span><span class="s2">&quot;consistency_scores&quot;</span><span class="p">])</span>
+</span><span id="__span-8-24"><a id="__codelineno-8-24" name="__codelineno-8-24" href="#__codelineno-8-24"></a><span class="c1"># {&#39;PTQ_INT8&#39;: 0.93}  ← Pearson correlation vs FP32 rollout</span>
+</span></code></pre></div>
+<p>You can also drive the explainer directly when you want one heatmap
+without spinning up the full pipeline:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">neuroquant.xai.explainability</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>    <span class="n">AttentionRolloutExplainer</span><span class="p">,</span> <span class="n">is_vision_transformer</span><span class="p">,</span>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="p">)</span>
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>
+</span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="k">assert</span> <span class="n">is_vision_transformer</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>             <span class="c1"># sanity check</span>
+</span><span id="__span-9-6"><a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a><span class="n">rollout</span> <span class="o">=</span> <span class="n">AttentionRolloutExplainer</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;cuda&quot;</span><span class="p">))</span>
+</span><span id="__span-9-7"><a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a><span class="n">heatmap</span> <span class="o">=</span> <span class="n">rollout</span><span class="o">.</span><span class="n">compute</span><span class="p">(</span><span class="n">image_tensor</span><span class="p">)</span>         <span class="c1"># [H, W] in [0, 1]</span>
+</span></code></pre></div>
+<div class="admonition info">
+<p class="admonition-title">Hybrid models (Conv-stem + transformer body)</p>
+<p>Models that mix Conv2d with attention (ConvNeXt-style hybrids,
+Swin's patch-embed Conv layer) intentionally fall through to the
+Grad-CAM path — the convolutional stem produces a more useful
+spatial signal than rollout on a partially-attended forward.
+Override via <code>XAIGenerator.run(target_layer_name="...")</code> if you
+want to force Grad-CAM on a specific module.</p>
+</div>
+<h2 id="9-mixing-library-pipeline">9 · Mixing library + pipeline<a class="headerlink" href="#9-mixing-library-pipeline" title="Permanent link">&para;</a></h2>
 <p>Library and pipeline are <em>complementary</em>, not exclusive. A common
 pattern: drive the heavy phases (clustering + NSGA + QAT) from the CLI
 for reproducibility, then load the resulting Pareto front into a
 notebook for analysis:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">neuroquant</span><span class="w"> </span><span class="kn">import</span> <span class="n">ParetoAnalyzer</span>
-</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>
-</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="s2">&quot;artifacts/pareto_summary.json&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>    <span class="n">pareto</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
-</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>
-</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="n">analyzer</span> <span class="o">=</span> <span class="n">ParetoAnalyzer</span><span class="p">(</span><span class="n">pareto</span><span class="p">[</span><span class="s2">&quot;solutions&quot;</span><span class="p">],</span> <span class="n">baseline_accuracy</span><span class="o">=</span><span class="mf">92.5</span><span class="p">)</span>
-</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="n">knee</span> <span class="o">=</span> <span class="n">analyzer</span><span class="o">.</span><span class="n">find_knee_point</span><span class="p">()</span>
-</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Knee solution: </span><span class="si">{</span><span class="n">knee</span><span class="p">[</span><span class="s1">&#39;solution_id&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2"> &quot;</span>
-</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>      <span class="sa">f</span><span class="s2">&quot;(</span><span class="si">{</span><span class="n">knee</span><span class="p">[</span><span class="s1">&#39;accuracy&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">%, </span><span class="si">{</span><span class="n">knee</span><span class="p">[</span><span class="s1">&#39;model_size_mb&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> MiB)&quot;</span><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">neuroquant</span><span class="w"> </span><span class="kn">import</span> <span class="n">ParetoAnalyzer</span>
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>
+</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="s2">&quot;artifacts/pareto_summary.json&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+</span><span id="__span-10-5"><a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a>    <span class="n">pareto</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+</span><span id="__span-10-6"><a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a>
+</span><span id="__span-10-7"><a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a><span class="n">analyzer</span> <span class="o">=</span> <span class="n">ParetoAnalyzer</span><span class="p">(</span><span class="n">pareto</span><span class="p">[</span><span class="s2">&quot;solutions&quot;</span><span class="p">],</span> <span class="n">baseline_accuracy</span><span class="o">=</span><span class="mf">92.5</span><span class="p">)</span>
+</span><span id="__span-10-8"><a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a><span class="n">knee</span> <span class="o">=</span> <span class="n">analyzer</span><span class="o">.</span><span class="n">find_knee_point</span><span class="p">()</span>
+</span><span id="__span-10-9"><a id="__codelineno-10-9" name="__codelineno-10-9" href="#__codelineno-10-9"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Knee solution: </span><span class="si">{</span><span class="n">knee</span><span class="p">[</span><span class="s1">&#39;solution_id&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2"> &quot;</span>
+</span><span id="__span-10-10"><a id="__codelineno-10-10" name="__codelineno-10-10" href="#__codelineno-10-10"></a>      <span class="sa">f</span><span class="s2">&quot;(</span><span class="si">{</span><span class="n">knee</span><span class="p">[</span><span class="s1">&#39;accuracy&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">%, </span><span class="si">{</span><span class="n">knee</span><span class="p">[</span><span class="s1">&#39;model_size_mb&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> MiB)&quot;</span><span class="p">)</span>
 </span></code></pre></div>
 <p>Or the inverse direction: do a quick standalone notebook experiment to
 pick a baseline, then commit those choices to <code>config.yaml</code> and run the
 full pipeline.</p>
-<h2 id="7-where-each-class-lives">7 · Where each class lives<a class="headerlink" href="#7-where-each-class-lives" title="Permanent link">&para;</a></h2>
+<h2 id="10-where-each-class-lives">10 · Where each class lives<a class="headerlink" href="#10-where-each-class-lives" title="Permanent link">&para;</a></h2>
 <p>Even though the flat import works, knowing the underlying layout helps
 when you read the API reference:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>neuroquant/
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>├── quantization/
-</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>│   ├── ptq.py             → PTQQuantizer
-</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>│   ├── awq.py             → AWQQuantizer
-</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>│   ├── gptq.py            → GPTQQuantizer
-</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>│   ├── smoothquant.py     → SmoothQuantQuantizer
-</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>│   ├── smoothquant_gptq.py→ SmoothQuantGPTQQuantizer
-</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>│   ├── adaround.py        → AdaroundOptimizer
-</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>│   ├── qat.py             → QATTrainer
-</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>│   ├── nsga_ii_search.py  → NSGAIIClusterSearch
-</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>│   ├── hessian_clustering.py → LayerClusterer
-</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a>│   └── surrogate.py       → AccuracySurrogate
-</span><span id="__span-6-13"><a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a>├── xai/explainability.py  → XAIGenerator
-</span><span id="__span-6-14"><a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a>├── visualization/         → ParetoAnalyzer, plot_* helpers
-</span><span id="__span-6-15"><a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a>└── config.py              → QuantizationConfig
+<div class="language-text highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>neuroquant/
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>├── quantization/
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>│   ├── ptq.py             → PTQQuantizer
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>│   ├── awq.py             → AWQQuantizer
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>│   ├── gptq.py            → GPTQQuantizer
+</span><span id="__span-11-6"><a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a>│   ├── smoothquant.py     → SmoothQuantQuantizer
+</span><span id="__span-11-7"><a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a>│   ├── smoothquant_gptq.py→ SmoothQuantGPTQQuantizer
+</span><span id="__span-11-8"><a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a>│   ├── adaround.py        → AdaroundOptimizer
+</span><span id="__span-11-9"><a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a>│   ├── qat.py             → QATTrainer
+</span><span id="__span-11-10"><a id="__codelineno-11-10" name="__codelineno-11-10" href="#__codelineno-11-10"></a>│   ├── nsga_ii_search.py  → NSGAIIClusterSearch
+</span><span id="__span-11-11"><a id="__codelineno-11-11" name="__codelineno-11-11" href="#__codelineno-11-11"></a>│   ├── hessian_clustering.py → LayerClusterer
+</span><span id="__span-11-12"><a id="__codelineno-11-12" name="__codelineno-11-12" href="#__codelineno-11-12"></a>│   └── surrogate.py       → AccuracySurrogate
+</span><span id="__span-11-13"><a id="__codelineno-11-13" name="__codelineno-11-13" href="#__codelineno-11-13"></a>├── xai/explainability.py  → XAIGenerator
+</span><span id="__span-11-14"><a id="__codelineno-11-14" name="__codelineno-11-14" href="#__codelineno-11-14"></a>├── visualization/         → ParetoAnalyzer, plot_* helpers
+</span><span id="__span-11-15"><a id="__codelineno-11-15" name="__codelineno-11-15" href="#__codelineno-11-15"></a>└── config.py              → QuantizationConfig
 </span></code></pre></div>
 <p><a href="../api_reference/"><span class="twemoji"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13.22 19.03a.75.75 0 0 1 0-1.06L18.19 13H3.75a.75.75 0 0 1 0-1.5h14.44l-4.97-4.97a.749.749 0 0 1 .326-1.275.75.75 0 0 1 .734.215l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0"/></svg></span> Continue to the auto-generated API reference</a></p>
 

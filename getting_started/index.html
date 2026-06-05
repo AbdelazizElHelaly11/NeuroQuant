@@ -758,9 +758,14 @@ of users need are exposed as extras:</p>
 <td>Phase 3 SHAP attribution (Grad-CAM works without it).</td>
 </tr>
 <tr>
+<td><code>neuroquant[nlp]</code></td>
+<td><code>transformers</code>, <code>datasets</code>, <code>tokenizers</code></td>
+<td><code>task: nlp</code> and <code>dataset_name: hf:&lt;name&gt;</code> HuggingFace integration (v2.1+).</td>
+</tr>
+<tr>
 <td><code>neuroquant[dev]</code></td>
-<td><code>ruff</code>, <code>build</code></td>
-<td>Linting and wheel building for contributors.</td>
+<td><code>ruff</code>, <code>build</code>, <code>pytest</code>, <code>pytest-cov</code></td>
+<td>Linting, wheel building, and running the test suite.</td>
 </tr>
 <tr>
 <td><code>neuroquant[docs]</code></td>
@@ -769,7 +774,7 @@ of users need are exposed as extras:</p>
 </tr>
 </tbody>
 </table>
-<p>Combine them with comma syntax: <code>pip install neuroquant[xai,dev]</code>.</p>
+<p>Combine them with comma syntax: <code>pip install neuroquant[xai,nlp,dev]</code>.</p>
 <h2 id="3-verify-the-install">3 · Verify the install<a class="headerlink" href="#3-verify-the-install" title="Permanent link">&para;</a></h2>
 <p>A clean install exposes a console-script <em>and</em> a flat Python API. Try both:</p>
 <div class="tabbed-set tabbed-alternate" data-tabs="2:2"><input checked="checked" id="__tabbed_2_1" name="__tabbed_2" type="radio" /><input id="__tabbed_2_2" name="__tabbed_2" type="radio" /><div class="tabbed-labels"><label for="__tabbed_2_1">Command line</label><label for="__tabbed_2_2">Python</label></div>

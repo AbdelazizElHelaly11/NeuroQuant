@@ -78,7 +78,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#neuroquant-v20" class="md-skip">
+        <a href="#neuroquant-v21" class="md-skip">
           Skip to content
         </a>
       
@@ -690,11 +690,12 @@
   
 
 
-<h1 id="neuroquant-v20">NeuroQuant v2.0<a class="headerlink" href="#neuroquant-v20" title="Permanent link">&para;</a></h1>
+<h1 id="neuroquant-v21">NeuroQuant v2.1<a class="headerlink" href="#neuroquant-v21" title="Permanent link">&para;</a></h1>
 <blockquote>
 <p><strong>Production-grade neural-network quantization</strong> with multi-objective search,
 ONNX deployment fidelity, and built-in explainability — for <strong>classification,
-object detection, and semantic segmentation</strong> alike.</p>
+object detection, segmentation, regression, and HuggingFace NLP</strong> alike,
+with <strong>Attention Rollout</strong> XAI for Vision Transformers.</p>
 </blockquote>
 <p align="center">
   <em>One framework. Two front doors.</em>
@@ -744,17 +745,21 @@ population scan tens of thousands of candidates per generation
 instead of dozens.</p>
 </li>
 <li>
-<p><span class="twemoji lg middle"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M22 16V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2m-11-4 2.03 2.71L16 11l4 5H8M2 6v14a2 2 0 0 0 2 2h14v-2H4V6"/></svg></span> <strong>Three vision paradigms</strong></p>
+<p><span class="twemoji lg middle"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M22 16V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2m-11-4 2.03 2.71L16 11l4 5H8M2 6v14a2 2 0 0 0 2 2h14v-2H4V6"/></svg></span> <strong>Five task families</strong></p>
 <p>Native support for <strong>classification</strong>, <strong>detection</strong>
-(Faster R-CNN, SSD, RetinaNet, FCOS, …), and <strong>segmentation</strong>
-(FCN, DeepLabV3, LRASPP). One pipeline, three task families.</p>
+(Faster R-CNN, SSD, RetinaNet, FCOS, …), <strong>segmentation</strong>
+(FCN, DeepLabV3, LRASPP), <strong>regression</strong> (RMSE/MAE/R²
+objectives), and <strong>NLP</strong> (any HuggingFace model via the
+optional <code>[nlp]</code> extras). One pipeline, five task families.</p>
 </li>
 <li>
 <p><span class="twemoji lg middle"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 9a3 3 0 0 1 3 3 3 3 0 0 1-3 3 3 3 0 0 1-3-3 3 3 0 0 1 3-3m0-4.5c5 0 9.27 3.11 11 7.5-1.73 4.39-6 7.5-11 7.5S2.73 16.39 1 12c1.73-4.39 6-7.5 11-7.5M3.18 12a9.821 9.821 0 0 0 17.64 0 9.821 9.821 0 0 0-17.64 0"/></svg></span> <strong>Task-aware XAI</strong></p>
 <p>Grad-CAM and SHAP-style attribution that dispatch on the
 model's output shape: classification logits, detection
 score lists, <em>and</em> segmentation <code>OrderedDict({"out": …})</code>
-masks — all from the same call.</p>
+masks — all from the same call. <strong>Vision Transformers</strong>
+automatically route to <em>Attention Rollout</em> instead of
+Grad-CAM (no Conv2d feature maps needed).</p>
 </li>
 <li>
 <p><span class="twemoji lg middle"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m16 11.78 4.24-7.33 1.73 1-5.23 9.05-6.51-3.75L5.46 19H22v2H2V3h2v14.54L9.5 8z"/></svg></span> <strong>Pareto + deployment fidelity</strong></p>
