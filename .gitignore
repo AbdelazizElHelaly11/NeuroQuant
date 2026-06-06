@@ -98,6 +98,11 @@ outputs/
 # gh-deploy``) rebuild on publish.
 site/
 
+# ── Thesis writeup (private to the author) ───────────────────────────────
+# Contains in-progress thesis drafts, supervisor feedback, and other
+# materials that don't belong in the public repo.
+thesis/
+
 # ── Model checkpoints (large binary files) ───────────────────────────────
 *.pth
 *.pt

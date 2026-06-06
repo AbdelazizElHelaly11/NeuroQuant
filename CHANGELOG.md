@@ -4,6 +4,50 @@ All notable changes to NeuroQuant are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] — 2026-06-07
+
+Multi-task expansion: regression, HuggingFace NLP, and Vision
+Transformer XAI now land alongside the existing CV task families.
+
+### Added
+- **Regression task** (`task: regression`) — `MSELoss` bridge, new
+  `compute_regression_metrics` returning RMSE / MAE / R², and a
+  task-agnostic `evaluate_primary_metric` dispatcher that puts
+  `-RMSE` in the canonical `top1` slot so NSGA-II's `fp32 − quant`
+  objective math stays untouched.
+- **HuggingFace NLP task** (`task: nlp`) — loss bridge invokes
+  `model(**x, labels=y).loss`; new `_load_huggingface_dataset`
+  branch activated by `hf:<name>` dataset prefix (e.g. `hf:imdb`,
+  `hf:glue/sst2`) with auto-tokenisation from `model_name`.
+  Optional `[nlp]` extras (`transformers`, `datasets`, `tokenizers`).
+- **Vision Transformer XAI** — `AttentionRolloutExplainer`
+  (Abnar & Zuidema, 2020) auto-routed when `is_vision_transformer`
+  detects a ViT (≥1 `MultiheadAttention` and `num_attention >=
+  num_conv2d`). Handles torchvision `vit_b_16` / `vit_l_16`, Swin,
+  DeiT, and timm ViTs without code changes.
+- **Hessian dict-input support** — `_move_to_device` helper
+  recursively shifts tensors / dicts / lists-of-dicts onto the
+  estimator's device, so NLP batches `{"input_ids":, "attention_mask":}`
+  work in Phase 1a alongside CV batches.
+- **Smoke tests** — `tests/test_regression.py`, `tests/test_vit_xai.py`,
+  `tests/test_nlp_loss.py` (NLP test uses a stub HF model so it runs
+  without the `[nlp]` extras installed).
+- **Docs auto-deploy** — `.github/workflows/docs.yml` rebuilds and
+  publishes the MkDocs Material site to `gh-pages` on every push to
+  `main`.
+
+### Changed
+- `QuantizationConfig.task` validator now accepts `regression` and
+  `nlp` in addition to the existing CV trio.
+- `NSGAIIClusterSearch._evaluate_accuracy` routes through
+  `evaluate_primary_metric` so regression Pareto search uses RMSE
+  without any new objective code.
+- `XAIGenerator.run` auto-detects ViTs and dispatches to Attention
+  Rollout instead of failing on missing Conv2d feature maps.
+- Documentation site bumped to v2.1 with new library examples for
+  regression, NLP, and ViT plus an updated task dispatch table in
+  the pipeline guide.
+
 ## [2.0.0] — 2026-05-14
 
 The first PyPI release. Ships a flat library API alongside the existing
@@ -63,4 +107,5 @@ segmentation), and a documentation site at `docs/`.
   `(images_tensor, labels_tensor)` and `(images_list,
   targets_list_of_dicts)` batch shapes.
 
+[2.1.0]: https://github.com/AbdelazizElHelaly11/NeuroQuant/releases/tag/v2.1.0
 [2.0.0]: https://github.com/AbdelazizElHelaly11/NeuroQuant/releases/tag/v2.0.0
