@@ -154,6 +154,68 @@ print(result["consistency_scores"])
 # {'GPTQ_INT4': 0.91}  ← Pearson correlation vs FP32 attention
 ```
 
+### Bring your own segmentation model + dataset
+
+> Added in v2.2.0 — segmentation now runs **end-to-end** (FP32 baseline,
+> NSGA-II, AdaRound, GPTQ/SmoothQuant/AWQ, Pareto) and is scored by **mIOU**.
+
+Three contracts make *any* segmentation model work:
+
+1. **Model output.** `forward` must return per-pixel logits as a bare
+   `[B, C, H, W]` tensor **or** a dict carrying them under `"out"`
+   (`OrderedDict({"out": [B, C, H, W]})`, the torchvision shape). The loss
+   bridge and the mIOU metric both unwrap `output.get("out", first_value)`.
+   Load it via `model.name` (a torchvision seg model — optionally
+   `model.pretrained: true`) or `model.class: "pkg.mod.MyNet"`, with
+   `model.num_classes` = the output channel count.
+
+2. **Dataset output.** Each item is `(image[3,H,W] float, mask[H,W] long)`,
+   where the mask holds class indices `0..C-1` and `255` for ignore/void
+   pixels (`[B,1,H,W]` masks are auto-squeezed). Wire it with
+   `dataset.class: "pkg.mod.MyDataset"`. Segmentation needs the mask
+   resized **in lockstep** with the image (image→bilinear, mask→nearest),
+   so your dataset must apply its **own** synchronized transform — the
+   generic loader only transforms the image. The bundled
+   `neuroquant.data.voc_segmentation.VOCSegmentationDataset` is a copyable
+   template (and works out of the box for Pascal VOC).
+
+3. **Config.** Just set `task: segmentation`, an `input_shape` that matches
+   what your dataset returns, and your model + dataset — **you do not need
+   to touch `phases`.** The pipeline is task-aware: it auto-skips QAT
+   (Phase 1e, which is classification-only) for non-classification tasks
+   and reports **AdaRound** in its place. So the stock 9-phase default
+   "just works".
+
+```yaml
+model:
+  class: "mypkg.MySegNet"        # or  name: deeplabv3_resnet50  + pretrained: true
+  task: segmentation             # ← the only task-specific switch you need
+  num_classes: 21
+  input_shape: [3, 512, 512]
+dataset:
+  class: "mypkg.MySegDataset"    # yields (image[3,512,512], mask[512,512] long)
+  path: "./data"
+  batch_size: 8
+methods: [ptq, gptq, smoothquant, awq]
+hyperparams:
+  onnx_export_enabled: false     # optional — dict-output ONNX export is heavy for seg
+  hardware_aware_search: false
+```
+
+That's it — no `phases:` block required. QAT is dropped automatically (you'll
+see `Phase 1e … [SKIPPED — QAT is classification-only]` in the log).
+
+!!! note "What you get / what to know"
+    - **mIOU is reported in the `Top-1` column** (and the `top1` field
+      everywhere); pixel accuracy lands in `Top-5`. NSGA-II optimises the
+      mIOU drop directly.
+    - The ignore label is **255** (the VOC / Cityscapes / ADE convention).
+    - Reported numbers are **weight-only** quantization (activations stay
+      FP32 in the PyTorch eval).
+    - AWQ works on segmentation (fixed input → static activation shapes)
+      but is memory-hungry at high resolution; it is skipped gracefully if
+      it runs out of memory.
+
 ## 5 · Mix and match — surrogate-NSGA + your own training loop
 
 The search and the QAT trainer are also library objects. You can

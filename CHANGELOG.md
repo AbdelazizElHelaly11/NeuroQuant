@@ -37,6 +37,14 @@ mIOU, no pretrained weights, and no VOC dataset.
   consumed, so with QAT disabled (e.g. segmentation, which QAT does not
   support) AdaRound's accuracy was never reported. It now appears in the
   Pareto + summary. QAT-enabled (classification) runs are unchanged.
+- **Task-aware pipeline — `task: segmentation` just works** — the
+  pipeline auto-skips Phase 1e (QAT is classification-only and crashes on
+  segmentation/detection/regression output) for non-classification tasks,
+  so the *default* 9-phase config runs without any manual `phases` editing
+  (the skipped QAT no longer counts as an incomplete phase). Grad-CAM /
+  the XAI comparison grid now also tolerate `[H,W]` segmentation masks as
+  ground-truth labels (dominant non-ignore class) instead of crashing on
+  `.item()`. Classification behaviour is unchanged (QAT still runs).
 
 ## [2.1.1] — 2026-06-11
 

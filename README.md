@@ -21,7 +21,7 @@ It has **two front doors**:
 | ---------------- | ------------------------------------------------------------------------ | ---------------- | ----------------------------------------- |
 | `classification` | any torchvision / timm / custom CNN **or** ViT                           | Top-1            | Grad-CAM (CNN) · Attention Rollout (ViT)  |
 | `detection`      | `torchvision.models.detection` (Faster/Mask R-CNN, SSD, RetinaNet, FCOS) | Top-1 surrogate  | task-aware Grad-CAM                        |
-| `segmentation`   | `torchvision.models.segmentation` (FCN, DeepLabV3, LRASPP)               | Top-1 surrogate  | task-aware Grad-CAM                        |
+| `segmentation`   | `torchvision.models.segmentation` (FCN, DeepLabV3, LRASPP)               | mIOU             | task-aware Grad-CAM                        |
 | `regression`     | any `[B, K]`-output model                                                | RMSE / MAE / R²  | Grad-CAM / Attention Rollout              |
 | `nlp`            | any HuggingFace model (`pip install neuroquant[nlp]`)                     | Top-1            | —                                         |
 

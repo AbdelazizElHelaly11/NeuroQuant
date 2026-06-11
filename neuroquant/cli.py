@@ -264,9 +264,20 @@ class NeuroQuantPipeline:
         from neuroquant.tracking.mlflow_logger import MLflowTracker
         self.tracker = MLflowTracker(self.config)
 
-        # Determine which phases to run
+        # Determine which phases to run. ``_will_run`` also auto-skips
+        # phase 1e (QAT) for tasks QAT cannot handle, so ``task:
+        # segmentation`` (etc.) works with the *default* phase list — the
+        # user only sets the task + model + dataset, no phase editing.
         active_phases = set(self.config.run_phases)
-        phases_total = sum(1 for name, _ in self.PHASES if name in active_phases)
+
+        def _will_run(name: str) -> bool:
+            if name not in active_phases:
+                return False
+            if name == "phase_1e_qat" and not self._qat_supported():
+                return False
+            return True
+
+        phases_total = sum(1 for name, _ in self.PHASES if _will_run(name))
 
         logger.info("=" * 70)
         logger.info("  NeuroQuant v2.0 Pipeline")
@@ -279,8 +290,15 @@ class NeuroQuantPipeline:
 
         # Execute phases in order
         for phase_name, display_name in self.PHASES:
-            if phase_name not in active_phases:
-                logger.info("⏭  %s [SKIPPED]", display_name)
+            if not _will_run(phase_name):
+                if phase_name == "phase_1e_qat" and phase_name in active_phases:
+                    logger.info(
+                        "⏭  %s [SKIPPED — QAT is classification-only; "
+                        "AdaRound is reported instead for task='%s']",
+                        display_name, self.config.task,
+                    )
+                else:
+                    logger.info("⏭  %s [SKIPPED]", display_name)
                 continue
 
             logger.info("")
@@ -940,12 +958,15 @@ class NeuroQuantPipeline:
         #    skipped ──
         # Normally Phase 1e (QAT) starts from the AdaRound weights and the
         # QAT result is the reported endpoint, so AdaRound itself is never
-        # evaluated. When the run omits ``phase_1e_qat`` (e.g. the
-        # segmentation experiments — QAT is not segmentation-aware),
-        # AdaRound IS the endpoint, so evaluate it and surface it in the
-        # Pareto + summary like any other method. Gated on the phase being
-        # absent so QAT-enabled (classification) runs are unchanged.
-        if "phase_1e_qat" not in self.config.run_phases:
+        # evaluated. When QAT will not run — either it's omitted from
+        # ``phases`` or it was auto-skipped because the task isn't
+        # classification (e.g. segmentation) — AdaRound IS the endpoint, so
+        # evaluate it and surface it in the Pareto + summary like any other
+        # method. QAT-enabled (classification) runs are unchanged.
+        qat_will_run = (
+            "phase_1e_qat" in self.config.run_phases and self._qat_supported()
+        )
+        if not qat_will_run:
             ada_model = self.adaround_result.get("model")
             if isinstance(ada_model, nn.Module):
                 from neuroquant.utils.common import compute_quantized_size_mb
@@ -2296,6 +2317,23 @@ class NeuroQuantPipeline:
     def _resume_phase_4_mlflow(self) -> None:
         # Nothing to reinstate in memory — MLflow already has the logged run.
         self.ckpt.load_phase_json("phase_4_mlflow")
+
+    # ==================================================================
+    # Task capability
+    # ==================================================================
+
+    def _qat_supported(self) -> bool:
+        """Whether Phase 1e (QAT) can run for the configured task.
+
+        QAT's fine-tuning loop is classification-only — it applies
+        ``CrossEntropyLoss`` to a logits tensor and reads
+        ``outputs.max(1)``, which crashes on a segmentation
+        ``OrderedDict`` / detection list / regression vector. The pipeline
+        auto-skips QAT for those tasks (see ``run``) so ``task:
+        segmentation`` works with the default phase list, and AdaRound is
+        reported in its place (Phase 1d).
+        """
+        return getattr(self.config, "task", "classification") == "classification"
 
     # ==================================================================
     # Task-aware Loss Bridge

@@ -75,7 +75,7 @@ ones:
     | --- | --- | --- | --- |
     | `classification` | `CrossEntropyLoss` | Top-1 (higher better) | Grad-CAM |
     | `detection` | sum of torchvision loss-dict | Top-1 surrogate | Task-aware Grad-CAM |
-    | `segmentation` | pixel-wise CE (`ignore_index=255`) | Top-1 surrogate | Task-aware Grad-CAM |
+    | `segmentation` | pixel-wise CE (`ignore_index=255`) | mIOU | Task-aware Grad-CAM |
     | `regression` | `MSELoss` | `-RMSE` (higher = lower error) | Grad-CAM (CNN) / Rollout (ViT) |
     | `nlp` (v2.1+) | `model(**x, labels=y).loss` | Top-1 (higher better) | n/a |
 

@@ -969,7 +969,7 @@ class XAIGenerator:
 
             for i in range(num_images):
                 img = test_images[i:i+1]
-                gt_idx = int(test_labels[i].item())
+                gt_idx = self._gt_label_index(test_labels[i])
 
                 # Capture model prediction + confidence BEFORE the Grad-CAM
                 # backward pass so the recorded probabilities reflect the
@@ -1269,7 +1269,7 @@ class XAIGenerator:
             ax.set_xticks([]); ax.set_yticks([])
             for spine in ax.spines.values():
                 spine.set_visible(False)
-            gt_idx = int(test_labels[j].item())
+            gt_idx = self._gt_label_index(test_labels[j])
             ax.set_title(
                 f"sample #{j}\nGT: {class_lookup(gt_idx)}",
                 fontsize=10, fontweight="bold", pad=4,
@@ -1481,6 +1481,24 @@ class XAIGenerator:
         with torch.no_grad():
             output = model(img)
         return predict_from_output(output)
+
+    @staticmethod
+    def _gt_label_index(label: torch.Tensor) -> int:
+        """Reduce a ground-truth label to a single class index.
+
+        Classification labels are already scalars. **Segmentation** labels
+        are ``[H, W]`` masks — there is no single GT class, so we report the
+        dominant non-ignore (≠255) class for the caption, which keeps the
+        Grad-CAM panel meaningful without crashing on ``.item()`` of a
+        multi-element tensor.
+        """
+        if label.numel() == 1:
+            return int(label.item())
+        flat = label.reshape(-1).long()
+        flat = flat[flat != 255]
+        if flat.numel() == 0:
+            return -1
+        return int(torch.bincount(flat).argmax().item())
 
     @staticmethod
     def _build_class_name_lookup(
