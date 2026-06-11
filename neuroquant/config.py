@@ -602,6 +602,13 @@ class QuantizationConfig:
     model_name: str = "mobilenetv2"
     model_path: Optional[str] = None  # Path to saved model weights
     model_class: Optional[str] = None  # Fully qualified class name
+    # Load torchvision's published pretrained weights (``weights="DEFAULT"``)
+    # instead of random init. For classification the ImageNet backbone is
+    # kept and the head is re-adapted for ``num_classes`` (needs
+    # fine-tuning). For segmentation/detection whose DEFAULT weights match
+    # ``num_classes`` (e.g. 21-class VOC DeepLabV3), the whole pretrained
+    # model is used — so the FP32 baseline is meaningful without training.
+    model_pretrained: bool = False
     num_classes: int = 10
     input_shape: Tuple[int, ...] = (3, 32, 32)
     # Task family the model targets.
@@ -784,6 +791,8 @@ class QuantizationConfig:
             config.model_path = model["path"]
         if "class" in model and model["class"]:
             config.model_class = model["class"]
+        if "pretrained" in model:
+            config.model_pretrained = bool(model["pretrained"])
         if "num_classes" in model:
             config.num_classes = model["num_classes"]
         if "input_shape" in model:
@@ -890,6 +899,7 @@ class QuantizationConfig:
                 "name": self.model_name,
                 "path": self.model_path,
                 "class": self.model_class,
+                "pretrained": self.model_pretrained,
                 "num_classes": self.num_classes,
                 "input_shape": list(self.input_shape),
                 "task": self.task,

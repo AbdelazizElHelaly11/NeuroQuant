@@ -36,49 +36,97 @@ def compute_topk_accuracy(
     data_loader: DataLoader,
     device: torch.device,
     k: int = 5,
+    *,
+    ignore_index: int = 255,
 ) -> Dict[str, float]:
     """
-    Compute top-1 and top-k accuracy on a dataset.
+    Top-1 / top-k accuracy, or segmentation **mIOU** when the model emits
+    per-pixel logits.
 
-    Handles num_classes < k by clamping k = min(k, num_classes).
-    Returns percentages in [0, 100].
+    The function dispatches on the *runtime* output shape, per batch, so
+    every accuracy consumer in the pipeline (the FP32 baseline, NSGA
+    fitness, method headlines) gets a meaningful "higher is better"
+    scalar without any per-call-site task plumbing:
 
-    Args:
-        model: Model to evaluate (moved to device automatically).
-        data_loader: Test/val DataLoader.
-        device: Compute device.
-        k: Maximum k for top-k (default 5).
+      * **Classification** — ``[B, C]`` logits → standard top-1 / top-k.
+        ``k`` is clamped to ``C`` (safe for CIFAR-10 with ``k=5`` etc.).
+      * **Segmentation** — ``OrderedDict({"out": [B, C, H, W]})`` (or a
+        bare ``[B, C, H, W]`` tensor). We accumulate a per-class
+        intersection/union confusion matrix and return **mIOU in the
+        ``top1`` slot** (so the same "higher = better" contract holds)
+        plus pixel accuracy in ``top5``; the explicit ``miou`` /
+        ``pixel_acc`` keys are also provided. ``ignore_index`` (255 by
+        convention, e.g. Pascal VOC boundary pixels) is excluded.
 
-    Returns:
-        {"top1": float, "top5": float}
-        "top5" key is always present but uses k=min(k, C).
+    Returns percentages in ``[0, 100]``. The ``top1`` / ``top5`` keys are
+    always present so task-agnostic callers keep working.
     """
     model.eval()
     model.to(device)
 
+    # Classification accumulators.
     correct_top1 = 0
     correct_topk = 0
     total = 0
-    actual_k = k  # Will be clamped on first batch
+    # Segmentation accumulators (lazily allocated on the first 4-D output).
+    seg = False
+    inter: Optional[torch.Tensor] = None
+    union: Optional[torch.Tensor] = None
+    pix_correct = 0
+    pix_total = 0
 
     with torch.no_grad():
         for batch in data_loader:
             images, labels = batch[0].to(device), batch[1].to(device)
             outputs = model(images)
 
-            # Clamp k to num_classes (safe for CIFAR-10 with k=5, or 3-class with k=5)
-            num_classes = outputs.shape[1]
-            actual_k = min(k, num_classes)
+            # Segmentation models return an OrderedDict; unwrap to the
+            # main per-pixel logits tensor.
+            if isinstance(outputs, dict):
+                outputs = outputs.get("out", next(iter(outputs.values())))
+            if not isinstance(outputs, torch.Tensor):
+                # e.g. a detection model's list-of-dicts — no top-k notion
+                # here; skip so the eval degrades gracefully rather than
+                # crashing on ``.shape``.
+                continue
 
-            # Top-1
-            _, pred_top1 = outputs.max(1)
-            correct_top1 += pred_top1.eq(labels).sum().item()
+            if outputs.dim() == 4:
+                # ── Segmentation: [B, C, H, W] → per-class IoU + pixel acc ──
+                seg = True
+                num_classes = outputs.shape[1]
+                if inter is None:
+                    inter = torch.zeros(num_classes, dtype=torch.float64, device=device)
+                    union = torch.zeros(num_classes, dtype=torch.float64, device=device)
+                pred = outputs.argmax(dim=1)                       # [B, H, W]
+                if labels.dim() == 4 and labels.size(1) == 1:
+                    labels = labels.squeeze(1)
+                labels = labels.long()
+                valid = labels != ignore_index
+                for c in range(num_classes):
+                    pred_c = (pred == c) & valid
+                    label_c = (labels == c) & valid
+                    inter[c] += (pred_c & label_c).sum()
+                    union[c] += (pred_c | label_c).sum()
+                pix_correct += int(((pred == labels) & valid).sum().item())
+                pix_total += int(valid.sum().item())
+            else:
+                # ── Classification: [B, C] → top-1 / top-k ──
+                num_classes = outputs.shape[1]
+                actual_k = min(k, num_classes)
+                _, pred_top1 = outputs.max(1)
+                correct_top1 += pred_top1.eq(labels).sum().item()
+                _, pred_topk = outputs.topk(actual_k, dim=1, largest=True, sorted=True)
+                correct_topk += pred_topk.eq(labels.unsqueeze(1)).any(dim=1).sum().item()
+                total += labels.size(0)
 
-            # Top-k
-            _, pred_topk = outputs.topk(actual_k, dim=1, largest=True, sorted=True)
-            correct_topk += pred_topk.eq(labels.unsqueeze(1)).any(dim=1).sum().item()
-
-            total += labels.size(0)
+    if seg and inter is not None and union is not None:
+        iou = inter / union.clamp(min=1.0)
+        present = union > 0          # ignore classes absent from this split
+        miou = float(iou[present].mean().item() * 100.0) if bool(present.any()) else 0.0
+        pix_acc = (pix_correct / max(pix_total, 1)) * 100.0
+        # mIOU rides in the ``top1`` slot so the pipeline's "higher is
+        # better" objective math (fp32 − quant) works unchanged.
+        return {"top1": miou, "top5": pix_acc, "miou": miou, "pixel_acc": pix_acc}
 
     top1 = (correct_top1 / max(total, 1)) * 100.0
     topk = (correct_topk / max(total, 1)) * 100.0
@@ -193,10 +241,11 @@ def evaluate_primary_metric(
     if task == "regression":
         return compute_regression_metrics(model, data_loader, device)
     # classification / detection / segmentation / nlp all funnel through
-    # the topk path. For detection/segmentation the caller is expected
-    # to compute task-native metrics separately (mAP, mIoU); the topk
-    # number is only used by NSGA's surrogate when explicit labels are
-    # present.
+    # ``compute_topk_accuracy``, which dispatches on the output shape:
+    # classification yields top-1, **segmentation yields mIOU** in the
+    # ``top1`` slot (so NSGA's ``fp32 − quant`` objective optimises the
+    # mIOU drop directly), and detection (a list output) degrades to a
+    # no-op there — compute mAP separately for detection.
     return compute_topk_accuracy(model, data_loader, device)
 
 

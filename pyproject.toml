@@ -19,7 +19,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neuroquant"
-version = "2.1.1"
+version = "2.2.0"
 description = "Production-grade neural-network quantization framework with NSGA + ONNX + hardware-aware search"
 readme = "README.md"
 requires-python = ">=3.10"

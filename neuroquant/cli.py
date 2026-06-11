@@ -936,6 +936,70 @@ class NeuroQuantPipeline:
                 f"(weight-only objective; no calib loader)"
             )
 
+        # ── Score the AdaRound model as a first-class method when QAT is
+        #    skipped ──
+        # Normally Phase 1e (QAT) starts from the AdaRound weights and the
+        # QAT result is the reported endpoint, so AdaRound itself is never
+        # evaluated. When the run omits ``phase_1e_qat`` (e.g. the
+        # segmentation experiments — QAT is not segmentation-aware),
+        # AdaRound IS the endpoint, so evaluate it and surface it in the
+        # Pareto + summary like any other method. Gated on the phase being
+        # absent so QAT-enabled (classification) runs are unchanged.
+        if "phase_1e_qat" not in self.config.run_phases:
+            ada_model = self.adaround_result.get("model")
+            if isinstance(ada_model, nn.Module):
+                from neuroquant.utils.common import compute_quantized_size_mb
+                ada_bw = self.adaround_config or self.best_config or {}
+                if self._is_mixed_bitwidth_assignment(ada_bw):
+                    ada_tag = "MIXED"
+                    ada_dom = self._dominant_bitwidth(ada_bw)
+                elif ada_bw:
+                    ada_dom = self._dominant_bitwidth(ada_bw)
+                    ada_tag = f"INT{ada_dom}"
+                else:
+                    ada_dom = max(self.config.supported_bitwidths)
+                    ada_tag = f"INT{ada_dom}"
+                ada_res: Dict[str, Any] = {
+                    "config_id": f"AdaRound_{ada_tag}",
+                    "display_name": f"AdaRound_{ada_tag}",
+                    "method": "AdaRound",
+                    "bitwidth": int(ada_dom),
+                    "bitwidth_assignment": dict(ada_bw),
+                    "ebops": self._ebops_from_bitwidth(ada_bw) if ada_bw else 0.0,
+                }
+                ada_size = (
+                    compute_quantized_size_mb(self.model, ada_bw) if ada_bw else 0.0
+                )
+                ada_res["model_size_mb"] = ada_size
+                ada_res["theoretical_size_mb"] = ada_size
+                # Headline accuracy from the test split (mIOU for seg).
+                self._attach_split_metrics(ada_res, ada_model)
+                self._export_method_to_onnx(ada_res, ada_model, ada_dom, ada_bw)
+                if not any(
+                    r.get("display_name") == ada_res["display_name"]
+                    for r in self.method_results
+                ):
+                    self.method_results.append(ada_res)
+                    lat = ada_res.get("latency") or {}
+                    onnx_lat = ada_res.get("onnx_latency") or {}
+                    self._add_summary_row(
+                        ada_res["display_name"],
+                        float(ada_res.get("accuracy", 0.0) or 0.0),
+                        float(lat.get("latency_mean_ms", 0.0) or 0.0),
+                        float(lat.get("throughput_fps", 0.0) or 0.0),
+                        ada_res["ebops"],
+                        ada_res.get("theoretical_size_mb", ada_size),
+                        onnx_size_mb=ada_res.get("onnx_size_mb"),
+                        onnx_latency_ms=onnx_lat.get("latency_mean_ms"),
+                        onnx_throughput_fps=onnx_lat.get("throughput_fps"),
+                    )
+                self.results["adaround_acc"] = ada_res.get("accuracy")
+                self.report_lines.append(
+                    f"[Phase 1d] AdaRound model scored: "
+                    f"acc={float(ada_res.get('accuracy', 0.0) or 0.0):.2f}%, "
+                    f"size={ada_size:.2f} MiB ({ada_tag})"
+                )
+
         # Checkpoint metadata also captures the reconstruction diagnostics
         # and objective components so they survive resume.
         adaround_meta = {

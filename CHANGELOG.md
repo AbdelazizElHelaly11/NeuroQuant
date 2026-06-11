@@ -4,6 +4,40 @@ All notable changes to NeuroQuant are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] — 2026-06-11
+
+End-to-end **semantic-segmentation** support and a ready-to-run Pascal
+VOC / DeepLabV3 experiment (replicates the AdaRound paper's Table 9).
+Previously segmentation was only partially wired (loss bridge + XAI);
+the accuracy path crashed on the `OrderedDict` output and there was no
+mIOU, no pretrained weights, and no VOC dataset.
+
+### Added
+- **Segmentation mIOU** — `compute_topk_accuracy` now dispatches on the
+  output shape: a `[B, C, H, W]` (or `OrderedDict({"out": …})`) output is
+  scored as per-class **mIOU in the `top1` slot** (+ pixel accuracy in
+  `top5`), ignoring label 255. So the FP32 baseline, NSGA fitness, and
+  every method headline get a real "higher is better" segmentation
+  metric with no per-call-site task plumbing. Classification is
+  unchanged.
+- **Pretrained weights** — new `model.pretrained` flag loads
+  torchvision's published `weights="DEFAULT"` (classification keeps the
+  ImageNet backbone + re-adapts the head; segmentation/detection whose
+  DEFAULT weights match `num_classes`, e.g. 21-class VOC DeepLabV3, use
+  the full pretrained model — so the FP32 baseline is meaningful without
+  training).
+- **Pascal VOC adapter** — `neuroquant.data.voc_segmentation.VOCSegmentationDataset`
+  reads the VOCdevkit layout directly with synchronized image+mask
+  resize (image→bilinear, mask→nearest) and ImageNet normalization;
+  `python -m neuroquant.data.voc_segmentation --download` fetches it on a
+  login node. Maps NeuroQuant's `split="train"/"test"` to VOC
+  `train`/`val` (the 1449-image val set becomes the held-out test split).
+- **AdaRound is scored as a first-class method when QAT is skipped** —
+  previously Phase 1d produced a refined model that only Phase 1e (QAT)
+  consumed, so with QAT disabled (e.g. segmentation, which QAT does not
+  support) AdaRound's accuracy was never reported. It now appears in the
+  Pareto + summary. QAT-enabled (classification) runs are unchanged.
+
 ## [2.1.1] — 2026-06-11
 
 Pipeline-audit fixes. Each item was confirmed against the source in
@@ -181,6 +215,7 @@ segmentation), and a documentation site at `docs/`.
   `(images_tensor, labels_tensor)` and `(images_list,
   targets_list_of_dicts)` batch shapes.
 
+[2.2.0]: https://github.com/AbdelazizElHelaly11/NeuroQuant/releases/tag/v2.2.0
 [2.1.1]: https://github.com/AbdelazizElHelaly11/NeuroQuant/releases/tag/v2.1.1
 [2.1.0]: https://github.com/AbdelazizElHelaly11/NeuroQuant/releases/tag/v2.1.0
 [2.0.0]: https://github.com/AbdelazizElHelaly11/NeuroQuant/releases/tag/v2.0.0

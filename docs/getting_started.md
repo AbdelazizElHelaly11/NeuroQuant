@@ -71,7 +71,7 @@ A clean install exposes a console-script *and* a flat Python API. Try both:
     ```pycon
     >>> from neuroquant import PTQQuantizer, __version__
     >>> __version__
-    '2.1.1'
+    '2.2.0'
     >>> PTQQuantizer  # quantizer class is importable
     <class 'neuroquant.quantization.ptq.PTQQuantizer'>
     ```

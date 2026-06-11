@@ -390,9 +390,13 @@ class ModelLoader:
                 f"{', '.join(sorted(available)[:20])}..."
             )
 
-        logger.info("  Loading torchvision model: %s", name_normalised)
+        weights = "DEFAULT" if self.config.model_pretrained else None
+        logger.info(
+            "  Loading torchvision model: %s%s", name_normalised,
+            " (pretrained=DEFAULT)" if weights else "",
+        )
         model_fn = getattr(tv_models, name_normalised)
-        model = model_fn(weights=None)
+        model = model_fn(weights=weights)
         return model
 
     def _load_torchvision_detection_model(self, name: str) -> nn.Module:
@@ -522,11 +526,30 @@ class ModelLoader:
                 f"{', '.join(sorted(available)[:20])}..."
             )
 
+        model_fn = getattr(tv_segmentation, name_normalised)
+
+        # ── Pretrained path ──
+        # Use torchvision's published weights as-is. We deliberately do
+        # NOT pass ``num_classes`` here — torchvision rejects it when it
+        # conflicts with the pretrained head, and the standard DeepLabV3 /
+        # FCN / LRASPP DEFAULT weights already ship a 21-class (Pascal-VOC)
+        # head, so the whole pretrained model is the FP32 baseline. The
+        # forward still returns ``OrderedDict({"out": ..., ["aux": ...]})``;
+        # only ``out`` is consumed downstream.
+        if self.config.model_pretrained:
+            logger.info(
+                "  Loading PRETRAINED segmentation weights (DEFAULT) for %s "
+                "(config num_classes=%d is informational; the pretrained head "
+                "defines the real class count).",
+                name_normalised, self.config.num_classes,
+            )
+            return model_fn(weights="DEFAULT")
+
         logger.info(
-            "  Loading torchvision segmentation model: %s (num_classes=%d)",
+            "  Loading torchvision segmentation model: %s (num_classes=%d, "
+            "random init — set model.pretrained: true for a real baseline)",
             name_normalised, self.config.num_classes,
         )
-        model_fn = getattr(tv_segmentation, name_normalised)
 
         # Build kwargs progressively: not every architecture accepts
         # every flag. Pass ``num_classes`` always; pass ``weights=None``
