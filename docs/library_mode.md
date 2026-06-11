@@ -163,36 +163,43 @@ training script:
 
 ```python
 from neuroquant import (
-    LayerClusterer, NSGAIIClusterSearch, QATTrainer,
+    QuantizationConfig, LayerClusterer, NSGAIIClusterSearch, QATTrainer,
 )
+from neuroquant.quantization.hessian_clustering import HessianComputer
 
-# 1. Hessian clustering — tells NSGA which layers are too sensitive
-#    to push below INT8.
-clusterer = LayerClusterer(config=None)
-hessian = clusterer.compute_hessian(model, calib_loader)
-cluster_result = clusterer.create_clusters(hessian)
+# The search, clusterer, and QAT trainer take a real config (unlike the
+# quantizers, they don't default ``config=None`` to ``QuantizationConfig()``).
+cfg = QuantizationConfig()
+
+# 1. Hessian / Fisher sensitivity, then cluster layers into
+#    HIGH / MEDIUM / LOW tiers — tells NSGA which layers are too
+#    sensitive to push below INT8.
+hessian = HessianComputer(model, cfg).compute_hessian(calib_loader)
+cluster_result = LayerClusterer(model, hessian, cfg).create_clusters()
 
 # 2. Surrogate-Assisted NSGA-II. Defaults to per-layer mode with
 #    sensitivity-weighted mutation. Returns a Pareto front of
-#    mixed-precision configs.
+#    mixed-precision configs. Score candidates on a held-out loader
+#    (the pipeline uses the dedicated ``search`` split — never test).
 nsga = NSGAIIClusterSearch(
     model,
     cluster_result["cluster_assignments"],
-    config=None,
+    cfg,
     hessian_diag=hessian,
 )
-pareto = nsga.search(val_loader, fp32_accuracy=92.5)
+pareto = nsga.search(search_loader, fp32_accuracy=92.5)
 best_config = pareto["solutions"][0]["bitwidth_assignment"]
 
-# 3. QAT fine-tune the winning config, with a knowledge-distillation
-#    teacher pointing at the FP32 baseline.
-qat = QATTrainer(model, config=None)
-qat_result = qat.run(
-    bitwidth_assignment=best_config,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    teacher_model=model,                # FP32 teacher
+# 3. QAT fine-tune the winning config, with the FP32 model as the
+#    knowledge-distillation teacher. The bitwidth assignment + teacher
+#    go to the constructor; ``train`` runs the loop and returns the
+#    best-val model.
+qat = QATTrainer(
+    model, best_config, cfg,
+    teacher=model,                 # FP32 teacher for KD
+    calib_loader=calib_loader,     # initialises the activation observers
 )
+qat_result = qat.train(train_loader, val_loader)
 final_model = qat_result["model"]
 ```
 
@@ -387,15 +394,23 @@ notebook for analysis:
 
 ```python
 import json
-from neuroquant import ParetoAnalyzer
 
 with open("artifacts/pareto_summary.json") as f:
-    pareto = json.load(f)
+    summary = json.load(f)
 
-analyzer = ParetoAnalyzer(pareto["solutions"], baseline_accuracy=92.5)
-knee = analyzer.find_knee_point()
-print(f"Knee solution: {knee['solution_id']} "
-      f"({knee['accuracy']:.2f}%, {knee['model_size_mb']:.2f} MiB)")
+print(f"FP32 baseline: {summary['fp32_top1']:.2f}% top-1, "
+      f"{summary['fp32_size_mb']:.2f} MiB · "
+      f"hypervolume {summary.get('hypervolume', 0):.3f}")
+
+# Pick the most compressed method within 1 pp of the best top-1 — the
+# same "knee" idea the CLI's ParetoAnalyzer applies, straight off the
+# summary the pipeline already wrote.
+methods = summary["methods"]
+best_top1 = max(m["top1"] for m in methods)
+within = [m for m in methods if best_top1 - m["top1"] <= 1.0]
+knee = min(within, key=lambda m: m.get("onnx_size_mb") or m["size_mb"])
+print(f"Knee method: {knee['method']} "
+      f"({knee['top1']:.2f}% top-1, {knee['size_mb']:.2f} MiB)")
 ```
 
 Or the inverse direction: do a quick standalone notebook experiment to

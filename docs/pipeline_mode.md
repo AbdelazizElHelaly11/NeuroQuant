@@ -138,7 +138,7 @@ ones:
     Set `task: detection` to also auto-export TensorRT / OpenVINO
     artefacts when the host has the backends installed.
 
-## 4 · The 10 phases, one by one
+## 4 · The 9 phases, one by one
 
 | Phase | Name                         | What it produces                                                                          |
 | ----- | ---------------------------- | ----------------------------------------------------------------------------------------- |
@@ -166,26 +166,29 @@ After a successful run the working directory looks like:
 
 ```
 artifacts/
-├── checkpoints/                # one JSON per phase — drives --resume
+├── checkpoints/                 # one JSON (+ .pth) per phase — drives --resume
 │   ├── phase_0_preparation.json
 │   ├── phase_1a_hessian_clustering.json
-│   ├── ...
-├── plots/                      # Pareto + sensitivity + bitwidth charts
-├── error_attribution/          # per-method per-layer error PNGs
-├── xai/                        # Grad-CAM heatmaps + comparison matrix
-├── onnx/                       # FP32 + INT8 ONNX exports per method
-│   ├── ptq_mixed.onnx
-│   ├── ptq_mixed.int8.onnx
 │   └── ...
+├── onnx/                        # FP32 + per-method INT8 .onnx files
+│   ├── PTQ_MIXED.fp32.onnx
+│   ├── PTQ_MIXED.int8.onnx
+│   └── ...
+├── pareto/                      # Pareto scatter / 3-D / bitwidth / table + JSON
+├── error_attribution/          # per-method per-layer error PNGs
+├── xai/                         # Grad-CAM / rollout heatmaps + comparison matrix
+├── sensitivity_heatmap.png       # Phase 1a sensitivity + tier distribution
+├── tier_distribution.png
 ├── pareto_summary.json
 ├── pipeline_report.txt
-└── report.html                 # opens in any browser
-mlruns/                         # MLflow tracking server data
+├── neuroquant_report.html        # self-contained, shareable HTML report
+└── reproducibility_manifest.json
+mlruns/  (or mlflow.db)          # MLflow tracking data — location set by output.mlflow_tracking_uri
 ```
 
-Open `artifacts/report.html` in a browser to read the run end-to-end —
-methods table, Pareto plots, sensitivity heatmap, XAI grid, error
-attribution per method, deployment fidelity caveats.
+Open `artifacts/neuroquant_report.html` in a browser to read the run
+end-to-end — methods table, Pareto plots, sensitivity heatmap, XAI grid,
+error attribution per method, deployment fidelity caveats.
 
 ## 6 · Common workflows
 
@@ -227,19 +230,23 @@ attribution per method, deployment fidelity caveats.
 
 ## 7 · MLflow integration
 
-NeuroQuant logs every phase as its own MLflow run, parented under the
-experiment named `neuroquant.<model_name>.<dataset_name>`. To browse:
+NeuroQuant logs every phase as its own MLflow run, grouped under the
+experiment named by `output.experiment_name` in your config (default
+`neuroquant_v2`). The tracking store comes from
+`output.mlflow_tracking_uri` (the legacy `./mlruns` file backend is
+auto-upgraded to `sqlite:///mlflow.db`). To browse:
 
 ```bash
-mlflow ui --backend-store-uri ./mlruns
-# or use the bundled wrapper:
+# Use the same URI your run wrote to:
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+# or use the bundled wrapper (defaults to sqlite:///mlflow.db, adds
+# optional LAN / tunnel presets):
 python scripts/serve_mlflow.py
 ```
 
 Each phase run carries phase-level metrics (e.g. `pareto_solutions`,
-`fit_compression`, `nsga_evaluations`) and pointers to the artefacts
-on disk; the `phase_4_summary` run aggregates the headline Pareto stats
-so MLflow's *Compare Runs* view becomes a one-click cross-experiment
-table.
+`nsga_evaluations`, `hypervolume`) and pointers to the artefacts on disk;
+the `phase_4_summary` run aggregates the headline Pareto stats so
+MLflow's *Compare Runs* view becomes a one-click cross-experiment table.
 
 [:octicons-arrow-right-24: Next: integrate the same quantizers into your own training script](library_mode.md)

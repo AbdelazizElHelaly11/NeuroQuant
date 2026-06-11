@@ -105,7 +105,7 @@ hide:
 
 ---
 
-## The 10-phase pipeline at a glance
+## The 9-phase pipeline at a glance
 
 ```mermaid
 flowchart LR
@@ -122,9 +122,12 @@ flowchart LR
     P0 --> P1a --> P1c --> P1d --> P1e --> P1f --> P2 --> P3 --> P4
 ```
 
-Every box is a standalone class you can import and call yourself
-([Library mode](library_mode.md)) — or just leave the orchestrator to it
-([Pipeline mode](pipeline_mode.md)).
+The phase IDs are intentionally non-contiguous — the old `phase_1b`
+FITCompress seed was removed (Hessian-tier clustering plus the in-loop
+surrogate cover it), so the pipeline runs **9 phases** and legacy
+checkpoints still resolve. Every box is a standalone class you can import
+and call yourself ([Library mode](library_mode.md)) — or just leave the
+orchestrator to it ([Pipeline mode](pipeline_mode.md)).
 
 ---
 
