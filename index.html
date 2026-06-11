@@ -448,10 +448,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#the-10-phase-pipeline-at-a-glance" class="md-nav__link">
+  <a href="#the-9-phase-pipeline-at-a-glance" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The 10-phase pipeline at a glance
+        The 9-phase pipeline at a glance
       
     </span>
   </a>
@@ -636,10 +636,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#the-10-phase-pipeline-at-a-glance" class="md-nav__link">
+  <a href="#the-9-phase-pipeline-at-a-glance" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The 10-phase pipeline at a glance
+        The 9-phase pipeline at a glance
       
     </span>
   </a>
@@ -778,7 +778,7 @@ NSGA-II search that preceded it.</p>
 </ul>
 </div>
 <hr />
-<h2 id="the-10-phase-pipeline-at-a-glance">The 10-phase pipeline at a glance<a class="headerlink" href="#the-10-phase-pipeline-at-a-glance" title="Permanent link">&para;</a></h2>
+<h2 id="the-9-phase-pipeline-at-a-glance">The 9-phase pipeline at a glance<a class="headerlink" href="#the-9-phase-pipeline-at-a-glance" title="Permanent link">&para;</a></h2>
 <pre class="mermaid"><code>flowchart LR
     P0[Phase 0&lt;br/&gt;Model + data prep]
     P1a[Phase 1a&lt;br/&gt;Hessian / Fisher&lt;br/&gt;clustering]
@@ -791,9 +791,12 @@ NSGA-II search that preceded it.</p>
     P4[Phase 4&lt;br/&gt;MLflow finalise&lt;br/&gt;+ HTML report]
 
     P0 --&gt; P1a --&gt; P1c --&gt; P1d --&gt; P1e --&gt; P1f --&gt; P2 --&gt; P3 --&gt; P4</code></pre>
-<p>Every box is a standalone class you can import and call yourself
-(<a href="library_mode/">Library mode</a>) — or just leave the orchestrator to it
-(<a href="pipeline_mode/">Pipeline mode</a>).</p>
+<p>The phase IDs are intentionally non-contiguous — the old <code>phase_1b</code>
+FITCompress seed was removed (Hessian-tier clustering plus the in-loop
+surrogate cover it), so the pipeline runs <strong>9 phases</strong> and legacy
+checkpoints still resolve. Every box is a standalone class you can import
+and call yourself (<a href="library_mode/">Library mode</a>) — or just leave the
+orchestrator to it (<a href="pipeline_mode/">Pipeline mode</a>).</p>
 <hr />
 <h2 id="quick-install">Quick install<a class="headerlink" href="#quick-install" title="Permanent link">&para;</a></h2>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>pip<span class="w"> </span>install<span class="w"> </span>neuroquant

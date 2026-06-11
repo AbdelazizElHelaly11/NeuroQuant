@@ -524,10 +524,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#4-the-10-phases-one-by-one" class="md-nav__link">
+  <a href="#4-the-9-phases-one-by-one" class="md-nav__link">
     <span class="md-ellipsis">
       
-        4 · The 10 phases, one by one
+        4 · The 9 phases, one by one
       
     </span>
   </a>
@@ -689,10 +689,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#4-the-10-phases-one-by-one" class="md-nav__link">
+  <a href="#4-the-9-phases-one-by-one" class="md-nav__link">
     <span class="md-ellipsis">
       
-        4 · The 10 phases, one by one
+        4 · The 9 phases, one by one
       
     </span>
   </a>
@@ -900,7 +900,7 @@ artefacts when the host has the backends installed.</p>
 </div>
 </div>
 </div>
-<h2 id="4-the-10-phases-one-by-one">4 · The 10 phases, one by one<a class="headerlink" href="#4-the-10-phases-one-by-one" title="Permanent link">&para;</a></h2>
+<h2 id="4-the-9-phases-one-by-one">4 · The 9 phases, one by one<a class="headerlink" href="#4-the-9-phases-one-by-one" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
 <tr>
@@ -968,25 +968,28 @@ checkpoints still resolve.</p>
 <h2 id="5-output-layout">5 · Output layout<a class="headerlink" href="#5-output-layout" title="Permanent link">&para;</a></h2>
 <p>After a successful run the working directory looks like:</p>
 <div class="language-text highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>artifacts/
-</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>├── checkpoints/                # one JSON per phase — drives --resume
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>├── checkpoints/                 # one JSON (+ .pth) per phase — drives --resume
 </span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>│   ├── phase_0_preparation.json
 </span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>│   ├── phase_1a_hessian_clustering.json
-</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>│   ├── ...
-</span><span id="__span-8-6"><a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>├── plots/                      # Pareto + sensitivity + bitwidth charts
-</span><span id="__span-8-7"><a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a>├── error_attribution/          # per-method per-layer error PNGs
-</span><span id="__span-8-8"><a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a>├── xai/                        # Grad-CAM heatmaps + comparison matrix
-</span><span id="__span-8-9"><a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a>├── onnx/                       # FP32 + INT8 ONNX exports per method
-</span><span id="__span-8-10"><a id="__codelineno-8-10" name="__codelineno-8-10" href="#__codelineno-8-10"></a>│   ├── ptq_mixed.onnx
-</span><span id="__span-8-11"><a id="__codelineno-8-11" name="__codelineno-8-11" href="#__codelineno-8-11"></a>│   ├── ptq_mixed.int8.onnx
-</span><span id="__span-8-12"><a id="__codelineno-8-12" name="__codelineno-8-12" href="#__codelineno-8-12"></a>│   └── ...
-</span><span id="__span-8-13"><a id="__codelineno-8-13" name="__codelineno-8-13" href="#__codelineno-8-13"></a>├── pareto_summary.json
-</span><span id="__span-8-14"><a id="__codelineno-8-14" name="__codelineno-8-14" href="#__codelineno-8-14"></a>├── pipeline_report.txt
-</span><span id="__span-8-15"><a id="__codelineno-8-15" name="__codelineno-8-15" href="#__codelineno-8-15"></a>└── report.html                 # opens in any browser
-</span><span id="__span-8-16"><a id="__codelineno-8-16" name="__codelineno-8-16" href="#__codelineno-8-16"></a>mlruns/                         # MLflow tracking server data
+</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>│   └── ...
+</span><span id="__span-8-6"><a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>├── onnx/                        # FP32 + per-method INT8 .onnx files
+</span><span id="__span-8-7"><a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a>│   ├── PTQ_MIXED.fp32.onnx
+</span><span id="__span-8-8"><a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a>│   ├── PTQ_MIXED.int8.onnx
+</span><span id="__span-8-9"><a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a>│   └── ...
+</span><span id="__span-8-10"><a id="__codelineno-8-10" name="__codelineno-8-10" href="#__codelineno-8-10"></a>├── pareto/                      # Pareto scatter / 3-D / bitwidth / table + JSON
+</span><span id="__span-8-11"><a id="__codelineno-8-11" name="__codelineno-8-11" href="#__codelineno-8-11"></a>├── error_attribution/          # per-method per-layer error PNGs
+</span><span id="__span-8-12"><a id="__codelineno-8-12" name="__codelineno-8-12" href="#__codelineno-8-12"></a>├── xai/                         # Grad-CAM / rollout heatmaps + comparison matrix
+</span><span id="__span-8-13"><a id="__codelineno-8-13" name="__codelineno-8-13" href="#__codelineno-8-13"></a>├── sensitivity_heatmap.png       # Phase 1a sensitivity + tier distribution
+</span><span id="__span-8-14"><a id="__codelineno-8-14" name="__codelineno-8-14" href="#__codelineno-8-14"></a>├── tier_distribution.png
+</span><span id="__span-8-15"><a id="__codelineno-8-15" name="__codelineno-8-15" href="#__codelineno-8-15"></a>├── pareto_summary.json
+</span><span id="__span-8-16"><a id="__codelineno-8-16" name="__codelineno-8-16" href="#__codelineno-8-16"></a>├── pipeline_report.txt
+</span><span id="__span-8-17"><a id="__codelineno-8-17" name="__codelineno-8-17" href="#__codelineno-8-17"></a>├── neuroquant_report.html        # self-contained, shareable HTML report
+</span><span id="__span-8-18"><a id="__codelineno-8-18" name="__codelineno-8-18" href="#__codelineno-8-18"></a>└── reproducibility_manifest.json
+</span><span id="__span-8-19"><a id="__codelineno-8-19" name="__codelineno-8-19" href="#__codelineno-8-19"></a>mlruns/  (or mlflow.db)          # MLflow tracking data — location set by output.mlflow_tracking_uri
 </span></code></pre></div>
-<p>Open <code>artifacts/report.html</code> in a browser to read the run end-to-end —
-methods table, Pareto plots, sensitivity heatmap, XAI grid, error
-attribution per method, deployment fidelity caveats.</p>
+<p>Open <code>artifacts/neuroquant_report.html</code> in a browser to read the run
+end-to-end — methods table, Pareto plots, sensitivity heatmap, XAI grid,
+error attribution per method, deployment fidelity caveats.</p>
 <h2 id="6-common-workflows">6 · Common workflows<a class="headerlink" href="#6-common-workflows" title="Permanent link">&para;</a></h2>
 <details class="example">
 <summary>Resume after a Phase 1f crash</summary>
@@ -1017,17 +1020,21 @@ fresh folder so MLflow runs stay separate, and launch:</p>
 </span></code></pre></div>
 </details>
 <h2 id="7-mlflow-integration">7 · MLflow integration<a class="headerlink" href="#7-mlflow-integration" title="Permanent link">&para;</a></h2>
-<p>NeuroQuant logs every phase as its own MLflow run, parented under the
-experiment named <code>neuroquant.&lt;model_name&gt;.&lt;dataset_name&gt;</code>. To browse:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>mlflow<span class="w"> </span>ui<span class="w"> </span>--backend-store-uri<span class="w"> </span>./mlruns
-</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="c1"># or use the bundled wrapper:</span>
-</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>python<span class="w"> </span>scripts/serve_mlflow.py
+<p>NeuroQuant logs every phase as its own MLflow run, grouped under the
+experiment named by <code>output.experiment_name</code> in your config (default
+<code>neuroquant_v2</code>). The tracking store comes from
+<code>output.mlflow_tracking_uri</code> (the legacy <code>./mlruns</code> file backend is
+auto-upgraded to <code>sqlite:///mlflow.db</code>). To browse:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="c1"># Use the same URI your run wrote to:</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>mlflow<span class="w"> </span>ui<span class="w"> </span>--backend-store-uri<span class="w"> </span>sqlite:///mlflow.db
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="c1"># or use the bundled wrapper (defaults to sqlite:///mlflow.db, adds</span>
+</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="c1"># optional LAN / tunnel presets):</span>
+</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a>python<span class="w"> </span>scripts/serve_mlflow.py
 </span></code></pre></div>
 <p>Each phase run carries phase-level metrics (e.g. <code>pareto_solutions</code>,
-<code>fit_compression</code>, <code>nsga_evaluations</code>) and pointers to the artefacts
-on disk; the <code>phase_4_summary</code> run aggregates the headline Pareto stats
-so MLflow's <em>Compare Runs</em> view becomes a one-click cross-experiment
-table.</p>
+<code>nsga_evaluations</code>, <code>hypervolume</code>) and pointers to the artefacts on disk;
+the <code>phase_4_summary</code> run aggregates the headline Pareto stats so
+MLflow's <em>Compare Runs</em> view becomes a one-click cross-experiment table.</p>
 <p><a href="../library_mode/"><span class="twemoji"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13.22 19.03a.75.75 0 0 1 0-1.06L18.19 13H3.75a.75.75 0 0 1 0-1.5h14.44l-4.97-4.97a.749.749 0 0 1 .326-1.275.75.75 0 0 1 .734.215l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0"/></svg></span> Next: integrate the same quantizers into your own training script</a></p>
 
 
