@@ -71,15 +71,17 @@ desktop.ini
 # ``data/`` itself is the *source* package (contains data_loader.py).
 # The downloaded datasets land *inside* ``data/`` at fixed paths that
 # torchvision and our synthetic loader use. Whitelist the source code
-# and ignore the rest.
-data/cifar-10-batches-py/
-data/cifar-100-python/
-data/cifar-10-python.tar.gz
-data/cifar-100-python.tar.gz
-data/MNIST/
-data/FashionMNIST/
-data/imagenet/
-data/imagefolder/
+# and ignore the rest. The ``**/`` prefix matches these dataset dirs at
+# any depth — including a stray ``neuroquant/data/cifar-10-batches-py/``
+# that torchvision can materialise next to the package.
+**/cifar-10-batches-py/
+**/cifar-100-python/
+**/cifar-10-python.tar.gz
+**/cifar-100-python.tar.gz
+**/MNIST/
+**/FashionMNIST/
+**/imagenet/
+**/imagefolder/
 *.tar.gz
 *.tar
 *.zip

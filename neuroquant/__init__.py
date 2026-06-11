@@ -26,7 +26,7 @@ pipeline themselves.
 
 from __future__ import annotations
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 # Re-export the configuration dataclass first because every other
 # public symbol depends on it (directly or transitively).

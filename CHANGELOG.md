@@ -4,6 +4,80 @@ All notable changes to NeuroQuant are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.1] — 2026-06-11
+
+Pipeline-audit fixes. Each item was confirmed against the source in
+this tree (the audit referenced a different layout, so every claim was
+re-verified before changing anything). No public API changed; defaults
+and behaviour are preserved except where a number was previously wrong.
+
+### Fixed
+- **FP32 baseline scored on the test split (C1)** — `phase_0` now
+  reports `fp32_acc` from the same `test_loader` every quantized
+  method uses for its headline, instead of the validation loader. The
+  FP32-vs-quantized comparison (and `accuracy_loss`) is now
+  apples-to-apples; the val number is retained as the diagnostic
+  `fp32_val_acc` (persisted to the phase-0 checkpoint and restored on
+  resume). Removes the systematic negative-`accuracy_loss` that
+  inflated apparent quantization gains (also addresses **M1**).
+- **Calibration runs on inference-time preprocessing (C3)** — PTQ /
+  GPTQ / AWQ / SmoothQuant scale search, Fisher sensitivity, and
+  AdaRound reconstruction now calibrate on an eval-transform view of
+  the training split (`_calib_dataset`) instead of the randomly
+  augmented training images. Applied to the torchvision and ImageFolder
+  loaders; loaders whose training data is already eval-transformed
+  (custom Dataset / synthetic / HuggingFace) are unaffected.
+- **Mixed-precision size/EBops reported correctly (N4)** — the PTQ
+  rerank now recomputes `ebops` from the real per-layer bitwidth
+  assignment, so a `PTQ_MIXED` config's INT4 layers actually show a
+  saving instead of reporting the same size as uniform INT8.
+- **PTQ quantizes Linear weights per-output-channel (N2)** — Linear
+  layers previously used a single per-tensor scale (much coarser than
+  the per-channel scheme GPTQ/AWQ use and fragile at INT4). Now
+  per-output-channel for both Conv2d and Linear; strictly lower
+  reconstruction error and the standard deployable scheme.
+- **QAT ONNX deployment fields survive resume (H4)** — `onnx_path`,
+  `onnx_size_mb`, and `onnx_latency` for the QAT method are now
+  persisted in the phase-1e checkpoint and restored on resume, so a
+  resumed run no longer reports `null` size/latency for QAT. The
+  resumed summary row also mirrors the original `QAT_MIXED` /
+  `QAT_INT8` label rule.
+- **`export_to_onnx` no longer strands the caller's model (N5)** — the
+  function moved the live model to CPU/eval in place and left it there;
+  it now captures and restores the original device + training mode in
+  a `finally`, even on export failure.
+- **In-pipeline FP32 training keeps the best-val weights (M8)** —
+  `--epochs N` reported the best validation accuracy but handed
+  downstream phases the last-epoch weights. The best-val `state_dict`
+  is now snapshotted and restored, so the model matches the reported
+  number.
+- **Hypervolume is computed in normalized objective space (M2)** —
+  accuracy-loss and EBops are each scaled to `[0, 1]` (consistent with
+  `compute_spacing`) before the dominated-area product, replacing the
+  dimensionally meaningless `points × bytes` value.
+- **Config load-time validation covers the choice fields (M5)** —
+  `validate()` now rejects invalid `nsga_search_mode`,
+  `smoothquant_alpha_strategy`, `awq_alpha_strategy`, and out-of-set
+  `supported_bitwidths` on the YAML/JSON load path (which bypasses the
+  pydantic field validators via `setattr`).
+- **Checkpoint loads surface skipped keys (L4)** — `ModelLoader`
+  loads with `strict=False` by design (adapted head), but now logs
+  missing / unexpected keys at WARNING so a genuinely mismatched
+  checkpoint is visible rather than silent.
+- **Model-agnostic latency note (H3, partial)** — the
+  `latency_backend_note` no longer hard-codes a depthwise-conv
+  rationale; it now describes the QDQ-overhead cause generically across
+  CNN and transformer op families.
+- **Consistent units + correct median (L1, L2)** —
+  `BaseQuantizer.evaluate` reports model size in binary MiB (1024²) to
+  match the rest of the pipeline; the Pareto summary and deployment
+  sections now use a true median (averaging the two middle elements for
+  even-length input) instead of the upper-middle element.
+- **Reproducible training data order (L8)** — the train DataLoader now
+  uses a seeded shuffle generator and a `worker_init_fn` that seeds each
+  worker's numpy/random stream, closing a determinism gap on multi-worker
+  (non-Windows) runs.
+
 ## [2.1.0] — 2026-06-07
 
 Multi-task expansion: regression, HuggingFace NLP, and Vision
@@ -107,5 +181,6 @@ segmentation), and a documentation site at `docs/`.
   `(images_tensor, labels_tensor)` and `(images_list,
   targets_list_of_dicts)` batch shapes.
 
+[2.1.1]: https://github.com/AbdelazizElHelaly11/NeuroQuant/releases/tag/v2.1.1
 [2.1.0]: https://github.com/AbdelazizElHelaly11/NeuroQuant/releases/tag/v2.1.0
 [2.0.0]: https://github.com/AbdelazizElHelaly11/NeuroQuant/releases/tag/v2.0.0

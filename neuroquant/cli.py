@@ -52,6 +52,22 @@ logging.basicConfig(
 logger = logging.getLogger("neuroquant.main")
 
 
+def _median(values: List[float]) -> float:
+    """True median: average the two middle elements for even-length input.
+
+    The previous ``sorted_v[len // 2]`` returned the upper-middle element,
+    biasing every even-length summary statistic high (L2).
+    """
+    s = sorted(values)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    if n % 2:
+        return float(s[mid])
+    return float((s[mid - 1] + s[mid]) / 2.0)
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Model & Data Builders
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -186,7 +202,12 @@ class NeuroQuantPipeline:
         # Dataset class names (optional, used by XAI captions).
         self.class_names: Optional[List[str]] = None
 
+        # ``fp32_acc`` is the public headline baseline — scored on the TEST
+        # split so it is directly comparable to every quantized method's
+        # headline (C1). ``fp32_val_acc`` keeps the validation number as an
+        # internal diagnostic only.
         self.fp32_acc: float = 0.0
+        self.fp32_val_acc: float = 0.0
         self.fp32_ebops: float = 0.0
 
         self.hessian_diag: Dict = {}
@@ -321,27 +342,40 @@ class NeuroQuantPipeline:
          self.test_loader, self.calib_loader,
          self.class_names) = build_data_loaders(self.config)
 
-        # Optional: Train baseline model
+        # Optional: Train baseline model. The value captured here is the
+        # validation accuracy (best-val when training); it is kept only as
+        # an internal diagnostic — the public headline is the TEST number
+        # computed below.
         if self.training_epochs > 0:
             logger.info("  Training FP32 baseline for %d epochs ...",
                          self.training_epochs)
             self.model.to(self.device)
-            self.fp32_acc = self._train_model(
+            self.fp32_val_acc = self._train_model(
                 self.model, self.train_loader, self.val_loader,
                 epochs=self.training_epochs,
             )
         else:
-            # Evaluate existing weights
+            # Evaluate existing weights on the val split (diagnostic only).
             self.model.to(self.device)
-            acc_dict = evaluate_model(
+            val_dict = evaluate_model(
                 self.model, self.val_loader, self.device
             )
-            self.fp32_acc = acc_dict["top1"]
+            self.fp32_val_acc = val_dict["top1"]
             logger.info("  Skipping training (use --epochs N to train)")
 
-        # FP32 top-5
-        fp32_acc_full = evaluate_model(self.model, self.val_loader, self.device)
-        self.fp32_top5 = fp32_acc_full["top5"]
+        # Headline FP32 accuracy is the TEST top-1 — the SAME split every
+        # quantized method reports its headline on (see
+        # ``_attach_split_metrics``). Previously the baseline was scored on
+        # val while methods reported test, so the FP32-vs-quantized
+        # comparison was apples-to-oranges and ``accuracy_loss`` could be
+        # systematically negative; evaluating both on test fixes it (C1).
+        fp32_test = evaluate_model(self.model, self.test_loader, self.device)
+        self.fp32_acc = fp32_test["top1"]
+        self.fp32_top5 = fp32_test["top5"]
+        logger.info(
+            "  FP32 baseline: test_top1=%.2f%% (val_top1=%.2f%% — diagnostic)",
+            self.fp32_acc, self.fp32_val_acc,
+        )
 
         # FP32 latency
         from neuroquant.utils.metrics import benchmark_latency, parse_hardware_report
@@ -465,10 +499,12 @@ class NeuroQuantPipeline:
             f"checkpoint={ckpt_path.name}"
         )
         self.results["fp32_acc"] = self.fp32_acc
+        self.results["fp32_val_acc"] = self.fp32_val_acc
 
         # Checkpoint
         self.ckpt.save_phase_full("phase_0_preparation", self.model, {
             "fp32_acc": self.fp32_acc,
+            "fp32_val_acc": self.fp32_val_acc,
             "fp32_top5": self.fp32_top5,
             "fp32_ebops": self.fp32_ebops,
             "fp32_size_mb": self.fp32_size_mb,
@@ -1081,6 +1117,11 @@ class NeuroQuantPipeline:
             "time_seconds": self.qat_result.get("time_seconds", 0.0),
             "qat_warmstart_source": self.results.get("qat_warmstart_source"),
             "qat_warmstart_id": self.results.get("qat_warmstart_id"),
+            # Persist the ONNX deployment fields so a resumed run shows the
+            # same real size/latency for QAT instead of nulls (H4).
+            "onnx_path": self.qat_result.get("onnx_path"),
+            "onnx_size_mb": self.qat_result.get("onnx_size_mb"),
+            "onnx_latency": self.qat_result.get("onnx_latency"),
         }
         qat_m = self.qat_result.get("model")
         if qat_m and isinstance(qat_m, nn.Module):
@@ -1884,6 +1925,7 @@ class NeuroQuantPipeline:
 
         data = self.ckpt.load_phase_json("phase_0_preparation")
         self.fp32_acc = float(data.get("fp32_acc", 0.0))
+        self.fp32_val_acc = float(data.get("fp32_val_acc", 0.0))
         self.fp32_top5 = float(data.get("fp32_top5", 0.0))
         self.fp32_ebops = float(data.get("fp32_ebops", 0.0))
         self.fp32_size_mb = float(data.get("fp32_size_mb", 0.0))
@@ -1891,6 +1933,7 @@ class NeuroQuantPipeline:
         self.fp32_onnx = data.get("fp32_onnx", {}) or {}
 
         self.results["fp32_acc"] = self.fp32_acc
+        self.results["fp32_val_acc"] = self.fp32_val_acc
         self.results["fp32_top5"] = self.fp32_top5
 
         # Recreate the FP32 row in the summary table for the final report.
@@ -2017,6 +2060,12 @@ class NeuroQuantPipeline:
             "val_accuracy": metadata.get("val_accuracy", []),
             "train_loss": metadata.get("train_loss", []),
             "time_seconds": float(metadata.get("time_seconds", 0.0)),
+            # ONNX deployment fields persisted by phase 1e (H4) so a
+            # resumed run reproduces QAT's real size/latency instead of
+            # showing null deployment numbers.
+            "onnx_path": metadata.get("onnx_path"),
+            "onnx_size_mb": metadata.get("onnx_size_mb"),
+            "onnx_latency": metadata.get("onnx_latency"),
         }
         self.results["qat_acc"] = self.qat_result["final_val_acc"]
         if self.qat_result.get("test_top1") is not None:
@@ -2032,10 +2081,15 @@ class NeuroQuantPipeline:
         # rebuilt ``pareto_summary.json`` matches the original run.
         from neuroquant.utils.common import compute_quantized_size_mb
         qat_bw = self.best_config or {}
-        qat_dom_bw = (
-            self._dominant_bitwidth(qat_bw) if qat_bw
-            else int(self.config.hyperparams.qat_act_bitwidth)
-        )
+        # Mirror the non-resume label rule: MIXED when both INT4 and INT8
+        # are present, else INT<dominant> — so a resumed report uses the
+        # same QAT row label as the original run.
+        if self._is_mixed_bitwidth_assignment(qat_bw):
+            qat_tag = "MIXED"
+        elif qat_bw:
+            qat_tag = f"INT{self._dominant_bitwidth(qat_bw)}"
+        else:
+            qat_tag = f"INT{int(self.config.hyperparams.qat_act_bitwidth)}"
         qat_size_mb = (
             compute_quantized_size_mb(self.model, qat_bw) if qat_bw else 0.0
         )
@@ -2045,13 +2099,25 @@ class NeuroQuantPipeline:
             if self.qat_result.get("test_top1") is not None
             else float(self.qat_result.get("final_val_acc", 0.0) or 0.0)
         )
+        # Reuse the persisted ONNX latency/size so the resumed row matches
+        # the original (H4): the Size column prefers the real on-disk ONNX
+        # size when available, exactly like the non-resume path.
+        qat_onnx_lat = self.qat_result.get("onnx_latency") or {}
+        qat_size_col = (
+            self.qat_result.get("onnx_size_mb")
+            if self.qat_result.get("onnx_size_mb") is not None
+            else qat_size_mb
+        )
         self._add_summary_row(
-            f"QAT_INT{qat_dom_bw}",
+            f"QAT_{qat_tag}",
             qat_headline_acc,
-            0.0,  # latency not persisted in qat_meta
-            0.0,
+            float(qat_onnx_lat.get("latency_mean_ms", 0.0) or 0.0),
+            float(qat_onnx_lat.get("throughput_fps", 0.0) or 0.0),
             qat_ebops,
-            qat_size_mb,
+            qat_size_col,
+            onnx_size_mb=self.qat_result.get("onnx_size_mb"),
+            onnx_latency_ms=qat_onnx_lat.get("latency_mean_ms"),
+            onnx_throughput_fps=qat_onnx_lat.get("throughput_fps"),
         )
 
     def _resume_phase_1f_gptq_smooth_awq(self) -> None:
@@ -2342,6 +2408,7 @@ class NeuroQuantPipeline:
         )
 
         best_acc = 0.0
+        best_state: Optional[Dict[str, Any]] = None
         for epoch in range(1, epochs + 1):
             model.train()
             running_loss = 0.0
@@ -2414,7 +2481,13 @@ class NeuroQuantPipeline:
                 train_acc = correct / max(total, 1) * 100
                 val_dict = evaluate_model(model, val_loader, self.device)
                 val_acc = val_dict["top1"]
-                best_acc = max(best_acc, val_acc)
+                if val_acc > best_acc:
+                    best_acc = val_acc
+                    # Snapshot the best-val weights so the model we keep
+                    # matches the accuracy we report (M8). Without this the
+                    # baseline trained to ``best_acc`` but handed every
+                    # downstream phase the LAST-epoch weights instead.
+                    best_state = copy.deepcopy(model.state_dict())
                 logger.info(
                     "  Epoch %d/%d: loss=%.4f, train_acc=%.2f%%, val_acc=%.2f%%",
                     epoch, epochs, train_loss, train_acc, val_acc,
@@ -2427,6 +2500,15 @@ class NeuroQuantPipeline:
                     epoch, epochs, train_loss, task,
                 )
             scheduler.step()
+
+        # Restore the best-val weights (classification only — other tasks
+        # have no scalar val metric to select on at this layer, so they
+        # keep their last-epoch weights as before).
+        if best_state is not None:
+            model.load_state_dict(best_state)
+            logger.info(
+                "  Restored best-val FP32 weights (val_top1=%.2f%%).", best_acc,
+            )
 
         return best_acc
 
@@ -2585,6 +2667,12 @@ class NeuroQuantPipeline:
             res["bitwidth"] = int(dom_bw)
             res["bitwidth_assignment"] = assignment
             res["model_size_mb"] = compute_quantized_size_mb(self.model, assignment)
+            # ``evaluate`` filled ``ebops`` at a single uniform bitwidth, so
+            # a MIXED config's INT4 layers showed no saving (e.g.
+            # PTQ_MIXED.ebops == GPTQ_INT8.ebops). Recompute from the real
+            # per-layer assignment so the size/ebops objective reflects the
+            # mixed precision — matching how QAT already reports it (N4).
+            res["ebops"] = self._ebops_from_bitwidth(assignment)
             materialized.append(res)
             models.append(q_model)
             logger.info(
@@ -3121,22 +3209,21 @@ class NeuroQuantPipeline:
         def _stats(values: List[float]) -> Dict[str, float]:
             if not values:
                 return {}
-            sorted_v = sorted(values)
             return {
-                "best": min(sorted_v),
-                "median": sorted_v[len(sorted_v) // 2],
-                "worst": max(sorted_v),
+                "best": min(values),
+                "median": _median(values),
+                "worst": max(values),
             }
 
-        # Top-1 stats are best=max not min; handle separately.
+        # Top-1 stats are best=max not min; handle separately. ``_median``
+        # is order-independent, so the same helper gives the true median.
         top1_vals = [float(r["top1"]) for r in method_rows if r.get("top1") is not None]
         top1_stats: Dict[str, float] = {}
         if top1_vals:
-            sorted_top1 = sorted(top1_vals, reverse=True)
             top1_stats = {
-                "best": sorted_top1[0],
-                "median": sorted_top1[len(sorted_top1) // 2],
-                "worst": sorted_top1[-1],
+                "best": max(top1_vals),
+                "median": _median(top1_vals),
+                "worst": min(top1_vals),
             }
 
         size_stats = _stats(
@@ -3219,11 +3306,16 @@ class NeuroQuantPipeline:
                 "ort_providers_available": providers,
                 "methods_slower_than_fp32": slower,
                 "note": (
-                    "ORT QInt8 on CPU is not faster than FP32 for every "
-                    "model. Depthwise convolutions in particular lack a "
-                    "fast INT8 kernel, so methods listed in "
-                    "'methods_slower_than_fp32' are slower in this "
-                    "deployment-runtime measurement. Quote the backend "
+                    "ORT QInt8 is not always faster than FP32: the QDQ "
+                    "(quantize/dequantize) nodes add overhead that can "
+                    "exceed the INT8 compute saving for small or "
+                    "memory-bound ops. On CPU this commonly affects "
+                    "depthwise convolutions (CNN backbones) and the small "
+                    "MatMul / attention projections in transformers — so "
+                    "the explanation is op-family- and provider-dependent, "
+                    "not a single fixed cause. Methods listed in "
+                    "'methods_slower_than_fp32' were slower in this "
+                    "deployment-runtime measurement; quote the backend "
                     "(provider) and op family when comparing latencies."
                 ),
             }
@@ -3311,8 +3403,7 @@ class NeuroQuantPipeline:
                 f"{'' if len(size_ratios) == 1 else 's'})"
             )
         if latencies:
-            sorted_lat = sorted(latencies)
-            median = sorted_lat[len(sorted_lat) // 2]
+            median = _median(latencies)
             line = f"    Median quantized ORT latency: {median:>5.2f} ms"
             if fp32_onnx_lat:
                 speedup = fp32_onnx_lat / max(median, 1e-9)

@@ -978,6 +978,13 @@ class QuantizationConfig:
         # ── Bitwidths ──
         if not self.supported_bitwidths:
             errors.append("supported_bitwidths must not be empty.")
+        else:
+            for bw in self.supported_bitwidths:
+                if int(bw) not in (4, 8):
+                    errors.append(
+                        f"supported_bitwidths contains invalid {bw}; "
+                        "the framework only has backends for 4 and 8."
+                    )
         if self.io_layer_bitwidth not in [4, 8, 16, 32]:
             errors.append(f"io_layer_bitwidth={self.io_layer_bitwidth} is invalid.")
 
@@ -994,6 +1001,31 @@ class QuantizationConfig:
             errors.append("nsga_population_size must be >= 4.")
         if hp.nsga_generations < 1:
             errors.append("nsga_generations must be >= 1.")
+        if str(hp.nsga_search_mode).lower().strip() not in ("per_layer", "cluster"):
+            errors.append(
+                f"nsga_search_mode='{hp.nsga_search_mode}' invalid. "
+                "Use 'per_layer' or 'cluster'."
+            )
+
+        # ── α-search strategies (SmoothQuant / AWQ) ──
+        # These have pydantic field validators, but the YAML/JSON load
+        # path copies values onto a default-constructed config via
+        # ``setattr``, which bypasses field validation. The load-time
+        # guarantee for these choice fields therefore rests on the
+        # explicit checks below (downstream code lower-cases the value, so
+        # case variations are accepted here too).
+        if str(hp.smoothquant_alpha_strategy).lower().strip() not in (
+            "closed_form", "grid",
+        ):
+            errors.append(
+                f"smoothquant_alpha_strategy='{hp.smoothquant_alpha_strategy}' "
+                "invalid. Use 'closed_form' or 'grid'."
+            )
+        if str(hp.awq_alpha_strategy).lower().strip() not in ("golden", "grid"):
+            errors.append(
+                f"awq_alpha_strategy='{hp.awq_alpha_strategy}' invalid. "
+                "Use 'golden' or 'grid'."
+            )
 
         # ── Clustering ──
         if not (0 < hp.cluster_low_percentile < hp.cluster_high_percentile < 1):

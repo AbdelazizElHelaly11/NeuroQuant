@@ -217,13 +217,19 @@ class ParetoAnalyzer:
 
     def compute_hypervolume(self) -> float:
         """
-        Compute 2D hypervolume (area dominated by the Pareto front).
+        Compute the 2D hypervolume in NORMALISED objective space.
 
-        Uses the correct incremental algorithm (not the spec's naive
-        sum which double-counts overlapping rectangles).
+        Both objectives (accuracy_loss, ebops) are first scaled to [0, 1]
+        by their observed range across the front — consistent with
+        ``compute_spacing`` — and only then multiplied into the dominated
+        area. The previous version multiplied raw accuracy-loss (points)
+        by raw ebops (bytes, ~1e8), producing a dimensionally meaningless
+        number that couldn't be compared across runs (M2).
 
-        Objectives: minimise accuracy_loss, minimise ebops.
-        Reference point: (max_loss + margin, max_ebops + margin).
+        Objectives are minimised; the reference point sits at 1.1 on each
+        normalised axis (just past the worst solution), so a denser,
+        closer-to-origin front yields a larger HV in a comparable
+        [0, ~1.21] range.
         """
         if not self.public_solutions:
             return 0.0
@@ -231,23 +237,31 @@ class ParetoAnalyzer:
         losses = [s.get("accuracy_loss", 0.0) for s in self.public_solutions]
         ebops_vals = [s.get("ebops", 0.0) for s in self.public_solutions]
 
-        # Reference point: worst case + 10% margin
-        ref_loss = max(losses) * 1.1 + 1.0
-        ref_ebops = max(ebops_vals) * 1.1 + 1.0
+        loss_min, loss_max = min(losses), max(losses)
+        ebops_min, ebops_max = min(ebops_vals), max(ebops_vals)
+        loss_range = (loss_max - loss_min) or 1.0
+        ebops_range = (ebops_max - ebops_min) or 1.0
 
-        # Sort by accuracy_loss (ascending)
-        points = sorted(zip(losses, ebops_vals), key=lambda p: p[0])
+        # Normalise each objective to [0, 1]; reference point at 1.1.
+        ref = 1.1
+        points = sorted(
+            (
+                (
+                    (loss - loss_min) / loss_range,
+                    (ebops - ebops_min) / ebops_range,
+                )
+                for loss, ebops in zip(losses, ebops_vals)
+            ),
+            key=lambda p: p[0],
+        )
 
-        # Incremental hypervolume: sweep from left to right
+        # Incremental hypervolume: sweep from left to right.
         hv = 0.0
-        prev_ebops = ref_ebops
-
-        for loss, ebops in points:
-            if ebops < prev_ebops:
-                width = ref_loss - loss
-                height = prev_ebops - ebops
-                hv += width * height
-                prev_ebops = ebops
+        prev_ebops = ref
+        for n_loss, n_ebops in points:
+            if n_ebops < prev_ebops:
+                hv += (ref - n_loss) * (prev_ebops - n_ebops)
+                prev_ebops = n_ebops
 
         return hv
 

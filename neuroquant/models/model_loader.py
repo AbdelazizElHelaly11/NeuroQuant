@@ -559,8 +559,32 @@ class ModelLoader:
         elif isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
 
-        model.load_state_dict(state, strict=False)
-        logger.info("  Checkpoint loaded successfully.")
+        # ``strict=False`` is intentional: the classifier head is adapted
+        # (replaced) before this load, so the checkpoint's original head
+        # tensors are deliberately skipped on a size mismatch and the
+        # freshly-initialised head is kept. But silently dropping keys can
+        # also mask a genuinely wrong checkpoint, so surface what did not
+        # line up at WARNING instead of hiding it (L4).
+        incompatible = model.load_state_dict(state, strict=False)
+        missing = list(getattr(incompatible, "missing_keys", []) or [])
+        unexpected = list(getattr(incompatible, "unexpected_keys", []) or [])
+        if missing:
+            logger.warning(
+                "  Checkpoint did not provide %d parameter(s); kept "
+                "initialised values: %s%s",
+                len(missing), missing[:8],
+                " ..." if len(missing) > 8 else "",
+            )
+        if unexpected:
+            logger.warning(
+                "  Checkpoint had %d unexpected key(s) (ignored): %s%s",
+                len(unexpected), unexpected[:8],
+                " ..." if len(unexpected) > 8 else "",
+            )
+        logger.info(
+            "  Checkpoint loaded (missing=%d, unexpected=%d).",
+            len(missing), len(unexpected),
+        )
 
     # ------------------------------------------------------------------
     # Name normalisation

@@ -19,6 +19,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset, random_split
 
@@ -53,6 +54,24 @@ except ImportError:
 # Detection collate function (module-level so it pickles cleanly across
 # DataLoader workers on platforms that use spawn instead of fork).
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _seed_worker(worker_id: int) -> None:
+    """Seed numpy + python RNG per DataLoader worker for reproducibility.
+
+    The torch RNG is forked deterministically by the DataLoader from its
+    ``generator``, but augmentation that draws from ``numpy.random`` /
+    ``random`` (not torch) would otherwise get an unseeded stream in each
+    worker — making multi-worker runs non-reproducible despite
+    ``set_seed``. Windows forces ``num_workers=0`` so this only matters on
+    POSIX, but wiring it makes the strict-determinism contract hold there
+    too (L8).
+    """
+    import random as _random
+
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    _random.seed(worker_seed)
 
 
 def detection_collate_fn(batch: List[Any]) -> Tuple[Tuple[Any, ...], ...]:
@@ -143,6 +162,15 @@ class GenericDatasetLoader:
         # fitness measurements are not corrupted by random augmentation
         # and the public ``test`` set is never touched during search.
         self._search_dataset: Optional[Dataset] = None
+        # Eval-transform view of the training split used for calibration
+        # (PTQ/GPTQ/AWQ scale search, Fisher sensitivity, AdaRound
+        # reconstruction). Built by the loaders whose training transform
+        # augments (torchvision, ImageFolder) so calibration always sees
+        # inference-time preprocessing, never RandomCrop/flip/jitter (C3).
+        # Stays ``None`` for loaders whose training data is already
+        # eval-transformed (custom Dataset class, synthetic, HuggingFace),
+        # where ``get_calibration_loader`` falls back to ``_train_dataset``.
+        self._calib_dataset: Optional[Dataset] = None
 
         self._load()
 
@@ -557,6 +585,11 @@ class GenericDatasetLoader:
         self._train_dataset = Subset(full_train_aug, train_idx)
         self._search_dataset = Subset(full_train_eval, search_idx)
         self._val_dataset = Subset(full_train_eval, val_idx)
+        # Calibration draws the SAME training samples but through the
+        # deterministic eval transform (C3): the underlying dataset has a
+        # fixed sample order, so ``train_idx`` selects identical images to
+        # ``full_train_aug`` minus the random augmentation.
+        self._calib_dataset = Subset(full_train_eval, train_idx)
 
         logger.info(
             "Loaded %s: train=%d, search=%d, val=%d, test=%d (spatial=%dx%d)",
@@ -624,6 +657,20 @@ class GenericDatasetLoader:
                 ) = self._split_train_search_val(full_train)
         else:
             raise FileNotFoundError(f"ImageFolder train dir not found: {train_dir}")
+
+        # Eval-transform calibration view aligned to the train split (C3):
+        # re-open the same train directory with the non-augmenting
+        # transform, then mirror whatever Subset indices the train split
+        # ended up with so calibration sees inference-time preprocessing.
+        full_train_eval = torchvision.datasets.ImageFolder(
+            str(train_dir), transform=eval_transform,
+        )
+        if isinstance(self._train_dataset, Subset):
+            self._calib_dataset = Subset(
+                full_train_eval, self._train_dataset.indices,
+            )
+        else:
+            self._calib_dataset = full_train_eval
 
         if test_dir and test_dir.exists():
             self._test_dataset = torchvision.datasets.ImageFolder(
@@ -815,11 +862,20 @@ class GenericDatasetLoader:
         instead of the default stacker that would crash on the
         variable box count.
         """
+        # Seed the shuffle RNG so epoch ordering is reproducible, and seed
+        # each worker's numpy/random stream so any non-torch augmentation
+        # is too — part of the strict-determinism contract ``set_seed``
+        # advertises (L8). ``worker_init_fn`` is only meaningful when
+        # workers are actually forked.
+        gen = torch.Generator()
+        gen.manual_seed(self.split_seed)
         return DataLoader(
             self._train_dataset, batch_size=self.batch_size,
             shuffle=True, num_workers=self.num_workers,
             pin_memory=False,
             collate_fn=self._collate_fn(),
+            generator=gen,
+            worker_init_fn=_seed_worker if self.num_workers > 0 else None,
         )
 
     def get_val_loader(self) -> DataLoader:
@@ -893,8 +949,17 @@ class GenericDatasetLoader:
         the contract every quantizer expects from the rest of the
         pipeline.
         """
-        n_samples = min(num_batches * self.batch_size, len(self._train_dataset))
-        subset = Subset(self._train_dataset, list(range(n_samples)))
+        # Prefer the eval-transform calibration view when the loader built
+        # one (torchvision / ImageFolder). Falls back to the training
+        # dataset for loaders whose training data is already
+        # eval-transformed (custom Dataset class / synthetic / HuggingFace),
+        # so calibration never runs on randomly-augmented images (C3).
+        calib_source = (
+            self._calib_dataset if self._calib_dataset is not None
+            else self._train_dataset
+        )
+        n_samples = min(num_batches * self.batch_size, len(calib_source))
+        subset = Subset(calib_source, list(range(n_samples)))
         return DataLoader(
             subset, batch_size=self.batch_size,
             shuffle=False, num_workers=self.num_workers,

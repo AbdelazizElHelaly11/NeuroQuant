@@ -378,7 +378,15 @@ class PTQQuantizer(BaseQuantizer):
                 # The calibration observer is retained for diagnostics
                 # and as a future hook for activation quantization, but
                 # it must NOT drive the weight scale.
-                per_channel = isinstance(module, nn.Conv2d)
+                # Per-output-channel (channel_dim=0) symmetric quant for
+                # BOTH Conv2d and Linear. Per-tensor on Linear (the old
+                # behaviour) was needlessly coarse for Linear-heavy models
+                # (transformers / MLPs) and inconsistent with GPTQ/AWQ,
+                # which both quantize Linear per-output-channel. Per-channel
+                # is strictly finer-grained, so reconstruction error can
+                # only drop, and per-output-channel INT8/INT4 weights are
+                # exactly what ORT / TensorRT deploy (N2).
+                per_channel = isinstance(module, (nn.Conv2d, nn.Linear))
                 param.data = self.quantize_tensor(
                     param.data, bitwidth=bw,
                     per_channel=per_channel, channel_dim=0,

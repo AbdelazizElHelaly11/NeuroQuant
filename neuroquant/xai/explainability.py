@@ -469,17 +469,24 @@ class SHAPExplainer:
             explainer = shap.GradientExplainer(self.model, bg)
             shap_values = explainer.shap_values(img)
 
-            # shap_values is a list (one per class); take predicted class
             with torch.no_grad():
                 pred = self.model(img).argmax(dim=1).item()
 
+            # Normalise across SHAP versions to a single ``[C, H, W]`` map:
+            #   * old SHAP → a per-class ``list`` of ``[1, C, H, W]`` arrays;
+            #   * newer SHAP → one ``ndarray`` with a trailing class axis,
+            #     ``[1, C, H, W, n_classes]`` (or no class axis for a single
+            #     output). Selecting the predicted class collapses that axis
+            #     so the downstream plotter always receives ``[C, H, W]`` and
+            #     never a 4-D array (which ``imshow`` rejects).
             if isinstance(shap_values, list):
-                sv = shap_values[pred]
+                sv = np.array(shap_values[pred])[0]
             else:
-                sv = shap_values
-
-            # sv shape: [1, C, H, W] -> [C, H, W]
-            return np.array(sv[0])
+                arr = np.array(shap_values)[0]
+                if arr.ndim == 4:  # trailing class axis present
+                    arr = arr[..., min(int(pred), arr.shape[-1] - 1)]
+                sv = arr
+            return sv
 
         except Exception as e:
             logger.warning("SHAP computation failed: %s. Using fallback.", e)

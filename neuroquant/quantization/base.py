@@ -107,9 +107,12 @@ class BaseQuantizer(abc.ABC):
         top1 = acc["top1"]
         top5 = acc["top5"]
 
-        # EBops and model size
+        # EBops (bytes) and model size. Use the binary MiB convention
+        # (1024²) so this matches ``compute_quantized_size_mb`` and the
+        # size reported everywhere else in the pipeline — the previous
+        # decimal ``/1e6`` here was a ~4.6% mismatch on the same quantity (L1).
         ebops = self._compute_ebops(model, bitwidth)
-        model_size_mb = ebops / 1e6
+        model_size_mb = ebops / (1024.0 * 1024.0)
 
         # Latency
         hp = self.config.hyperparams

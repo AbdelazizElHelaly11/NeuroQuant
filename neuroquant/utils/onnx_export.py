@@ -124,6 +124,17 @@ def export_to_onnx(
     # Trace on CPU. Quantized models containing custom modules
     # (SmoothQuant input-scale wrappers, AWQ wrappers) trace fine — the
     # wrapper's forward is pure tensor ops.
+    # ``.to()`` / ``.eval()`` mutate an nn.Module in place, so moving the
+    # caller's live model to CPU for tracing would otherwise leave it on
+    # CPU in eval mode afterwards — a latent device-mismatch trap (N5).
+    # Capture the original device + training mode and restore them once
+    # tracing is done (in the ``finally`` below).
+    try:
+        orig_device = next(model.parameters()).device
+    except StopIteration:
+        orig_device = torch.device("cpu")
+    was_training = model.training
+
     model_cpu = model.to("cpu").eval()
     dummy = torch.randn(batch_size, *input_shape)
 
@@ -149,13 +160,21 @@ def export_to_onnx(
         dynamic_axes=dynamic_axes,
     )
     try:
-        torch.onnx.export(
-            model_cpu, dummy, str(out),
-            dynamo=False, **export_kwargs,
-        )
-    except TypeError:
-        # torch < 2.5 doesn't accept the ``dynamo`` kwarg.
-        torch.onnx.export(model_cpu, dummy, str(out), **export_kwargs)
+        try:
+            torch.onnx.export(
+                model_cpu, dummy, str(out),
+                dynamo=False, **export_kwargs,
+            )
+        except TypeError:
+            # torch < 2.5 doesn't accept the ``dynamo`` kwarg.
+            torch.onnx.export(model_cpu, dummy, str(out), **export_kwargs)
+    finally:
+        # Restore the caller's model to its original device + mode even if
+        # the export raised, so a failed export never strands the model
+        # on CPU/eval for the next phase.
+        model.to(orig_device)
+        if was_training:
+            model.train()
     logger.info(
         "ONNX export: %s (opset=%d, dynamic_batch=%s, %d bytes)",
         out.name, opset, dynamic_batch, out.stat().st_size,

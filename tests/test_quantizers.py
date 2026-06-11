@@ -25,8 +25,11 @@ def test_ptq_int8_runs_config_less(toy_model, toy_loader) -> None:
     q_model = quantizer.quantize(toy_loader, bitwidth=8)
     assert isinstance(q_model, nn.Module)
     # Forward pass on a fresh batch — checks that the returned module
-    # is actually callable, not just constructed.
+    # is actually callable, not just constructed. The quantizer places
+    # the model on its (auto-selected) device, so feed the batch on the
+    # same device — keeps the smoke test correct on both CPU and GPU.
     images, _ = next(iter(toy_loader))
+    images = images.to(next(q_model.parameters()).device)
     with torch.no_grad():
         out = q_model(images)
     assert out.shape == (images.size(0), 4)
@@ -36,6 +39,7 @@ def test_ptq_int4_runs(toy_model, toy_loader) -> None:
     """INT4 path — uses the same wrapper but exercises the lower bitwidth."""
     q_model = PTQQuantizer(toy_model).quantize(toy_loader, bitwidth=4)
     images, _ = next(iter(toy_loader))
+    images = images.to(next(q_model.parameters()).device)
     with torch.no_grad():
         q_model(images)
 
