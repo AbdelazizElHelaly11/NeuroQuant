@@ -311,7 +311,13 @@ class HyperparameterSet:
     nsga_sensitivity_weighted_mutation: bool = True
 
     # Adaround
-    adaround_epochs: int = 100
+    # epochs = per-layer training steps (ordered mode) or global training
+    # epochs (parallel mode). The paper (Nagel et al. 2020) uses 10k–20k
+    # iterations; 200 epochs on an A100 takes ~5 min for a 36-layer model
+    # and gives the sigmoid rounding variables enough steps to converge.
+    # The previous default of 100 was insufficient for INT4-heavy configs
+    # and caused near-random accuracy in the segmentation experiments.
+    adaround_epochs: int = 200
     adaround_lr: float = 0.0001
     adaround_reg_param: float = 0.01  # lambda for entropy regularizer
     # Ordered (canonical) AdaRound: iterate target layers in topological
@@ -354,6 +360,17 @@ class HyperparameterSet:
     # softens the teacher distribution. ``alpha=0`` disables KD.
     qat_distill_alpha: float = 0.5
     qat_distill_temperature: float = 4.0
+
+    # ── Task-specific QAT knobs ───────────────────────────────────────────
+    # Segmentation: weight applied to the auxiliary head loss (e.g. the
+    # ``"aux"`` branch in DeepLabV3+ / FCN). Set to 0.0 to use the main
+    # head only. Standard DeepLabV3 training uses 0.4.
+    qat_seg_aux_weight: float = 0.4
+    # Detection: number of epochs to freeze the backbone before fine-tuning
+    # the full network. Useful for large backbones (ResNet-50+) where
+    # immediately fine-tuning with fake-quantized weights can destabilise
+    # the RPN. Set to 0 to disable (no freezing).
+    qat_det_freeze_backbone_epochs: int = 0
 
     # Multi-fidelity PTQ rerank (phase 1c)
     # Number of NSGA candidates materialised through real PTQ +

@@ -240,8 +240,16 @@ class AdaroundOptimizer:
         ]
         _MIN_LOW_BIT_FOR_FOCUSED_PASS = 3
         if len(low_bit_weights) >= _MIN_LOW_BIT_FOR_FOCUSED_PASS:
+            # Enough INT4 layers: focus exclusively on them. Rounding
+            # optimisation has the highest marginal gain on the lowest-
+            # bitwidth weights; INT8 layers are close enough to FP32 that
+            # per-element rounding direction barely moves the output error.
             self._target_params: List[str] = low_bit_weights
         else:
+            # Fewer than 3 INT4 layers (or none): fall back to ALL
+            # quantized weights so the optimisation still runs. This avoids
+            # a silent no-op when the entire config is INT8 or when only
+            # 1-2 layers are INT4 (too few to form a focused pass).
             self._target_params = quantized_weights
         self._owner_modules: Dict[str, nn.Module] = {}
         # Cached calibration inputs per layer (filled by collect_activations).
@@ -589,8 +597,14 @@ class AdaroundOptimizer:
             x_layer = x_layer.to(self.device)
 
             # ── 2. FP32 reference output ──
+            # Move original_w to device explicitly: it was cloned during
+            # initialize() on whatever device the model was on at that
+            # point, but defensive .to(device) guards against any resume
+            # path that reconstructs _original_weights on CPU.
             with torch.no_grad():
-                y_ref = self._layer_forward(module, x_layer, original_w)
+                y_ref = self._layer_forward(
+                    module, x_layer, original_w.to(self.device),
+                )
 
             # ── 3. Optimize V for this layer alone ──
             opt = torch.optim.Adam([v], lr=learning_rate)
@@ -757,8 +771,11 @@ class AdaroundOptimizer:
                 if use_recon and name in self._layer_inputs:
                     module = self._owner_modules[name]
                     x = self._layer_inputs[name].to(self.device)
+                    # Defensive: move original_w to device in case it was
+                    # reconstructed from a CPU checkpoint during a resume.
+                    w_orig_dev = original_w.to(self.device)
                     with torch.no_grad():
-                        y_ref = self._layer_forward(module, x, original_w)
+                        y_ref = self._layer_forward(module, x, w_orig_dev)
                     y_q = self._layer_forward(module, x, w_q_soft)
                     loss_recon = (y_q - y_ref).pow(2).mean()
                     main_loss = loss_recon

@@ -1,0 +1,147 @@
+# NeuroQuant v2.0 — Segmentation Experiment (A100 GPU)
+# ──────────────────────────────────────────────────────────────────────────
+# Hardware:  NVIDIA A100 (40/80 GB VRAM)
+# Model:    DeepLabV3-ResNet101 pretrained on COCO (VOC-21-class variant)
+# Dataset:  Pascal VOC 2012 val (1449 images) — standard segmentation benchmark
+# Target:   FP32 baseline ≥ 78% mIoU, quantized methods ≥ 72–77% mIoU
+# ──────────────────────────────────────────────────────────────────────────
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  name: "deeplabv3_resnet101"          # highest-accuracy torchvision segmentation model
+                                       # pretrained on COCO with VOC-21 labels
+                                       # FP32 mIoU on VOC val ≈ 78–80%
+  path: null                           # null = auto-download from torchvision hub
+  class: null
+  num_classes: 21                      # Pascal VOC: 20 objects + background
+  input_shape: [3, 520, 520]           # standard DeepLabV3 evaluation resolution
+  task: "segmentation"
+
+# ── Dataset ──────────────────────────────────────────────────────────────────
+dataset:
+  name: "voc_segmentation"
+  class: "neuroquant.data.voc_segmentation.VOCSegmentationDataset"
+  path: "./data"                       # contains VOCdevkit/VOC2012/
+  batch_size: 8                        # A100 can handle 8–16 at 520×520
+  num_workers: 4
+
+# ── Output ───────────────────────────────────────────────────────────────────
+output:
+  dir: "./artifacts/seg_deeplabv3_resnet101_voc"
+  mlflow_tracking_uri: "./mlruns"
+  experiment_name: "seg_deeplabv3_resnet101_voc_a100"
+
+# ── Methods ─────────────────────────────────────────────────────────────────
+# All quantization methods enabled — full pipeline for thesis comparison.
+methods:
+  - ptq
+  - qat
+  - gptq
+  - smoothquant
+  - awq
+  - smoothquant_gptq
+
+# ── Bitwidths ────────────────────────────────────────────────────────────────
+bitwidths:
+  supported: [4, 8]
+  io_layer: 8                          # first + last layer forced to INT8 (standard practice)
+
+# ── Hyperparameters ──────────────────────────────────────────────────────────
+hyperparams:
+  seed: 42
+  device: "cuda"
+
+  # Calibration
+  calibration_batches: 20              # 20×8 = 160 images — good observer statistics
+  calibration_strategy_io: "kl_divergence"
+  calibration_strategy_intermediate: "mse"
+
+  # Hessian / clustering
+  hessian_batches: 20
+  cluster_high_percentile: 0.66
+  cluster_low_percentile: 0.33
+  hessian_estimator: "fisher"
+
+  # NSGA-II search — full strength on A100
+  nsga_population_size: 32
+  nsga_generations: 30
+  nsga_crossover_prob: 0.9
+  nsga_mutation_prob: 0.1
+  nsga_accuracy_objective: "top1"      # top1 = mIoU for segmentation (routed by metrics.py)
+  nsga_search_mode: "per_layer"
+  nsga_use_surrogate: true
+  nsga_surrogate_warmup_evals: 30
+  nsga_surrogate_proposed_per_gen: 256
+  nsga_sensitivity_weighted_mutation: true
+
+  # AdaRound — 200 epochs per layer for proper convergence
+  adaround_epochs: 200
+  adaround_lr: 0.0001
+  adaround_reg_param: 0.01
+  adaround_ordered: true               # canonical paper order (Nagel et al. 2020)
+  adaround_max_samples_per_layer: 1024
+
+  # QAT — task-aware, segmentation mode
+  qat_epochs: 5
+  qat_lr: 0.0005                       # lower LR for seg fine-tuning (weights are already good)
+  qat_momentum: 0.9
+  qat_weight_decay: 0.0001
+  qat_early_stop_patience: 3
+  qat_warmstart_source: "ptq_best_acc"
+  qat_act_bitwidth: 8
+  qat_fold_bn: true
+  qat_distill_alpha: 0.0               # KD disabled for segmentation (by design)
+  qat_distill_temperature: 4.0
+  qat_seg_aux_weight: 0.4              # aux head loss weight (DeepLabV3 standard = 0.4)
+  qat_det_freeze_backbone_epochs: 0
+
+  # PTQ rerank
+  ptq_real_rerank_topk: 3
+  ptq_tradeoff_max_acc_drop: 1.5       # allow up to 1.5% mIoU drop for compression trade-off
+
+  # GPTQ
+  gptq_block_size: 128
+  gptq_percdamp: 0.01
+
+  # SmoothQuant
+  smoothquant_alpha: 0.5
+  smoothquant_per_layer_alpha: true
+  smoothquant_alpha_grid: [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+  smoothquant_alpha_strategy: "closed_form"
+
+  # AWQ
+  awq_group_size: 128
+  awq_alpha_grid: [0.0, 0.25, 0.5, 0.75, 1.0]
+  awq_alpha_strategy: "golden"
+  awq_keep_top_pct: 0.0
+  alpha_cluster_amortize: true
+
+  # Reporting / ONNX
+  eval_primary_accuracy: "top1"        # top1 = mIoU for segmentation
+  latency_warmup_runs: 10
+  latency_measure_runs: 50
+  latency_batch_size: 1
+  hardware_report_path: ""
+  use_latency_in_pareto: false
+  onnx_export_enabled: true
+  hardware_aware_search: true
+  latency_lut_bitwidths: [4, 8]
+
+  # XAI / explainability
+  xai_num_images: 5
+  xai_grad_cam_alpha: 0.4
+  xai_shap_n_samples: 50
+  xai_plot_dpi: 150
+
+# ── Phases ───────────────────────────────────────────────────────────────────
+# Full pipeline — all phases enabled for thesis-grade comparison.
+phases:
+  - phase_0_preparation
+  - phase_1a_hessian_clustering
+  - phase_1c_nsga_search
+  - phase_1d_adaround
+  - phase_1e_qat
+  - phase_1f_gptq_smooth_awq
+  - phase_2_pareto
+  - phase_3_xai
+  - phase_4_mlflow

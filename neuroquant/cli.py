@@ -853,9 +853,14 @@ class NeuroQuantPipeline:
         # is ``ptq_best_acc`` and the highest-accuracy NSGA solution is
         # uniform. AdaRound on an all-INT8 config is a no-op (INT8 is
         # too close to FP32 for learned rounding to find headroom).
-        # ``adaround_config`` keeps the most-balanced *mixed* solution
-        # from the Pareto front so AdaRound always has real INT4 layers
-        # to work on. Falls back to ``best_config`` when no mixed
+        # ``adaround_config`` picks the HIGHEST-ACCURACY mixed solution
+        # from the Pareto front so AdaRound starts from the best feasible
+        # checkpoint and still has real INT4 layers to optimise rounding
+        # on. The previous "most balanced INT4/INT8" heuristic routinely
+        # selected solutions near 50% INT4 — i.e. the *lowest-accuracy*
+        # Pareto candidate — which caused AdaRound to collapse because
+        # 50-epoch optimisation cannot recover from maximally aggressive
+        # quantization. Falls back to ``best_config`` when no mixed
         # solutions exist (e.g. all candidates are uniform INT8).
         mixed_solutions = [
             s for s in self.pareto_front.get("solutions", [])
@@ -864,12 +869,13 @@ class NeuroQuantPipeline:
             )
         ]
         if mixed_solutions:
-            def _balance_score(sol: Dict[str, Any]) -> float:
-                bw = sol.get("bitwidth_assignment", {}) or {}
-                int4 = sum(1 for v in bw.values() if int(v) == 4)
-                total = sum(1 for v in bw.values() if int(v) in (4, 8))
-                return abs(int4 / total - 0.5) if total > 0 else 1.0
-            mixed_solutions.sort(key=_balance_score)
+            # Sort by accuracy descending — pick highest-accuracy mixed
+            # solution so AdaRound has the best starting point. The
+            # previous balance heuristic (INT4 fraction closest to 0.5)
+            # was equivalent to picking the *worst* accuracy candidate.
+            mixed_solutions.sort(
+                key=lambda s: -float(s.get("accuracy", 0.0))
+            )
             self.adaround_config = dict(
                 mixed_solutions[0].get("bitwidth_assignment") or {}
             )
@@ -877,14 +883,16 @@ class NeuroQuantPipeline:
             int8 = sum(1 for v in self.adaround_config.values() if int(v) == 8)
             logger.info(
                 "  Phase 1c: AdaRound config from %s "
-                "(INT4/INT8 split=%d/%d).",
-                mixed_solutions[0].get("solution_id", "?"), int4, int8,
+                "(acc=%.2f%%, INT4/INT8 split=%d/%d).",
+                mixed_solutions[0].get("solution_id", "?"),
+                float(mixed_solutions[0].get("accuracy", 0.0)),
+                int4, int8,
             )
         else:
-            self.adaround_config = dict(self.best_config)
+            self.adaround_config = dict(self.best_config) if self.best_config else {}
             logger.info(
                 "  Phase 1c: no mixed Pareto solution; AdaRound will use "
-                "the warmstart config (uniform-bitwidth no-op)."
+                "the warmstart config (uniform-bitwidth fallback)."
             )
 
         # Checkpoint
@@ -908,11 +916,13 @@ class NeuroQuantPipeline:
 
         from neuroquant.quantization.adaround import AdaroundOptimizer
 
-        # Use ``adaround_config`` (most-balanced mixed Pareto solution)
+        # Use ``adaround_config`` (highest-accuracy mixed Pareto solution)
         # rather than ``best_config`` (QAT warmstart pick — often
         # uniform INT8). Falls back to ``best_config`` only when no
-        # mixed solution exists in the Pareto front.
-        ada_cfg = self.adaround_config or self.best_config
+        # mixed solution exists in the Pareto front. Explicit None/empty
+        # check: an empty dict {} is falsy in Python, so ``or`` alone
+        # would silently discard a valid all-INT8 adaround_config.
+        ada_cfg = self.adaround_config if self.adaround_config else self.best_config
         adaround_model = copy.deepcopy(self.model)
         adaround_opt = AdaroundOptimizer(
             adaround_model, ada_cfg, self.config,
@@ -958,11 +968,14 @@ class NeuroQuantPipeline:
         #    skipped ──
         # Normally Phase 1e (QAT) starts from the AdaRound weights and the
         # QAT result is the reported endpoint, so AdaRound itself is never
-        # evaluated. When QAT will not run — either it's omitted from
-        # ``phases`` or it was auto-skipped because the task isn't
-        # classification (e.g. segmentation) — AdaRound IS the endpoint, so
-        # evaluate it and surface it in the Pareto + summary like any other
-        # method. QAT-enabled (classification) runs are unchanged.
+        # evaluated as a standalone method. When QAT will not run — either
+        # it is omitted from ``phases`` OR auto-skipped because the task
+        # is not classification (segmentation / detection / regression) —
+        # AdaRound IS the final quantized endpoint, so evaluate it and
+        # surface it in the Pareto + summary table like any other method.
+        # Note: ``_qat_supported()`` returns False for segmentation, so
+        # AdaRound is always scored as a first-class result for non-
+        # classification tasks regardless of the ``run_phases`` list.
         qat_will_run = (
             "phase_1e_qat" in self.config.run_phases and self._qat_supported()
         )
@@ -1047,17 +1060,24 @@ class NeuroQuantPipeline:
     # ==================================================================
 
     def phase_1e_qat(self) -> None:
-        """Phase 1e: QAT fine-tuning from best PTQ model."""
+        """Phase 1e: QAT fine-tuning from best PTQ / AdaRound model.
+
+        Supports all tasks: classification, segmentation, detection,
+        nlp, and regression. The QATTrainer dispatches on ``task``
+        internally for loss, batch unpacking, and early-stopping metric.
+        """
         self.tracker.start_run("phase_1e_qat", {"phase": "1e"})
 
         from neuroquant.quantization.qat import QATTrainer
 
-        # Production W+A QAT: hand the trainer the FP32 baseline as a
-        # KD teacher and the calibration loader for activation observer
-        # initialisation. Wave-2 contract:
-        #   - BN is folded into the preceding Conv inside ``prepare_model``.
+        task = getattr(self.config, "task", "classification")
+
+        # W+A QAT: hand the trainer the FP32 baseline as a KD teacher
+        # (used only when task='classification') and the calibration
+        # loader for activation observer initialisation.
+        #   - BN is folded into the preceding Conv inside prepare_model.
         #   - Activations are observed once on calib data, then frozen
-        #     at the deployment-time INT8 (or ``qat_act_bitwidth``) scale.
+        #     at the deployment-time INT8 (or qat_act_bitwidth) scale.
         #   - Weights are fake-quantized via an autograd-aware
         #     parametrization so STE clipping actually fires.
         qat_model = copy.deepcopy(self.adaround_result["model"])
@@ -1066,22 +1086,40 @@ class NeuroQuantPipeline:
             qat_model,
             self.best_config,
             self.config,
+            task=task,
             teacher=teacher,
             calib_loader=self.calib_loader,
         )
         self.qat_result = qat_trainer.train(self.train_loader, self.val_loader)
 
-        # Headline accuracy for QAT comes from ``test_loader`` — the
-        # final QAT model is evaluated against the public test split
-        # exactly once, here, after the best-epoch weights have been
-        # restored. ``final_val_acc`` (used to drive early stopping)
-        # remains in the result for diagnostics.
-        qat_test_top1 = self._evaluate_top1(
-            self.qat_result.get("model"), self.test_loader,
-        )
-        if qat_test_top1 is not None:
-            self.qat_result["test_top1"] = float(qat_test_top1)
-            self.results["qat_test_top1"] = float(qat_test_top1)
+        # ── Headline accuracy / metric ──
+        # For classification: evaluate on the test split (Top-1).
+        # For all other tasks: _attach_split_metrics routes through
+        # evaluate_model which is already task-aware. We also keep
+        # qat_test_top1 for backward compatibility with classification.
+        qat_model_out = self.qat_result.get("model")
+        qat_test_top1: Optional[float] = None
+
+        if task == "classification":
+            qat_test_top1 = self._evaluate_top1(
+                qat_model_out, self.test_loader,
+            )
+            if qat_test_top1 is not None:
+                self.qat_result["test_top1"] = float(qat_test_top1)
+                self.results["qat_test_top1"] = float(qat_test_top1)
+        else:
+            # Non-classification: surface metric via _attach_split_metrics
+            # which calls evaluate_model (handles seg mIoU / det mAP
+            # through the task config). The result dict is populated
+            # in-place; ``accuracy`` will reflect the task-appropriate
+            # headline metric.
+            _qat_headline: Dict[str, Any] = {}
+            if qat_model_out is not None:
+                self._attach_split_metrics(_qat_headline, qat_model_out)
+            qat_test_top1 = _qat_headline.get("accuracy") or _qat_headline.get("test_top1")
+            if qat_test_top1 is not None:
+                self.qat_result["test_top1"] = float(qat_test_top1)
+                self.results["qat_test_top1"] = float(qat_test_top1)
 
         self.tracker.log_metrics({
             "qat_final_acc": self.qat_result["final_val_acc"],
@@ -1093,38 +1131,30 @@ class NeuroQuantPipeline:
         self.tracker.log_params({
             "qat_warmstart_source": str(ws_src),
             "qat_warmstart_id": str(ws_id),
+            "qat_task": task,
         })
         self.tracker.end_run()
 
         if qat_test_top1 is not None:
             self.report_lines.append(
-                f"[Phase 1e] QAT: test_top1={qat_test_top1:.2f}%, "
-                f"val_top1={self.qat_result['final_val_acc']:.2f}% "
+                f"[Phase 1e] QAT ({task}): metric={qat_test_top1:.2f}%, "
+                f"val={self.qat_result['final_val_acc']:.4f} "
                 f"(warmstart={ws_src}={ws_id})"
             )
         else:
             self.report_lines.append(
-                f"[Phase 1e] QAT: val_top1={self.qat_result['final_val_acc']:.2f}% "
+                f"[Phase 1e] QAT ({task}): val={self.qat_result['final_val_acc']:.4f} "
                 f"(warmstart={ws_src}={ws_id})"
             )
         self.results["qat_acc"] = self.qat_result["final_val_acc"]
 
         # Surface QAT into the public summary table so it appears in
         # ``pareto_summary.json`` alongside PTQ/GPTQ/AWQ/SmoothQuant.
-        # Previously QAT was logged to MLflow + persisted to the phase
-        # checkpoint but never made it into ``_summary_rows``, which is
-        # what ``_build_pareto_summary`` consumes — so the headline JSON
-        # silently dropped it (n_methods=7 with 8 candidates evaluated).
         # Size + ebops come from ``self.best_config`` (the NSGA-chosen
         # bitwidth assignment QAT was warmstarted on).
         from neuroquant.utils.common import compute_quantized_size_mb
         qat_bw = self.best_config or {}
-        # Use the same MIXED-vs-uniform label rule as the PTQ path: the
-        # warmstart often hands QAT a mixed-bitwidth config (when
-        # ``mixed_ranked`` won the picker), in which case calling the
-        # result "QAT_INT8" hides the real bitwidth distribution.
-        # Tagging it ``QAT_MIXED`` lets the bitwidth-distribution chart
-        # and method tables agree about what's actually quantized.
+        # Use the same MIXED-vs-uniform label rule as the PTQ path.
         if self._is_mixed_bitwidth_assignment(qat_bw):
             qat_tag = "MIXED"
             qat_dom_bw = self._dominant_bitwidth(qat_bw)
@@ -1138,6 +1168,8 @@ class NeuroQuantPipeline:
             compute_quantized_size_mb(self.model, qat_bw) if qat_bw else 0.0
         )
         qat_ebops = self._ebops_from_bitwidth(qat_bw) if qat_bw else 0.0
+        # Headline accuracy: test_top1 when available (classification),
+        # otherwise the task-appropriate metric from _attach_split_metrics.
         qat_headline_acc = (
             float(qat_test_top1) if qat_test_top1 is not None
             else float(self.qat_result.get("final_val_acc", 0.0) or 0.0)
@@ -2325,15 +2357,17 @@ class NeuroQuantPipeline:
     def _qat_supported(self) -> bool:
         """Whether Phase 1e (QAT) can run for the configured task.
 
-        QAT's fine-tuning loop is classification-only — it applies
-        ``CrossEntropyLoss`` to a logits tensor and reads
-        ``outputs.max(1)``, which crashes on a segmentation
-        ``OrderedDict`` / detection list / regression vector. The pipeline
-        auto-skips QAT for those tasks (see ``run``) so ``task:
-        segmentation`` works with the default phase list, and AdaRound is
-        reported in its place (Phase 1d).
+        QAT now supports all tasks: classification, segmentation,
+        detection, nlp, and regression. The QATTrainer dispatches on
+        ``task`` internally so the loss function, batch unpacking, and
+        early-stopping metric are all task-appropriate.
+
+        This method is kept so callers that checked it before the
+        task-aware rewrite continue to compile, but it unconditionally
+        returns True. The old classification-only guard that blocked
+        segmentation/detection runs has been removed.
         """
-        return getattr(self.config, "task", "classification") == "classification"
+        return True
 
     # ==================================================================
     # Task-aware Loss Bridge

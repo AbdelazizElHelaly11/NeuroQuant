@@ -82,6 +82,8 @@ desktop.ini
 **/FashionMNIST/
 **/imagenet/
 **/imagefolder/
+**/VOCdevkit/
+**/VOCtrainval_11-May-2012.tar
 *.tar.gz
 *.tar
 *.zip

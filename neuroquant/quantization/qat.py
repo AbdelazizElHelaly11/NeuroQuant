@@ -17,19 +17,29 @@ weights. Trains the model that real INT8 inference will execute:
     layer's input. The pre-QAT calibration pass freezes the observer
     scales so QAT trains against the deployment-time activation
     quantizer.
-  * **FP32 teacher KD** (E5) when a teacher model is supplied. The QAT
-    loss is ``α·KD + (1-α)·CE`` with KD = ``T²·KL(student/T || teacher/T)``.
+  * **FP32 teacher KD** (E5) when a teacher model is supplied — for
+    classification only. Non-classification tasks disable KD
+    automatically because their output formats are incompatible with
+    the KL-div objective (detection returns dicts; segmentation maps
+    need pixel-wise alignment that is out of scope for Phase 1e).
 
-Training-loop niceties from the previous version are preserved:
-cosine-annealing LR, gradient clipping, early stopping, best-epoch
-restore.
+Task support:
+  * ``classification`` — CrossEntropyLoss, Top-1 accuracy early-stop.
+  * ``segmentation``   — CrossEntropyLoss(ignore_index=255) on the
+    ``"out"`` head, negative-val-loss early-stop (mIoU is too
+    expensive per epoch).
+  * ``detection``      — model returns its own loss dict in train mode;
+    sum of dict values is the scalar loss. Negative-val-loss early-stop.
+  * ``nlp``            — HuggingFace contract: ``model(**x, labels=y).loss``.
+    Negative-val-loss early-stop.
+  * ``regression``     — MSELoss, negative-val-loss early-stop.
 """
 from __future__ import annotations
 
 import copy
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -317,15 +327,25 @@ class _QuantizationManager:
         calib_loader: DataLoader,
         device: torch.device,
         num_batches: int = 20,
+        batch_fn: Optional[Callable[[Any], torch.Tensor]] = None,
     ) -> None:
         """Run a forward-only pass to populate observer min/max.
 
         Observers stay in ``calibrating`` state during the loop and
         flip to ``quantizing`` afterwards. The model runs in eval
         mode so BN-folded layers and dropout behave deterministically.
+
+        Args:
+            batch_fn: optional callable that extracts the image/input
+                tensor from a batch. Defaults to ``batch[0]`` (the
+                standard CV convention). Pass a custom extractor for
+                NLP dict batches, detection list batches, etc.
         """
         for obs in self.observers.values():
             obs.start_calibration()
+
+        # Default batch extractor: CV tuple (images, labels) → images.
+        _extract = batch_fn if batch_fn is not None else (lambda b: b[0])
 
         was_training = model.training
         model.eval()
@@ -333,8 +353,26 @@ class _QuantizationManager:
             for i, batch in enumerate(calib_loader):
                 if i >= num_batches:
                     break
-                x = batch[0].to(device)
-                model(x)
+                try:
+                    x = _extract(batch)
+                except Exception as exc:
+                    logger.warning(
+                        "  QAT calibration: batch_fn failed on batch %d "
+                        "(%s); skipping.", i, exc,
+                    )
+                    continue
+                if isinstance(x, dict):
+                    x = {
+                        k: v.to(device) if isinstance(v, torch.Tensor) else v
+                        for k, v in x.items()
+                    }
+                    model(**x)
+                elif isinstance(x, (list, tuple)):
+                    x = [t.to(device) if isinstance(t, torch.Tensor) else t
+                         for t in x]
+                    model(x)
+                else:
+                    model(x.to(device))
         if was_training:
             model.train()
 
@@ -367,20 +405,205 @@ class _QuantizationManager:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Task-aware helpers
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _make_batch_extractor(task: str) -> Callable[[Any], Any]:
+    """Return a callable that unpacks the image/input tensor from a
+    batch tuple/dict/list, handling every task's loader convention.
+
+    Used for activation calibration so observers see the right input
+    format regardless of task.
+    """
+    if task == "nlp":
+        # HF loaders often pack everything into a dict; return it as-is
+        # so the model receives ``model(**batch_dict)``.
+        def _extract_nlp(batch):
+            if isinstance(batch, dict):
+                # Drop labels key so we only feed inputs to the model.
+                return {k: v for k, v in batch.items() if k != "labels"}
+            # Fallback: (input_dict, labels) tuple from some loaders.
+            x = batch[0]
+            return x
+        return _extract_nlp
+
+    if task == "detection":
+        # torchvision detection: list of image tensors in [0, 1].
+        # Calibration in eval mode — just feed the image list.
+        def _extract_det(batch):
+            images, _ = batch[0], batch[1]
+            # images may already be a list[Tensor] or a stacked Tensor.
+            if isinstance(images, torch.Tensor):
+                return [img for img in images]
+            return list(images)
+        return _extract_det
+
+    # Default (classification, segmentation, regression):
+    # loader returns (images_tensor, labels_tensor).
+    return lambda batch: batch[0]
+
+
+def _make_task_forward(
+    task: str,
+    model: nn.Module,
+    x: Any,
+    y: Any,
+    criterion: Optional[nn.Module],
+    seg_aux_weight: float = 0.4,
+) -> torch.Tensor:
+    """Run one task-aware forward pass and return a scalar loss.
+
+    Centralises all task dispatch so ``_train_epoch`` stays clean.
+
+    Args:
+        task: one of classification / segmentation / detection / nlp /
+            regression.
+        model: the (fake-quantized) student model.
+        x: model input — tensor for CV tasks, dict for NLP, list for
+            detection.
+        y: target — label tensor, mask tensor, list of dicts, etc.
+        criterion: loss module (used by classification / segmentation /
+            regression). ``None`` for detection and NLP where the model
+            produces its own loss.
+        seg_aux_weight: weight on the auxiliary segmentation head loss
+            (applied only when the output contains an ``"aux"`` key).
+    """
+    if task == "segmentation":
+        output = model(x)
+        if isinstance(output, dict):
+            logits = output.get("out", next(iter(output.values())))
+        else:
+            logits = output
+        # Masks can be [B, 1, H, W] from some loaders.
+        target = y.squeeze(1) if (y.dim() == 4 and y.size(1) == 1) else y
+        loss = criterion(logits, target.long())
+        # Auxiliary deep-supervision head (present in DeepLabV3+, FCN).
+        if isinstance(output, dict) and "aux" in output and seg_aux_weight > 0:
+            aux_logits = output["aux"]
+            loss = loss + seg_aux_weight * criterion(aux_logits, target.long())
+        return loss
+
+    if task == "detection":
+        # torchvision detection in train() mode returns a dict of named
+        # scalar losses; sum them into one scalar.
+        loss_dict = model(x, y)
+        if isinstance(loss_dict, dict):
+            return sum(loss_dict.values())
+        # Custom detector that already returns a scalar.
+        return loss_dict
+
+    if task == "nlp":
+        if isinstance(x, dict):
+            out = model(**x, labels=y) if y is not None else model(**x)
+        else:
+            out = model(x)
+        if hasattr(out, "loss") and out.loss is not None:
+            return out.loss
+        if isinstance(out, (tuple, list)) and out and isinstance(out[0], torch.Tensor):
+            return out[0]
+        raise RuntimeError(
+            "NLP model did not expose ``.loss``; ensure labels are passed "
+            "or included in the input dict."
+        )
+
+    if task == "regression":
+        output = model(x)
+        if isinstance(output, dict):
+            output = output.get("out", next(iter(output.values())))
+        pred = output.reshape(-1).float()
+        target = y.reshape(-1).float()
+        if pred.numel() != target.numel():
+            m = min(pred.numel(), target.numel())
+            pred, target = pred[:m], target[:m]
+        return criterion(pred, target)
+
+    # Default: classification.
+    return criterion(model(x), y)
+
+
+def _unpack_batch(
+    batch: Any,
+    task: str,
+    device: torch.device,
+) -> Tuple[Any, Any]:
+    """Unpack a loader batch into ``(x, y)`` and move both to ``device``.
+
+    Handles every batch format used by the framework:
+      * ``(Tensor, Tensor)``          — CV classification / segmentation
+      * ``(List[Tensor], List[dict])``— torchvision detection
+      * ``dict``                      — HuggingFace NLP (labels inside)
+      * ``(dict, Tensor)``            — some custom NLP loaders
+
+    Returns ``(x, y)`` where ``x`` is already on ``device`` and ``y``
+    is on ``device`` when it is a Tensor (or a list of device dicts for
+    detection).
+    """
+    if isinstance(batch, dict):
+        # Full HF dict: labels may be embedded.
+        y = batch.pop("labels", None)
+        x = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
+        if isinstance(y, torch.Tensor):
+            y = y.to(device)
+        return x, y
+
+    x_raw, y_raw = batch[0], batch[1]
+
+    # x: list/tuple → detection image list
+    if isinstance(x_raw, (list, tuple)):
+        x = [t.to(device) if isinstance(t, torch.Tensor) else t
+             for t in x_raw]
+    elif isinstance(x_raw, dict):
+        x = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in x_raw.items()
+        }
+    else:
+        x = x_raw.to(device)
+
+    # y: list of dicts → detection targets
+    if (
+        isinstance(y_raw, (list, tuple))
+        and y_raw
+        and isinstance(y_raw[0], dict)
+    ):
+        y = [
+            {k: v.to(device) if isinstance(v, torch.Tensor) else v
+             for k, v in t.items()}
+            for t in y_raw
+        ]
+    elif isinstance(y_raw, torch.Tensor):
+        y = y_raw.to(device)
+    else:
+        y = y_raw
+
+    return x, y
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # QATTrainer
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
 class QATTrainer:
-    """W+A Quantization-Aware Training with FP32-teacher KD.
+    """W+A Quantization-Aware Training with FP32-teacher KD (classification)
+    or loss-driven fine-tuning (all other tasks).
 
     Args:
         model: AdaRound-output model (will be BN-folded in place).
         bitwidth_config: ``{param_name -> weight_bitwidth}``.
         config: framework configuration (uses ``qat_*`` knobs).
-        teacher: optional FP32 teacher for KD. When provided and
-            ``qat_distill_alpha > 0``, the loss is
-            ``α·T²·KL(student/T, teacher/T) + (1-α)·CE``.
+        task: one of ``"classification"``, ``"segmentation"``,
+            ``"detection"``, ``"nlp"``, ``"regression"``.
+            Determines the loss function, batch unpacking, and the
+            early-stopping metric.
+        teacher: optional FP32 teacher for knowledge distillation.
+            **Only used when ``task == "classification"``**; ignored
+            silently for other tasks because output-space KD is not
+            straightforward for detection/segmentation/NLP.
         calib_loader: calibration loader for activation observers.
             Required when ``qat_act_bitwidth < 32``; without it the
             observers stay in passthrough mode (W-only QAT). The
@@ -392,43 +615,78 @@ class QATTrainer:
         model: nn.Module,
         bitwidth_config: Dict[str, int],
         config: QuantizationConfig,
+        task: str = "classification",
         teacher: Optional[nn.Module] = None,
         calib_loader: Optional[DataLoader] = None,
     ) -> None:
         self.model = model
         self.bitwidth_config = bitwidth_config
         self.config = config
+        self.task = str(task).lower()
         self.device = self._resolve_device(config.hyperparams.device)
         self.calib_loader = calib_loader
 
         self.model.to(self.device)
 
-        # FP32 teacher (frozen) for KD. Snapshot a deep copy so the
-        # caller can keep using its own model without risk of cross-
-        # contamination via shared state_dicts.
+        # FP32 teacher (frozen) — classification only.
         self.teacher: Optional[nn.Module] = None
         if teacher is not None:
-            self.teacher = teacher.to(self.device)
-            self.teacher.eval()
-            for p in self.teacher.parameters():
-                p.requires_grad_(False)
+            if self.task == "classification":
+                self.teacher = teacher.to(self.device)
+                self.teacher.eval()
+                for p in self.teacher.parameters():
+                    p.requires_grad_(False)
+            else:
+                logger.info(
+                    "  QATTrainer: teacher supplied but task='%s'. "
+                    "Knowledge distillation is disabled for non-"
+                    "classification tasks — output-space KL requires "
+                    "compatible logit tensors. The teacher is ignored.",
+                    self.task,
+                )
 
         self._mgr = _QuantizationManager()
 
+        # ``_best_val_metric`` stores the highest observed validation
+        # metric so far. For classification this is Top-1 accuracy
+        # (higher = better). For all other tasks it is the negative of
+        # the mean val loss (higher = less loss = better), so the same
+        # ``is_best = metric > _best_val_metric`` condition works
+        # universally.
+        self._best_val_metric: float = -float("inf")
         self._best_state: Optional[Dict[str, Any]] = None
-        self._best_val_acc: float = -1.0
         self._best_epoch: int = 0
 
     # ------------------------------------------------------------------
     # Preparation
     # ------------------------------------------------------------------
 
+    def _build_criterion(self) -> Optional[nn.Module]:
+        """Return the appropriate loss module for the configured task.
+
+        Returns ``None`` for tasks where the model produces its own
+        loss (detection in train mode, NLP via HuggingFace contract).
+        In those cases ``_make_task_forward`` bypasses the criterion
+        argument entirely.
+        """
+        hp = self.config.hyperparams
+        if self.task == "classification":
+            return nn.CrossEntropyLoss()
+        if self.task == "segmentation":
+            return nn.CrossEntropyLoss(ignore_index=255)
+        if self.task == "regression":
+            return nn.MSELoss()
+        # detection and nlp: model owns its loss.
+        return None
+
     def prepare_model(self) -> None:
         """Fold Conv-BN, freeze BN, install parametrizations + observers,
         and (when ``calib_loader`` is supplied) run the activation
         calibration pass."""
         hp = self.config.hyperparams
-        logger.info("Preparing model for QAT (W+A) ...")
+        logger.info(
+            "Preparing model for QAT (W+A, task=%s) ...", self.task,
+        )
 
         # ── E4: analytic Conv-BN fold ──
         if getattr(hp, "qat_fold_bn", True):
@@ -462,13 +720,11 @@ class QATTrainer:
             if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d))
             for p in m.parameters()
         }
-        trainable = 0
         for p in self.model.parameters():
             if id(p) in bn_param_ids:
                 continue
             if not p.requires_grad:
                 p.requires_grad_(True)
-                trainable += 1
 
         # ── Install weight parametrizations + activation hooks ──
         io_layer_names = self._find_io_layer_names()
@@ -482,15 +738,23 @@ class QATTrainer:
 
         # ── Activation calibration (E1) ──
         if self.calib_loader is not None and self._mgr.observers:
+            batch_fn = _make_batch_extractor(self.task)
             self._mgr.calibrate_activations(
                 self.model, self.calib_loader, self.device,
                 num_batches=int(hp.calibration_batches),
+                batch_fn=batch_fn,
             )
         elif self._mgr.observers:
             logger.warning(
                 "  No calib_loader supplied — activation observers stay "
                 "in passthrough mode. QAT will be weight-only."
             )
+
+        # ── Detection backbone freeze warmup ──
+        # Freeze backbone weights for the first N epochs to stabilise
+        # training before fine-tuning the full network.
+        det_freeze = int(getattr(hp, "qat_det_freeze_backbone_epochs", 0))
+        self._det_freeze_epochs = det_freeze if self.task == "detection" else 0
 
     # ------------------------------------------------------------------
     # Training
@@ -508,17 +772,25 @@ class QATTrainer:
         momentum = float(hp.qat_momentum)
         weight_decay = float(hp.qat_weight_decay)
         patience = int(hp.qat_early_stop_patience)
+        seg_aux_weight = float(getattr(hp, "qat_seg_aux_weight", 0.4))
 
         if criterion is None:
-            criterion = nn.CrossEntropyLoss()
-        criterion = criterion.to(self.device)
+            criterion = self._build_criterion()
+        if criterion is not None:
+            criterion = criterion.to(self.device)
 
         kd_alpha = float(getattr(hp, "qat_distill_alpha", 0.0))
         kd_T = float(getattr(hp, "qat_distill_temperature", 4.0))
-        use_kd = self.teacher is not None and kd_alpha > 0.0
+        use_kd = (
+            self.teacher is not None
+            and kd_alpha > 0.0
+            and self.task == "classification"
+        )
 
         logger.info("=" * 70)
-        logger.info("Phase 1e: QAT Warmstart (W+A) — Fine-Tuning from AdaRound")
+        logger.info(
+            "Phase 1e: QAT Warmstart (W+A) — task=%s", self.task,
+        )
         logger.info("=" * 70)
         logger.info(
             "  Epochs: %d, LR: %.4f, Momentum: %.1f, WD: %.1e, Patience: %d",
@@ -530,13 +802,19 @@ class QATTrainer:
             "on" if use_kd else "off",
             f" (α={kd_alpha}, T={kd_T})" if use_kd else "",
         )
+        early_stop_desc = (
+            "Top-1 accuracy" if self.task == "classification"
+            else "negative val loss"
+        )
+        logger.info(
+            "  Early-stop metric: %s", early_stop_desc,
+        )
 
         t_start = time.time()
         self.prepare_model()
 
         # NOTE: do NOT seed torch here — set_seed() at pipeline init
-        # already pinned cudnn determinism + the global RNG. Re-seeding
-        # mid-pipeline would desync the dataloader workers.
+        # already pinned cudnn determinism + the global RNG.
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         logger.info(
             "  Trainable parameters: %d tensors (%d elements)",
@@ -558,22 +836,33 @@ class QATTrainer:
         no_improve_count = 0
 
         for epoch in range(1, epochs + 1):
+            # Detection backbone freeze: unfreeze after warmup epochs.
+            if self._det_freeze_epochs > 0:
+                if epoch == 1:
+                    self._freeze_backbone()
+                elif epoch == self._det_freeze_epochs + 1:
+                    self._unfreeze_backbone()
+                    logger.info(
+                        "  [Epoch %d] Detection backbone unfrozen.", epoch,
+                    )
+
             train_loss, train_acc = self._train_epoch(
                 train_loader, criterion, optimizer,
                 use_kd=use_kd, kd_alpha=kd_alpha, kd_T=kd_T,
+                seg_aux_weight=seg_aux_weight,
             )
             history["train_loss"].append(train_loss)
-            history["train_accuracy"].append(train_acc)
+            history["train_accuracy"].append(train_acc if train_acc is not None else 0.0)
 
-            val_acc = self._validate(val_loader)
-            history["val_accuracy"].append(val_acc)
+            val_metric, val_display = self._validate(val_loader)
+            history["val_accuracy"].append(val_metric)
 
             current_lr = optimizer.param_groups[0]["lr"]
             scheduler.step()
 
-            is_best = val_acc > self._best_val_acc
+            is_best = val_metric > self._best_val_metric
             if is_best:
-                self._best_val_acc = val_acc
+                self._best_val_metric = val_metric
                 self._best_epoch = epoch
                 self._best_state = copy.deepcopy(self.model.state_dict())
                 no_improve_count = 0
@@ -582,9 +871,12 @@ class QATTrainer:
 
             best_marker = " [*best*]" if is_best else ""
             logger.info(
-                "  Epoch %d/%d: train_loss=%.4f, train_acc=%.2f%%, "
-                "val_acc=%.2f%%, lr=%.6f%s",
-                epoch, epochs, train_loss, train_acc, val_acc,
+                "  Epoch %d/%d: train_loss=%.4f, train_acc=%s, "
+                "val_%s=%.4f, lr=%.6f%s",
+                epoch, epochs, train_loss,
+                f"{train_acc:.2f}%" if train_acc is not None else "n/a",
+                "top1" if self.task == "classification" else "metric",
+                val_display,
                 current_lr, best_marker,
             )
 
@@ -596,7 +888,9 @@ class QATTrainer:
 
         if self._best_state is not None:
             self.model.load_state_dict(self._best_state)
-            logger.info("  Restored best model from epoch %d", self._best_epoch)
+            logger.info(
+                "  Restored best model from epoch %d", self._best_epoch,
+            )
 
         # Bake the parametrized fake-quant into the underlying weights
         # and remove all hooks so the returned model is a plain
@@ -605,10 +899,10 @@ class QATTrainer:
 
         t_elapsed = time.time() - t_start
         logger.info("-" * 70)
-        logger.info("QAT (W+A) Results:")
+        logger.info("QAT (W+A) Results (task=%s):", self.task)
         logger.info(
-            "  Best epoch: %d (val_acc=%.2f%%)",
-            self._best_epoch, self._best_val_acc,
+            "  Best epoch: %d (val_metric=%.4f)",
+            self._best_epoch, self._best_val_metric,
         )
         logger.info(
             "  Final train loss: %.4f",
@@ -617,13 +911,17 @@ class QATTrainer:
         logger.info("  Time: %.1f seconds", t_elapsed)
         logger.info("=" * 70)
 
+        # ``final_val_acc`` is kept for backward compatibility:
+        # classification→ top-1%; other tasks → negative val loss
+        # (a larger negative-loss is still "higher" in the best-epoch
+        # tracker; callers that need the raw loss can negate it).
         return QATResult(
             model=self.model,
             train_accuracy=history["train_accuracy"],
             val_accuracy=history["val_accuracy"],
             train_loss=history["train_loss"],
             best_epoch=self._best_epoch,
-            final_val_acc=self._best_val_acc,
+            final_val_acc=self._best_val_metric,
             time_seconds=t_elapsed,
         )
 
@@ -634,36 +932,63 @@ class QATTrainer:
     def _train_epoch(
         self,
         train_loader: DataLoader,
-        criterion: nn.Module,
+        criterion: Optional[nn.Module],
         optimizer: torch.optim.Optimizer,
         use_kd: bool,
         kd_alpha: float,
         kd_T: float,
-    ) -> Tuple[float, float]:
+        seg_aux_weight: float = 0.4,
+    ) -> Tuple[float, Optional[float]]:
+        """Run one training epoch.
+
+        Returns ``(avg_loss, accuracy_or_None)``. ``accuracy`` is
+        Top-1 % for classification; ``None`` for all other tasks (they
+        have no per-batch scalar accuracy notion at training time).
+        """
         self.model.train()
-        # Re-freeze any residual BN (model.train() un-evals them).
-        for module in self.model.modules():
-            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                module.eval()
+        # Detection models manage their own train/eval state per module;
+        # for segmentation / classification we re-freeze BN after
+        # model.train() resets it.
+        if self.task != "detection":
+            for module in self.model.modules():
+                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    module.eval()
 
         running_loss = 0.0
         correct = 0
         total = 0
+        samples_seen = 0
 
-        for images, labels in train_loader:
-            images = images.to(self.device)
-            labels = labels.to(self.device)
+        for batch in train_loader:
+            x, y = _unpack_batch(batch, self.task, self.device)
 
-            outputs = self.model(images)
-            ce_loss = criterion(outputs, labels)
+            # Batch size — task-aware.
+            if isinstance(x, (list, tuple)):
+                batch_size = len(x)
+            elif isinstance(x, dict):
+                sentinel = x.get("input_ids", next(iter(x.values()), None))
+                batch_size = (
+                    sentinel.size(0) if isinstance(sentinel, torch.Tensor) else 1
+                )
+            else:
+                batch_size = x.size(0)
+
+            # Task-aware forward + loss.
+            ce_loss = _make_task_forward(
+                self.task, self.model, x, y, criterion,
+                seg_aux_weight=seg_aux_weight,
+            )
 
             if use_kd:
+                # KD is classification-only (enforced in __init__).
+                # We need the raw logits from the student — NOT the scalar
+                # ce_loss — to compute KL-div. The ce_loss computed above
+                # already captures the student loss; run a second forward
+                # to get logits for the soft-target KL term.
                 with torch.no_grad():
-                    teacher_logits = self.teacher(images)
-                # Standard Hinton KD: scale gradient by T² so the
-                # effective KD-CE balance is invariant to the choice
-                # of temperature.
-                student_logp = F.log_softmax(outputs / kd_T, dim=-1)
+                    teacher_logits = self.teacher(x)
+                student_logits = self.model(x)  # raw logits [B, C]
+                student_logp = F.log_softmax(student_logits / kd_T, dim=-1)
                 teacher_p = F.softmax(teacher_logits / kd_T, dim=-1)
                 kd_loss = F.kl_div(
                     student_logp, teacher_p, reduction="batchmean",
@@ -675,36 +1000,132 @@ class QATTrainer:
             optimizer.zero_grad()
             loss.backward()
 
-            # Gradient clipping — quantized weights amplify loss
-            # spikes; clip_grad_norm keeps SGD stable.
             torch.nn.utils.clip_grad_norm_(
                 [p for p in self.model.parameters() if p.requires_grad],
                 max_norm=1.0,
             )
             optimizer.step()
 
-            running_loss += loss.item() * labels.size(0)
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            running_loss += loss.item() * batch_size
+            samples_seen += batch_size
 
-        avg_loss = running_loss / max(total, 1)
-        accuracy = (correct / max(total, 1)) * 100.0
+            # Top-1 accumulator — classification only.
+            if self.task == "classification" and isinstance(y, torch.Tensor):
+                with torch.no_grad():
+                    outputs = self.model(x)
+                    _, predicted = outputs.max(1)
+                    total += y.size(0)
+                    correct += predicted.eq(y).sum().item()
+
+        avg_loss = running_loss / max(samples_seen, 1)
+        accuracy = (
+            (correct / max(total, 1)) * 100.0
+            if self.task == "classification" and total > 0
+            else None
+        )
         return avg_loss, accuracy
 
-    def _validate(self, val_loader: DataLoader) -> float:
+    def _validate(self, val_loader: DataLoader) -> Tuple[float, float]:
+        """Compute the validation metric for early stopping.
+
+        Returns ``(metric, display_value)`` where:
+          * classification → ``(top1_accuracy, top1_accuracy)``
+          * other tasks    → ``(-mean_val_loss, mean_val_loss)``
+
+        The first element is used for ``is_best`` comparisons (higher
+        is always better). The second is logged for readability.
+
+        Detection note: the model is set to eval() for inference — in
+        eval mode, torchvision detectors return prediction dicts, not
+        loss dicts. We compute val loss by temporarily switching to
+        train mode per batch, then restoring eval.
+        """
         self.model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images = images.to(self.device)
-                labels = labels.to(self.device)
-                outputs = self.model(images)
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-        return (correct / max(total, 1)) * 100.0
+
+        if self.task == "classification":
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    x, y = _unpack_batch(batch, self.task, self.device)
+                    outputs = self.model(x)
+                    _, predicted = outputs.max(1)
+                    total += y.size(0)
+                    correct += predicted.eq(y).sum().item()
+            top1 = (correct / max(total, 1)) * 100.0
+            return top1, top1
+
+        # Non-classification: compute mean val loss as the proxy.
+        criterion = self._build_criterion()
+        if criterion is not None:
+            criterion = criterion.to(self.device)
+        total_loss = 0.0
+        count = 0
+
+        for batch in val_loader:
+            x, y = _unpack_batch(batch, self.task, self.device)
+            try:
+                if self.task == "detection":
+                    # Detection: must be in train() to produce a loss dict.
+                    # Switch per-batch and restore immediately after.
+                    self.model.train()
+                    with torch.enable_grad():
+                        loss_dict = self.model(x, y)
+                    self.model.eval()
+                    if isinstance(loss_dict, dict):
+                        loss_val = float(sum(v.item() for v in loss_dict.values()))
+                    else:
+                        loss_val = float(loss_dict.item())
+                else:
+                    with torch.no_grad():
+                        loss = _make_task_forward(
+                            self.task, self.model, x, y, criterion,
+                        )
+                        loss_val = float(loss.item())
+                total_loss += loss_val
+                count += 1
+            except Exception as exc:
+                logger.warning(
+                    "  QAT val loss computation failed on batch: %s", exc,
+                )
+        mean_loss = total_loss / max(count, 1)
+        # Return negative so "higher = better" holds universally.
+        return -mean_loss, mean_loss
+
+    # ------------------------------------------------------------------
+    # Detection backbone freeze / unfreeze
+    # ------------------------------------------------------------------
+
+    def _freeze_backbone(self) -> None:
+        """Freeze the backbone parameters for detection warm-up.
+
+        Heuristic: parameters whose name starts with ``"backbone"``
+        are considered backbone. Generalises to torchvision Faster
+        RCNN, RetinaNet, SSD, and similar architectures without
+        hard-coding module names beyond the conventional prefix.
+        """
+        frozen = 0
+        for name, p in self.model.named_parameters():
+            if name.startswith("backbone"):
+                p.requires_grad_(False)
+                frozen += 1
+        logger.info(
+            "  [Detection QAT] Backbone frozen: %d parameters "
+            "(warmup for %d epoch(s)).",
+            frozen, self._det_freeze_epochs,
+        )
+
+    def _unfreeze_backbone(self) -> None:
+        """Unfreeze backbone parameters after the warm-up phase."""
+        unfrozen = 0
+        for name, p in self.model.named_parameters():
+            if name.startswith("backbone"):
+                p.requires_grad_(True)
+                unfrozen += 1
+        logger.info(
+            "  [Detection QAT] Backbone unfrozen: %d parameters.",
+            unfrozen,
+        )
 
     # ------------------------------------------------------------------
     # Helpers
