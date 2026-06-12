@@ -1746,16 +1746,53 @@ class NeuroQuantPipeline:
 
         from neuroquant.xai.explainability import XAIGenerator
 
-        # Get test images
-        test_images, test_labels = [], []
+        # Get test images + labels (task-aware).
+        # Classification/segmentation: batch = (Tensor[B,...], Tensor[B,...])
+        #   → torch.cat works directly.
+        # Detection: batch = (List[Tensor], List[Dict])
+        #   → images are stacked manually, labels stored as a flat list
+        #     of dicts and converted to scalar tensors via their dominant
+        #     class so _gt_label_index still works.
+        task = getattr(self.config, "task", "classification")
+        test_images_list: List[torch.Tensor] = []
+        test_labels_list: List[Any] = []
+        n_needed = self.config.hyperparams.xai_num_images
+        n_collected = 0
+
         for batch in self.val_loader:
-            test_images.append(batch[0])
-            test_labels.append(batch[1])
-            if len(test_images) * batch[0].shape[0] >= self.config.hyperparams.xai_num_images:
+            if task == "detection":
+                imgs, targets = batch
+                # imgs is List[Tensor[C,H,W]] — stack into [B,C,H,W]
+                if isinstance(imgs, (list, tuple)):
+                    for img_t in imgs:
+                        test_images_list.append(img_t.unsqueeze(0))
+                        n_collected += 1
+                        if n_collected >= n_needed:
+                            break
+                else:
+                    test_images_list.append(imgs)
+                    n_collected += imgs.shape[0]
+                # For labels: extract dominant class from each target dict
+                if isinstance(targets, (list, tuple)):
+                    for tgt in targets:
+                        if isinstance(tgt, dict) and "labels" in tgt:
+                            dom = int(tgt["labels"][0].item()) if tgt["labels"].numel() > 0 else -1
+                        else:
+                            dom = -1
+                        test_labels_list.append(torch.tensor(dom))
+                        if len(test_labels_list) >= n_needed:
+                            break
+            else:
+                # Classification / segmentation: both are tensors
+                test_images_list.append(batch[0])
+                test_labels_list.append(batch[1])
+                n_collected += batch[0].shape[0]
+
+            if n_collected >= n_needed:
                 break
 
-        test_images = torch.cat(test_images, dim=0)[:self.config.hyperparams.xai_num_images]
-        test_labels = torch.cat(test_labels, dim=0)[:self.config.hyperparams.xai_num_images]
+        test_images = torch.cat(test_images_list, dim=0)[:n_needed]
+        test_labels = torch.cat(test_labels_list, dim=0)[:n_needed]
 
         xai_dir = self.output_dir / "xai"
         xai_gen = XAIGenerator(self.config, device=self.device)
