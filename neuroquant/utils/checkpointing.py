@@ -270,6 +270,26 @@ class CheckpointManager:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
+def _safe_gpu_name() -> Optional[str]:
+    """Return GPU name, or None if the device is unavailable (MIG/OOM)."""
+    try:
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            return torch.cuda.get_device_name(0)
+    except (AssertionError, RuntimeError):
+        pass
+    return None
+
+
+def _safe_gpu_count() -> int:
+    """Return GPU count, or 0 if the query fails."""
+    try:
+        if torch.cuda.is_available():
+            return torch.cuda.device_count()
+    except (AssertionError, RuntimeError):
+        pass
+    return 0
+
+
 def save_reproducibility_manifest(
     output_dir: str,
     config: Any,
@@ -299,8 +319,8 @@ def save_reproducibility_manifest(
             "cuda_available": torch.cuda.is_available(),
             "cuda_version": torch.version.cuda if torch.cuda.is_available() else None,
             "cudnn_version": str(torch.backends.cudnn.version()) if torch.cuda.is_available() else None,
-            "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-            "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+            "gpu_name": _safe_gpu_name(),
+            "gpu_count": _safe_gpu_count(),
             "os": platform.platform(),
             "cpu": platform.processor(),
         },

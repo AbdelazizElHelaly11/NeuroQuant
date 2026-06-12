@@ -13,6 +13,7 @@ model:
                                        # FP32 mIoU on VOC val ≈ 78–80%
   path: null                           # null = auto-download from torchvision hub
   class: null
+  pretrained: true                     # CRITICAL: load COCO pretrained weights (not random init)
   num_classes: 21                      # Pascal VOC: 20 objects + background
   input_shape: [3, 520, 520]           # standard DeepLabV3 evaluation resolution
   task: "segmentation"
