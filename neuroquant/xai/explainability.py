@@ -337,8 +337,15 @@ class GradCAMExplainer:
             # Weighted sum of activations
             cam = (weights * self._activations).sum(dim=1, keepdim=True)  # [1, 1, H, W]
 
-            # ReLU (only positive contributions)
-            cam = F.relu(cam)
+            # Grad-CAM keeps only positive contributions via ReLU, but for
+            # some quantized models — notably QAT after Conv-BN folding —
+            # the gradient-weighted sum at the target layer can be entirely
+            # negative. ReLU then zeroes the whole map, the heatmap is flat,
+            # and the consistency score collapses to exactly 0.0000. Fall
+            # back to the magnitude map in that degenerate case so a real
+            # (if sign-flipped) attention pattern still surfaces.
+            cam_pos = F.relu(cam)
+            cam = cam_pos if float(cam_pos.abs().max()) > 1e-12 else cam.abs()
 
             # Normalise to [0, 1]
             cam = cam.squeeze().detach().cpu().numpy()
