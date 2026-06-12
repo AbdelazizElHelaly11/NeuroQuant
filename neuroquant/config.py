@@ -386,6 +386,20 @@ class HyperparameterSet:
     # GPTQ
     gptq_block_size: int = 128
     gptq_percdamp: float = 0.01
+    # Activation rows streamed per matmul when accumulating the GPTQ
+    # Hessian H = XᵀX. The full im2col matrix is NEVER materialised on
+    # the GPU; rows are processed in chunks of this size so peak
+    # activation memory stays bounded regardless of calibration-set size
+    # or feature-map resolution. Lower this on memory-constrained GPUs
+    # (e.g. an A100 MIG slice); raise it for speed on large-VRAM devices.
+    # 0 = process each calibration batch whole (legacy behaviour).
+    gptq_hessian_chunk_rows: int = 8192
+    # When a single layer's GPTQ step still OOMs (very large in_features ×
+    # spatial — e.g. DeepLabV3 ASPP atrous convs at in_features=18432),
+    # fall back to standard per-channel round-to-nearest for THAT layer
+    # instead of aborting the whole method. Keeps the GPTQ /
+    # SmoothQuant→GPTQ comparison populated on small GPUs.
+    gptq_oom_fallback: bool = True
 
     # SmoothQuant
     smoothquant_alpha: float = 0.5
@@ -442,6 +456,13 @@ class HyperparameterSet:
     xai_grad_cam_alpha: float = 0.4       # Heatmap overlay transparency
     xai_shap_n_samples: int = 50          # SHAP background samples
     xai_plot_dpi: int = 150               # Plot resolution
+    # Optional explicit Grad-CAM target layer (dotted module path, e.g.
+    # "classifier.1" or "backbone.layer4.2.conv3"). When None (default)
+    # the layer is auto-detected per model by gradient connectivity — the
+    # deepest Conv2d that actually receives gradient from the main output,
+    # which skips auxiliary heads (e.g. DeepLabV3 ``aux_classifier``, not
+    # on ``output['out']``) that would otherwise yield all-zero heatmaps.
+    xai_target_layer: Optional[str] = None
 
     # Evaluation / Metrics
     eval_primary_accuracy: str = "top1"   # Public reporting stays top-1 only

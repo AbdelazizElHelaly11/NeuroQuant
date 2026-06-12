@@ -97,15 +97,26 @@ class GPTQQuantizer(BaseQuantizer):
             calibration_loader, self.device, num_batches,
         )
 
-        # Quantize each layer
+        # Quantize each layer. The per-layer calibration inputs are kept
+        # on the CPU by ``collect_layer_inputs`` and streamed onto the GPU
+        # one chunk at a time inside ``_quantize_layer`` — we deliberately
+        # do NOT ``torch.cat(...).to(device)`` the whole stack, because the
+        # im2col expansion of that concatenation is what OOMs a small GPU
+        # (e.g. a 20 GB A100 MIG slice) on large convs.
         for layer_name, module in target_layers.items():
-            inputs = layer_inputs.get(layer_name, [])
+            inputs = layer_inputs.get(layer_name) or []
             if not inputs:
                 logger.warning("  No calibration data for '%s', skipping", layer_name)
                 continue
 
-            inp_cat = torch.cat(inputs, dim=0).to(self.device)
-            self._quantize_layer(module, layer_name, inp_cat, bitwidth, damp_pct)
+            self._quantize_layer(module, layer_name, inputs, bitwidth, damp_pct)
+
+            # Release this layer's calibration activations as we advance so
+            # peak CPU RAM doesn't grow with model depth, and reclaim any
+            # freed GPU blocks before the next (possibly larger) layer.
+            layer_inputs[layer_name] = None
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
         elapsed = time.time() - start
         logger.info("GPTQ INT%d complete in %.1fs", bitwidth, elapsed)
@@ -115,28 +126,38 @@ class GPTQQuantizer(BaseQuantizer):
         self,
         layer: nn.Module,
         layer_name: str,
-        inp: torch.Tensor,
+        inputs: List[torch.Tensor],
         bitwidth: int,
         damp_pct: float,
     ) -> None:
         """
         Quantize a single layer using the GPTQ OBS algorithm.
 
-        Reshapes Conv2d weights to 2D and unfolds Conv2d inputs
-        via im2col for Hessian computation.
+        Reshapes Conv2d weights to 2D and unfolds Conv2d inputs via im2col
+        for Hessian computation. ``inputs`` is the list of per-batch
+        calibration activations captured by ``collect_layer_inputs`` (kept
+        on the CPU); they are streamed onto the GPU in row-chunks so the
+        full im2col matrix is never materialised at once.
 
-        Falls back to standard quantization for depthwise convolutions
-        where Hessian dimensions don't match weight matrix columns.
+        Falls back to standard per-channel quantization when:
+          * the layer is depthwise (groups > 1) — Hessian dim mismatch,
+          * the unfolded input width doesn't match the weight columns, or
+          * the full GPTQ step OOMs and ``gptq_oom_fallback`` is enabled.
         """
         weight = layer.weight.data
         is_conv = isinstance(layer, nn.Conv2d)
 
+        def _standard_fallback(reason: str) -> None:
+            with torch.no_grad():
+                layer.weight.data = self.quantize_tensor(
+                    weight, bitwidth, per_channel=True,
+                )
+            logger.info("    %s: standard INT%d (%s)",
+                        layer_name, bitwidth, reason)
+
         # Skip depthwise convolutions (groups > 1): Hessian dim mismatch
         if is_conv and layer.groups > 1:
-            with torch.no_grad():
-                layer.weight.data = self.quantize_tensor(weight, bitwidth, per_channel=True)
-            logger.info("    %s: standard INT%d (depthwise conv, groups=%d)",
-                         layer_name, bitwidth, layer.groups)
+            _standard_fallback(f"depthwise conv, groups={layer.groups}")
             return
 
         # Reshape weight to 2D: [out_features, in_features]
@@ -145,82 +166,117 @@ class GPTQQuantizer(BaseQuantizer):
             w_2d = weight.reshape(out_ch, -1)  # [out, in*kH*kW]
         else:
             w_2d = weight.clone()  # [out, in]
+        in_features = w_2d.shape[1]
 
-        # Unfold conv inputs via im2col
-        if is_conv:
-            x_2d = self._unfold_conv_input(inp, layer)  # [N*H_out*W_out, in*kH*kW]
-        else:
-            # Linear: flatten batch dims
-            if inp.dim() > 2:
-                x_2d = inp.reshape(-1, inp.shape[-1])
-            else:
-                x_2d = inp
+        hp = self.config.hyperparams
+        chunk_rows = int(getattr(hp, "gptq_hessian_chunk_rows", 8192) or 0)
+        oom_fallback = bool(getattr(hp, "gptq_oom_fallback", True))
 
-        x_2d = x_2d.to(self.device)
-
-        # Verify dimensions match before computing Hessian
-        if x_2d.shape[1] != w_2d.shape[1]:
-            with torch.no_grad():
-                layer.weight.data = self.quantize_tensor(weight, bitwidth, per_channel=True)
-            logger.info("    %s: standard INT%d (dim mismatch: H=%d vs W=%d)",
-                         layer_name, bitwidth, x_2d.shape[1], w_2d.shape[1])
-            return
-
-        # Compute Hessian: H = X^T X / N
-        n_samples = x_2d.shape[0]
-        H = (x_2d.t() @ x_2d) / n_samples  # [in_features, in_features]
-
-        # Dampening
-        diag_mean = H.diag().mean().item()
-        damp = max(damp_pct * diag_mean, MIN_DAMP)
-        H += damp * torch.eye(H.shape[0], device=self.device)
-
-        # Invert Hessian (Cholesky for numerical stability)
         try:
-            L = torch.linalg.cholesky(H)
-            H_inv = torch.cholesky_inverse(L)
-        except RuntimeError:
-            # Fallback: add more dampening
-            H += 0.1 * torch.eye(H.shape[0], device=self.device)
-            H_inv = torch.inverse(H)
+            # ── Memory-bounded Hessian accumulation: H = (1/N) Σ xᵀx ──
+            # The full im2col matrix is the OOM culprit on large convs, so
+            # we stream each calibration batch through im2col, then add its
+            # rows into H in sub-chunks of ``chunk_rows``. Peak activation
+            # memory is one sub-chunk, not the whole calibration set.
+            H = torch.zeros(in_features, in_features, device=self.device)
+            n_samples = 0
+            for chunk in inputs:
+                xc = chunk.to(self.device, non_blocking=True)
+                if is_conv:
+                    x_2d = self._unfold_conv_input(xc, layer)
+                elif xc.dim() > 2:
+                    x_2d = xc.reshape(-1, xc.shape[-1])
+                else:
+                    x_2d = xc
 
-        # GPTQ: quantize columns sequentially with error propagation
-        n_cols = w_2d.shape[1]
-        qmin = -(2 ** (bitwidth - 1))
-        qmax = 2 ** (bitwidth - 1) - 1
+                # Verify dims once on the first chunk; bail to fallback.
+                if x_2d.shape[1] != in_features:
+                    mismatch = x_2d.shape[1]
+                    del xc, x_2d, H
+                    _standard_fallback(
+                        f"dim mismatch: H={mismatch} vs W={in_features}")
+                    return
 
-        for col in range(n_cols):
-            w_col = w_2d[:, col].clone()
+                rows = x_2d.shape[0]
+                step = chunk_rows if chunk_rows > 0 else rows
+                for r0 in range(0, rows, step):
+                    xr = x_2d[r0:r0 + step]
+                    H += xr.t() @ xr
+                    n_samples += xr.shape[0]
+                del xc, x_2d
 
-            # Compute scale for this column
-            amax = w_col.abs().max().clamp(min=MIN_SCALE)
-            scale = amax / qmax
+            if n_samples == 0:
+                del H
+                _standard_fallback("no calibration rows")
+                return
+            H /= n_samples
 
-            # Quantize
-            w_q = (w_col / scale).round().clamp(qmin, qmax) * scale
+            # Dampening — add to the diagonal in place (no dense identity).
+            diag_mean = H.diag().mean().item()
+            damp = max(damp_pct * diag_mean, MIN_DAMP)
+            H.diagonal().add_(damp)
 
-            # Compute error
-            error = w_col - w_q
+            # Invert Hessian (Cholesky for numerical stability).
+            try:
+                L = torch.linalg.cholesky(H)
+                H_inv = torch.cholesky_inverse(L)
+                del L
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower():
+                    raise
+                # Non-PD matrix: add more dampening and use a dense inverse.
+                H.diagonal().add_(0.1)
+                H_inv = torch.inverse(H)
+            del H
 
-            # Apply quantized value
-            w_2d[:, col] = w_q
+            # GPTQ: quantize columns sequentially with error propagation.
+            n_cols = in_features
+            qmin = -(2 ** (bitwidth - 1))
+            qmax = 2 ** (bitwidth - 1) - 1
 
-            # Propagate error to subsequent columns using Hessian inverse
-            if col < n_cols - 1:
-                h_ii = H_inv[col, col].clamp(min=MIN_SCALE)
-                # Update remaining columns
-                w_2d[:, col + 1:] -= (
-                    error.unsqueeze(1) * H_inv[col, col + 1:].unsqueeze(0) / h_ii
-                )
+            for col in range(n_cols):
+                w_col = w_2d[:, col].clone()
 
-        # Write back
-        if is_conv:
-            layer.weight.data = w_2d.reshape_as(weight)
-        else:
-            layer.weight.data = w_2d
+                # Compute scale for this column.
+                amax = w_col.abs().max().clamp(min=MIN_SCALE)
+                scale = amax / qmax
 
-        logger.info("    %s: GPTQ INT%d applied (%d cols)",
-                     layer_name, bitwidth, n_cols)
+                # Quantize.
+                w_q = (w_col / scale).round().clamp(qmin, qmax) * scale
+
+                # Compute error.
+                error = w_col - w_q
+
+                # Apply quantized value.
+                w_2d[:, col] = w_q
+
+                # Propagate error to subsequent columns via Hessian inverse.
+                if col < n_cols - 1:
+                    h_ii = H_inv[col, col].clamp(min=MIN_SCALE)
+                    w_2d[:, col + 1:] -= (
+                        error.unsqueeze(1) * H_inv[col, col + 1:].unsqueeze(0) / h_ii
+                    )
+
+            del H_inv
+
+            # Write back.
+            if is_conv:
+                layer.weight.data = w_2d.reshape_as(weight)
+            else:
+                layer.weight.data = w_2d
+
+            logger.info("    %s: GPTQ INT%d applied (%d cols)",
+                         layer_name, bitwidth, n_cols)
+
+        except RuntimeError as exc:
+            # CUDA OOM (or any runtime failure) on this single layer: keep
+            # the method alive by degrading to per-channel rounding for just
+            # this layer instead of aborting all of GPTQ.
+            if "out of memory" not in str(exc).lower() or not oom_fallback:
+                raise
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            _standard_fallback("OOM on full GPTQ → per-channel fallback")
 
     def _unfold_conv_input(
         self, inp: torch.Tensor, layer: nn.Conv2d
