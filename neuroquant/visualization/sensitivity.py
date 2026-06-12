@@ -106,21 +106,40 @@ def plot_sensitivity_heatmap(
         # Fall back to all layers if no cluster assignments found
         clustered_hessian = flat_hessian
 
-    # Sort layers by sensitivity (descending), take top_n
-    sorted_layers = sorted(
-        clustered_hessian.items(), key=lambda kv: kv[1], reverse=True,
-    )[:top_n]
+    # Stratified selection across tiers. Taking the global top-N by score
+    # makes the chart almost entirely HIGH-tier (red) and hides the
+    # LOW/green tier completely — which then contradicts the tier pie
+    # chart (e.g. "33% LOW" with no green bars visible). Instead take the
+    # top-scoring layers from EACH tier so all three colours appear.
+    by_tier: Dict[str, List] = {"HIGH": [], "MEDIUM": [], "LOW": []}
+    for name, score in clustered_hessian.items():
+        by_tier.setdefault(tier_map.get(name, "MEDIUM"), []).append((name, score))
+    per_tier = max(1, top_n // 3)
+    selected: List = []
+    for tier in ("HIGH", "MEDIUM", "LOW"):
+        ranked = sorted(by_tier.get(tier, []), key=lambda kv: kv[1], reverse=True)
+        selected.extend(ranked[:per_tier])
 
+    # Sort the combined selection by score (descending) for display.
+    sorted_layers = sorted(selected, key=lambda kv: kv[1], reverse=True)
     if not sorted_layers:
         return None
 
     # Reverse for horizontal bar (highest at top)
     sorted_layers = list(reversed(sorted_layers))
     names = [_short_name(n) for n, _ in sorted_layers]
-    scores = [s for _, s in sorted_layers]
+    raw_scores = [s for _, s in sorted_layers]
     full_names = [n for n, _ in sorted_layers]
     colors = [TIER_COLORS.get(tier_map.get(n, "MEDIUM"), DEFAULT_COLOR)
               for n in full_names]
+
+    # Raw Fisher/Hessian diagonals are ~1e-5, so a ``.4f`` annotation
+    # printed "0.0000" on every bar. Plot the score RELATIVE to the most
+    # sensitive layer (= 1.0) so bar lengths and labels are readable while
+    # preserving the true ratios between layers.
+    score_max = max(raw_scores) if raw_scores else 1.0
+    score_max = score_max if score_max > 0 else 1.0
+    scores = [s / score_max for s in raw_scores]
 
     fig, ax = plt.subplots(
         figsize=(10, max(5, len(names) * 0.32 + 1.5)),
@@ -132,10 +151,11 @@ def plot_sensitivity_heatmap(
     )
     ax.set_yticks(range(len(names)))
     ax.set_yticklabels(names, fontsize=8)
-    ax.set_xlabel("Sensitivity Score (Fisher / Hessian diagonal)")
+    ax.set_xlabel("Relative Sensitivity (Fisher / Hessian, normalised to most-sensitive layer)")
+    ax.set_xlim(0, 1.08)
     ax.set_title(
         f"Per-Layer Quantization Sensitivity — {model_name}\n"
-        f"Top {len(names)} layers (sorted by score)",
+        f"Top {per_tier} layers per tier (HIGH / MEDIUM / LOW)",
         pad=12,
     )
 
@@ -149,14 +169,14 @@ def plot_sensitivity_heatmap(
     ax.legend(handles=legend_handles, loc="lower right", title="Tier",
               fontsize=9)
 
-    # Score annotations on bars
-    max_score = max(scores) if scores else 1.0
-    for i, (bar, score) in enumerate(zip(bars, scores)):
-        if score > max_score * 0.05:  # only annotate visible bars
-            ax.text(
-                bar.get_width() + max_score * 0.01, bar.get_y() + bar.get_height() / 2,
-                f"{score:.4f}", va="center", fontsize=7, color="#555555",
-            )
+    # Score annotations on every bar (including the small LOW-tier ones,
+    # which are the whole point of showing the green tier). Two decimals
+    # of the normalised score is always legible — no more "0.0000".
+    for bar, score in zip(bars, scores):
+        ax.text(
+            bar.get_width() + 0.012, bar.get_y() + bar.get_height() / 2,
+            f"{score:.2f}", va="center", fontsize=7, color="#555555",
+        )
 
     ax.grid(True, axis="x", alpha=0.3)
     fig.tight_layout()

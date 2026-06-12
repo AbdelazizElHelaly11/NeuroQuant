@@ -82,46 +82,53 @@ def compute_layer_errors(
     fp32_model = fp32_model.to(device).eval()
     quant_model = quant_model.to(device).eval()
 
-    # Identify matching layers by name
-    fp32_layers: Dict[str, nn.Module] = {}
-    quant_layers: Dict[str, nn.Module] = {}
+    # Identify matching layers, preserving registration order so we can
+    # fall back to POSITIONAL pairing when wrappers rename the quantized
+    # layers. SmoothQuant/AWQ insert ``_SmoothInputScale`` / ``_AWQInputScale``
+    # modules, so e.g. ``classifier.1`` becomes ``classifier.1.0`` — exact
+    # and suffix matching then find nothing and the whole plot was skipped.
+    fp32_ordered = [
+        (n, m) for n, m in fp32_model.named_modules() if isinstance(m, layer_types)
+    ]
+    quant_ordered = [
+        (n, m) for n, m in quant_model.named_modules() if isinstance(m, layer_types)
+    ]
+    fp32_by_name = dict(fp32_ordered)
+    quant_by_name = dict(quant_ordered)
 
-    for name, m in fp32_model.named_modules():
-        if isinstance(m, layer_types):
-            fp32_layers[name] = m
+    # ``pairs``: display_name -> (fp32_module, quant_module).
+    common = sorted(set(fp32_by_name) & set(quant_by_name))
+    if common:
+        pairs: Dict[str, Tuple[nn.Module, nn.Module]] = {
+            n: (fp32_by_name[n], quant_by_name[n]) for n in common
+        }
+    elif len(fp32_ordered) == len(quant_ordered) and fp32_ordered:
+        # Same architecture, only renamed by wrappers → pair by position.
+        pairs = {
+            fn: (fm, qm)
+            for (fn, fm), (qn, qm) in zip(fp32_ordered, quant_ordered)
+        }
+        logger.info(
+            "  Error attribution: matched %d layers positionally "
+            "(quantization wrappers renamed them).", len(pairs),
+        )
+    else:
+        pairs = {}
 
-    for name, m in quant_model.named_modules():
-        if isinstance(m, layer_types):
-            quant_layers[name] = m
-
-    # Find common layers
-    common_names = sorted(set(fp32_layers.keys()) & set(quant_layers.keys()))
-    if not common_names:
-        # Try fuzzy matching by stripping wrapper prefixes
-        common_names = _fuzzy_match_layers(fp32_layers, quant_layers)
-
-    if not common_names:
+    if not pairs:
         logger.warning("No common layers found for error attribution.")
         return []
+
+    common_names = list(pairs.keys())
 
     # Register hooks
     fp32_acts: Dict[str, List[torch.Tensor]] = {n: [] for n in common_names}
     quant_acts: Dict[str, List[torch.Tensor]] = {n: [] for n in common_names}
 
-    fp32_hooks = []
-    quant_hooks = []
-
-    for name in common_names:
-        if name in fp32_layers:
-            h = fp32_layers[name].register_forward_hook(
-                _make_hook(fp32_acts, name)
-            )
-            fp32_hooks.append(h)
-        if name in quant_layers:
-            h = quant_layers[name].register_forward_hook(
-                _make_hook(quant_acts, name)
-            )
-            quant_hooks.append(h)
+    hooks = []
+    for name, (fmod, qmod) in pairs.items():
+        hooks.append(fmod.register_forward_hook(_make_hook(fp32_acts, name)))
+        hooks.append(qmod.register_forward_hook(_make_hook(quant_acts, name)))
 
     # Forward pass
     with torch.no_grad():
@@ -134,7 +141,7 @@ def compute_layer_errors(
             quant_model(x)
 
     # Remove hooks
-    for h in fp32_hooks + quant_hooks:
+    for h in hooks:
         h.remove()
 
     # Compute errors
@@ -167,7 +174,7 @@ def compute_layer_errors(
         diff_norm = float(torch.norm(fp32_flat - quant_flat).item())
         rel_error = diff_norm / max(fp32_norm, 1e-8)
 
-        layer_type = type(fp32_layers.get(name, quant_layers.get(name))).__name__
+        layer_type = type(pairs[name][0]).__name__
 
         results.append({
             "name": name,
