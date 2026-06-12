@@ -1080,7 +1080,14 @@ class NeuroQuantPipeline:
         #     at the deployment-time INT8 (or qat_act_bitwidth) scale.
         #   - Weights are fake-quantized via an autograd-aware
         #     parametrization so STE clipping actually fires.
-        qat_model = copy.deepcopy(self.adaround_result["model"])
+        # Use AdaRound model if available, otherwise fall back to FP32
+        # baseline (when phase_1d was skipped or not in the phase list).
+        if self.adaround_result and self.adaround_result.get("model") is not None:
+            qat_model = copy.deepcopy(self.adaround_result["model"])
+        else:
+            logger.info("  AdaRound not available — QAT warm-starting from FP32 baseline.")
+            qat_model = copy.deepcopy(self.model)
+
         teacher = copy.deepcopy(self.model)  # untouched FP32 baseline
         qat_trainer = QATTrainer(
             qat_model,
