@@ -1598,7 +1598,17 @@ class NeuroQuantPipeline:
 
         # QAT entry — synthesise from the in-memory result.
         if self.qat_result:
-            qat_acc = float(self.qat_result.get("final_val_acc", 0.0) or 0.0)
+            # Use the QAT model's REAL evaluated accuracy (``test_top1`` =
+            # mIoU for segmentation). ``final_val_acc`` is the early-stop
+            # metric, which for non-classification tasks is *negative
+            # validation loss* — feeding it here previously placed an
+            # impossible negative "mIoU" point on the Pareto front and
+            # corrupted the hypervolume normalisation.
+            _qat_test = self.qat_result.get("test_top1")
+            qat_acc = float(
+                _qat_test if _qat_test is not None
+                else (self.qat_result.get("final_val_acc", 0.0) or 0.0)
+            )
             qat_bw = self.best_config or {}
             qat_ebops = self._ebops_from_bitwidth(qat_bw)
             qat_red = (
@@ -1665,6 +1675,24 @@ class NeuroQuantPipeline:
             s for s in all_solutions
             if not str(s.get("solution_id", "")).startswith("nsga_")
         ]
+        # Validity guard: drop solutions whose accuracy is outside [0, 100].
+        # A negative or >100 "accuracy" is always an upstream metric leak
+        # (e.g. a loss value misused as accuracy); letting it reach the
+        # analyzer skews accuracy_min / accuracy_range and the hypervolume.
+        _valid = [
+            s for s in public_candidates
+            if 0.0 <= float(s.get("accuracy", 0.0)) <= 100.0
+        ]
+        _dropped = len(public_candidates) - len(_valid)
+        if _dropped:
+            logger.warning(
+                "  Dropped %d Pareto candidate(s) with out-of-range "
+                "accuracy (expected 0–100): %s",
+                _dropped,
+                [s.get("solution_id") for s in public_candidates
+                 if s not in _valid],
+            )
+        public_candidates = _valid
         non_dominated = self._filter_non_dominated_solutions(public_candidates)
         non_dominated_ids = {
             str(s.get("solution_id", "")) for s in non_dominated
@@ -1862,6 +1890,9 @@ class NeuroQuantPipeline:
             test_labels=test_labels,
             output_dir=str(xai_dir),
             class_names=self.class_names,
+            target_layer_name=getattr(
+                self.config.hyperparams, "xai_target_layer", None,
+            ),
         )
 
         n_heatmaps = sum(
@@ -1961,7 +1992,13 @@ class NeuroQuantPipeline:
             "phases_completed": self.phases_passed,
         }
         if self.qat_result:
-            summary_metrics["best_qat_acc"] = self.qat_result.get("final_val_acc", 0)
+            # Prefer the real evaluated accuracy; ``final_val_acc`` is
+            # negative val-loss for non-classification tasks (see phase 2).
+            _qt = self.qat_result.get("test_top1")
+            summary_metrics["best_qat_acc"] = float(
+                _qt if _qt is not None
+                else (self.qat_result.get("final_val_acc", 0) or 0)
+            )
         if self.pareto_analysis:
             summary_metrics["hypervolume"] = self.pareto_analysis.get(
                 "metrics", {}
@@ -2034,6 +2071,15 @@ class NeuroQuantPipeline:
 
         # ── HTML Report Generation ──
         # Compile all pipeline artifacts into a self-contained HTML file.
+        # The report counts methods from ``results['method_results']``;
+        # source it from the canonical public summary rows (minus the FP32
+        # comparator) so "Methods Evaluated" matches the report table even
+        # on resumed runs — where ``self.method_results`` only holds the
+        # phase-1f entries and would undercount (or show 0).
+        self.results["method_results"] = [
+            r for r in getattr(self, "_summary_rows", [])
+            if r.get("method") != "FP32"
+        ]
         try:
             from neuroquant.visualization.report import generate_html_report
             report_html = generate_html_report(
@@ -2154,6 +2200,15 @@ class NeuroQuantPipeline:
         for res in (ptq_acc, ptq_to):
             if not res:
                 continue
+            # Mirror the fresh phase: the phase-2 Pareto front walks
+            # ``method_results``, so PTQ must be present there on resume
+            # too — otherwise the front silently drops it (dedup by id).
+            _rid = res.get("display_name") or res.get("config_id")
+            if _rid and not any(
+                (r.get("display_name") or r.get("config_id")) == _rid
+                for r in self.method_results
+            ):
+                self.method_results.append(res)
             lat = res.get("latency") or {}
             onnx_lat = res.get("onnx_latency") or {}
             self._add_summary_row(
@@ -2283,7 +2338,20 @@ class NeuroQuantPipeline:
 
     def _resume_phase_1f_gptq_smooth_awq(self) -> None:
         data = self.ckpt.load_phase_json("phase_1f_gptq_smooth_awq")
-        self.method_results = data.get("method_results", []) or []
+        # Merge (dedup by id) rather than overwrite: earlier resume
+        # restorers (notably phase 1c PTQ) may have already populated
+        # ``method_results``. A blind overwrite dropped those entries, so
+        # the phase-2 Pareto front and the report under-counted methods.
+        _restored = data.get("method_results", []) or []
+        _existing_ids = {
+            (r.get("display_name") or r.get("config_id"))
+            for r in self.method_results
+        }
+        for r in _restored:
+            _rid = r.get("display_name") or r.get("config_id")
+            if _rid not in _existing_ids:
+                self.method_results.append(r)
+                _existing_ids.add(_rid)
 
         # Rematerialise quantized models used by phase 3 (XAI). Each is the
         # same architecture as the baseline with a modified state_dict.
