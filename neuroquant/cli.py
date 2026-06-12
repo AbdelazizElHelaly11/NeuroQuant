@@ -2069,6 +2069,19 @@ class NeuroQuantPipeline:
         if task == "detection":
             self._export_detection_backends()
 
+        # Write the reproducibility manifest BEFORE the HTML report: the
+        # report's Reproducibility table reads gpu_name/versions from the
+        # manifest file on disk, so without this it showed the PREVIOUS
+        # run's manifest (or GPU: None). run() refreshes it again at the
+        # very end with final timings.
+        try:
+            from neuroquant.utils.checkpointing import save_reproducibility_manifest
+            save_reproducibility_manifest(
+                str(self.output_dir), self.config, self.results,
+            )
+        except Exception as exc:
+            logger.warning("  Manifest pre-write skipped: %s", exc)
+
         # ── HTML Report Generation ──
         # Compile all pipeline artifacts into a self-contained HTML file.
         # The report counts methods from ``results['method_results']``;
@@ -2165,6 +2178,25 @@ class NeuroQuantPipeline:
         )
         self.results["hessian_layers"] = len(self.hessian_diag)
         self.results["num_clusters"] = len(self.cluster_assignments)
+
+        # Re-render the sensitivity plots from the restored data. Phase 1a
+        # is skipped on resume, so without this the report would keep
+        # embedding the ORIGINAL (pre-fix) PNGs. Cheap — no Hessian recompute.
+        try:
+            from neuroquant.visualization.sensitivity import (
+                plot_sensitivity_heatmap, plot_tier_distribution,
+            )
+            if self.hessian_diag and self.cluster_result:
+                plot_sensitivity_heatmap(
+                    self.hessian_diag, self.cluster_result,
+                    str(self.output_dir), model_name=self.config.model_name,
+                )
+                plot_tier_distribution(
+                    self.cluster_result, str(self.output_dir),
+                    model_name=self.config.model_name,
+                )
+        except Exception as exc:
+            logger.warning("  Sensitivity plot re-render on resume skipped: %s", exc)
 
     def _resume_phase_1c_nsga_search(self) -> None:
         data = self.ckpt.load_phase_json("phase_1c_nsga_search")

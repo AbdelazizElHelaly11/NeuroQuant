@@ -271,11 +271,39 @@ class CheckpointManager:
 
 
 def _safe_gpu_name() -> Optional[str]:
-    """Return GPU name, or None if the device is unavailable (MIG/OOM)."""
+    """Return the GPU name, or None if it cannot be determined.
+
+    The in-process CUDA query (``get_device_name``) can raise
+    ``AssertionError: Invalid device id`` on SLURM MIG slices or after a
+    CUDA OOM, which previously left the manifest/report showing
+    ``GPU: None`` even though a GPU was clearly in use. We try several
+    torch APIs and finally fall back to ``nvidia-smi`` so the device is
+    still recorded.
+    """
+    if torch.cuda.is_available():
+        for getter in (
+            lambda: torch.cuda.get_device_name(torch.cuda.current_device()),
+            lambda: torch.cuda.get_device_name(0),
+            lambda: torch.cuda.get_device_properties(0).name,
+        ):
+            try:
+                name = getter()
+                if name:
+                    return str(name)
+            except (AssertionError, RuntimeError, IndexError):
+                continue
+    # Last resort: ask the driver directly — works on MIG slices and when
+    # the in-process CUDA context is unusable.
     try:
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            return torch.cuda.get_device_name(0)
-    except (AssertionError, RuntimeError):
+        import subprocess
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        lines = [ln.strip() for ln in (out.stdout or "").splitlines() if ln.strip()]
+        if lines:
+            return lines[0]
+    except Exception:
         pass
     return None
 
