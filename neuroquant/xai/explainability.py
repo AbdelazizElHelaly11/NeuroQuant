@@ -569,6 +569,101 @@ def auto_detect_target_layer(model: nn.Module) -> Tuple[str, nn.Module]:
     return last_conv_name, last_conv_module
 
 
+def auto_detect_target_layer_grad_aware(
+    model: nn.Module,
+    probe_image: torch.Tensor,
+    device: torch.device,
+    *,
+    target_class: Optional[int] = None,
+    num_classes: Optional[int] = None,
+) -> Tuple[str, nn.Module]:
+    """Pick the deepest Conv2d that receives gradient from the task target.
+
+    Unlike :func:`auto_detect_target_layer` — which blindly takes the last
+    Conv2d in *registration* order — this runs a probe forward+backward and
+    keeps only convolutions that lie on the gradient path of the model's
+    **main** output (``compute_backward_target``). That makes it immune to
+    *auxiliary* branches: e.g. torchvision DeepLabV3's ``aux_classifier``
+    head is the last Conv2d by registration order, but it feeds
+    ``output['aux']`` from a separate backbone tap and is **not** part of
+    ``output['out']``. Selecting it gives all-zero Grad-CAM heatmaps
+    because no gradient ever reaches it — exactly the failure this fixes.
+
+    Among the on-graph convolutions with a usable (≥ 2×2) spatial grid, the
+    deepest is chosen. The final 1×1 logits conv (``out_channels ==
+    num_classes``) is skipped when a deeper feature conv exists, so the
+    heatmap reflects rich decode-head features rather than the raw class
+    score map.
+
+    Falls back to the last Conv2d overall when nothing receives gradient
+    (e.g. a fully frozen model or a ``no_grad`` output).
+    """
+    conv_layers = [
+        (n, m) for n, m in model.named_modules()
+        if isinstance(m, (nn.Conv2d, nn.Conv1d))
+    ]
+    if not conv_layers:
+        raise ValueError(
+            "No Conv2d layer found in model. Cannot compute Grad-CAM."
+        )
+
+    spatial_ok: Dict[str, bool] = {}
+    out_channels: Dict[str, int] = {}
+    got_grad: set = set()
+    hooks: List[Any] = []
+
+    def _make_fwd(name: str):
+        def _fwd(_module: nn.Module, _inp: Any, out: Any) -> None:
+            # Record only lightweight metadata (shape + a grad flag) — never
+            # retain the activation/gradient tensors, so probing a 100+ layer
+            # segmentation net costs almost no extra memory.
+            if not isinstance(out, torch.Tensor):
+                return
+            spatial_ok[name] = (
+                out.dim() == 4 and out.shape[2] >= 2 and out.shape[3] >= 2
+            )
+            out_channels[name] = out.shape[1] if out.dim() >= 2 else 0
+            if out.requires_grad:
+                out.register_hook(lambda _g, nm=name: got_grad.add(nm))
+        return _fwd
+
+    for name, module in conv_layers:
+        hooks.append(module.register_forward_hook(_make_fwd(name)))
+
+    try:
+        model.eval()
+        img = probe_image.to(device)
+        output = model(img)
+        scalar = compute_backward_target(output, target_class)
+        if scalar is not None:
+            model.zero_grad(set_to_none=True)
+            scalar.backward()
+    finally:
+        for h in hooks:
+            h.remove()
+        model.zero_grad(set_to_none=True)
+
+    # On-graph candidates (received gradient) with a usable spatial grid,
+    # in shallow→deep registration order.
+    candidates = [
+        (n, m) for n, m in conv_layers
+        if n in got_grad and spatial_ok.get(n)
+    ]
+    if not candidates:
+        # Nothing received gradient — degrade to the last conv overall.
+        return conv_layers[-1][0], conv_layers[-1][1]
+
+    # Prefer the deepest non-logits conv: walk from the deepest backwards
+    # and skip the final classification/segmentation head (a conv whose
+    # channel count equals the class count).
+    for name, module in reversed(candidates):
+        if num_classes is not None and out_channels.get(name) == int(num_classes):
+            continue
+        return name, module
+    # All on-graph convs were logits-sized — take the deepest.
+    return candidates[-1][0], candidates[-1][1]
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Vision Transformer detection + Attention Rollout
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -917,19 +1012,44 @@ class XAIGenerator:
 
         # Auto-detect target layer or fall back to Attention Rollout for
         # Vision Transformers (no Conv2d → Grad-CAM is meaningless).
+        #
+        # ``explicit_layer`` (from config ``xai_target_layer`` / caller)
+        # forces a specific dotted module path. Otherwise we detect the
+        # Grad-CAM target *per model* by gradient connectivity (see the
+        # loop below) so auxiliary heads like DeepLabV3's ``aux_classifier``
+        # — which are not on ``output['out']`` — are never selected; doing
+        # so previously produced all-zero heatmaps.
         use_rollout = is_vision_transformer(fp32_model)
+        explicit_layer = target_layer_name
+        probe_target = (
+            self._gt_label_index(test_labels[0]) if len(test_labels) else None
+        )
         if use_rollout:
             layer_name = "<attention_rollout>"
             logger.info(
                 "  Detected Vision Transformer — using Attention Rollout "
                 "instead of Grad-CAM (no Conv2d feature maps available)."
             )
-        elif target_layer_name is None:
-            layer_name, _ = auto_detect_target_layer(fp32_model)
-            logger.info("  Auto-detected target layer: '%s'", layer_name)
+        elif explicit_layer is not None:
+            layer_name = explicit_layer
+            logger.info("  Target layer (configured): '%s'", layer_name)
         else:
-            layer_name = target_layer_name
-            logger.info("  Target layer: '%s'", layer_name)
+            try:
+                layer_name, _ = auto_detect_target_layer_grad_aware(
+                    fp32_model, test_images[0:1], self.device,
+                    target_class=probe_target,
+                    num_classes=int(self.config.num_classes),
+                )
+                logger.info(
+                    "  Auto-detected target layer (gradient-aware): '%s'",
+                    layer_name,
+                )
+            except Exception as exc:
+                layer_name, _ = auto_detect_target_layer(fp32_model)
+                logger.warning(
+                    "  Gradient-aware detection failed (%s); falling back "
+                    "to last-conv: '%s'", exc, layer_name,
+                )
 
         # Background data for SHAP
         if background_data is None:
@@ -954,13 +1074,30 @@ class XAIGenerator:
                 explainer: Any = AttentionRolloutExplainer(model, self.device)
                 target_module = None
             else:
-                target_module = find_layer_by_name(model, layer_name)
+                # An explicit configured layer is resolved by name; the
+                # default path detects per model by gradient connectivity.
+                # Per-model detection is essential because quantization
+                # wrappers (SmoothQuant/AWQ input-scale wrappers) can rename
+                # modules, so a single shared name may miss — and because
+                # each model must hook a conv on *its own* output graph.
+                target_module = (
+                    find_layer_by_name(model, explicit_layer)
+                    if explicit_layer is not None else None
+                )
                 if target_module is None:
                     try:
-                        _, target_module = auto_detect_target_layer(model)
-                    except ValueError:
-                        logger.warning("    No conv layer in '%s', skipping", model_id)
-                        continue
+                        _, target_module = auto_detect_target_layer_grad_aware(
+                            model, test_images[0:1], self.device,
+                            target_class=probe_target,
+                            num_classes=int(self.config.num_classes),
+                        )
+                    except Exception:
+                        try:
+                            _, target_module = auto_detect_target_layer(model)
+                        except ValueError:
+                            logger.warning(
+                                "    No conv layer in '%s', skipping", model_id)
+                            continue
                 explainer = GradCAMExplainer(model, self.device)
 
             heatmaps: List[np.ndarray] = []
