@@ -4,17 +4,17 @@
 [![license](https://img.shields.io/badge/license-MIT-green)]()
 [![docs](https://img.shields.io/badge/docs-mkdocs--material-526CFE)](https://AbdelazizElHelaly11.github.io/NeuroQuant/)
 
-**Production-grade neural-network quantization framework — multi-objective NSGA search, ONNX deployment fidelity, and built-in explainability across classification, detection, segmentation, regression, and HuggingFace NLP.**
+**Production-grade neural-network quantization framework — multi-objective NSGA search, ONNX deployment fidelity, and built-in explainability across classification, detection, segmentation.**
 
 ---
 
 ## Team Members
 | Name | Student ID | Program |
 | :--- | :--- | :--- |
-| **Abdelaziz Elhelaly** | **202201827** | **Computer Science (CSAI)** |
-| **Abdelwahab Hassan** | **202201281** | **Computer Science (CSAI)** |
-| **Mostafa Nashaat** | **202202075** | **Computer Science (CSAI)** |
-| **Abdelrahman Elsayed** | **202202049** | **Computer Science (CSAI)** |
+| **Abdelaziz Elhelaly** | **202201827** | **Data Science & Artificial Intelligence (DSAI)** |
+| **Abdelwahab Hassan** | **202201281** | **Data Science & Artificial Intelligence (DSAI)** |
+| **Mostafa Nashaat** | **202202075** | **Data Science & Artificial Intelligence (DSAI)** |
+| **Abdelrahman Elsayed** | **202202049** | **Data Science & Artificial Intelligence (DSAI)** |
 
 **Supervisors:** 
 - **Dr. Mohamed Fakhry Eldin Ghalwash (Main)**
@@ -26,13 +26,13 @@
 
 The deployment of state-of-the-art deep learning models in production environments and on edge devices is fundamentally hindered by their significant computational costs, memory footprint, and high inference latency. While quantization reduces these overheads by representing weights and activations in lower bitwidths (e.g., INT8), existing academic tools frequently fail in real-world scenarios. They often rely on simulated inference that masks actual hardware performance, lack comprehensive multi-objective optimization (balancing accuracy, true on-disk size, and hardware latency), and are opaque regarding how quantization degrades model interpretability. 
 
-There is a critical need for a production-grade framework that addresses these gaps by delivering true INT8 artifacts, incorporating hardware-aware Pareto optimization, and integrating Explainable AI (XAI) to ensure both uncompromising performance and trustworthiness in deployment.
+There is a critical need for a production-grade framework that addresses these gaps by delivering true INT8 artifacts, incorporating Pareto optimization, and integrating Explainable AI (XAI) to ensure both uncompromising performance and trustworthiness in deployment.
 
 ---
 
 ## Features
 
-- **Comprehensive Quantization Arsenal:** Out-of-the-box support for PTQ, QAT, GPTQ, SmoothQuant, AWQ, SmoothQuant→GPTQ, and AdaRound.
+- **Comprehensive Quantization Arsenal:** Out-of-the-box support for PTQ, QAT, GPTQ, SmoothQuant, AWQ, SmoothQuant→GPTQ.
 - **Hardware-Aware Multi-Objective Search:** Utilizes Surrogate-assisted NSGA-II to optimize for model accuracy, true `.onnx` filesystem size, and real ONNX Runtime latency.
 - **True Deployment Fidelity:** Emits real static-INT8 ONNX graphs rather than relying on FP32 simulations.
 - **Explainable AI (XAI) Integration:** Built-in Grad-CAM, task-aware Grad-CAM, Attention Rollout (for ViTs), and SHAP for analyzing per-layer quantization error attribution.
@@ -184,4 +184,5 @@ hyperparams:
 *For comprehensive API documentation and detailed usage workflows, visit the [NeuroQuant Documentation Site](https://AbdelazizElHelaly11.github.io/NeuroQuant/).*
 
 ---
+
 *This project was developed in partial fulfillment of the requirements for the Degree of Bachelor of Science in CSAI at Zewail City of Science and Technology.*
