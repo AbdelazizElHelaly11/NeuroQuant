@@ -1115,26 +1115,47 @@ class XAIGenerator:
                 img = test_images[i:i+1]
                 gt_idx = self._gt_label_index(test_labels[i])
 
-                # Capture model prediction + confidence BEFORE the Grad-CAM
-                # backward pass so the recorded probabilities reflect the
-                # untouched forward output.
-                pred_idx, confidence = self._predict(model, img)
-                pred_meta = {
-                    "pred_idx": pred_idx,
-                    "pred_name": class_lookup(pred_idx),
-                    "confidence": confidence,
-                    "gt_idx": gt_idx,
-                    "gt_name": class_lookup(gt_idx),
-                    "correct": pred_idx == gt_idx,
-                }
-                preds.append(pred_meta)
+                # The whole per-image body is wrapped so a single model's
+                # explanation failure can never abort Phase 3 (which would
+                # ``break`` the entire pipeline at cli.py's phase loop).
+                # This matters most for detection: backward-through-NMS on a
+                # quantized detector can raise, and the run must still finish
+                # with a degraded (zero) heatmap rather than dying after
+                # every earlier phase already succeeded.
+                try:
+                    # Capture model prediction + confidence BEFORE the
+                    # Grad-CAM backward pass so the recorded probabilities
+                    # reflect the untouched forward output.
+                    pred_idx, confidence = self._predict(model, img)
+                    pred_meta = {
+                        "pred_idx": pred_idx,
+                        "pred_name": class_lookup(pred_idx),
+                        "confidence": confidence,
+                        "gt_idx": gt_idx,
+                        "gt_name": class_lookup(gt_idx),
+                        "correct": pred_idx == gt_idx,
+                    }
 
-                if use_rollout:
-                    heatmap = explainer.compute(img, target_class=gt_idx)
-                else:
-                    heatmap = explainer.compute(
-                        img, target_module, target_class=gt_idx,
+                    if use_rollout:
+                        heatmap = explainer.compute(img, target_class=gt_idx)
+                    else:
+                        heatmap = explainer.compute(
+                            img, target_module, target_class=gt_idx,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "    %s img%d: explanation failed (%s) — using a "
+                        "zero heatmap so the run continues.", model_id, i, exc,
                     )
+                    h, w = int(img.shape[-2]), int(img.shape[-1])
+                    heatmap = np.zeros((h, w), dtype=np.float32)
+                    pred_meta = {
+                        "pred_idx": -1, "pred_name": class_lookup(-1),
+                        "confidence": 0.0, "gt_idx": gt_idx,
+                        "gt_name": class_lookup(gt_idx), "correct": False,
+                    }
+
+                preds.append(pred_meta)
                 heatmaps.append(heatmap)
 
                 if HAS_MATPLOTLIB:

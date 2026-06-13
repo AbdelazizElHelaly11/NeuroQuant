@@ -115,16 +115,26 @@ def build_data_loaders(config: QuantizationConfig):
 
 
 def evaluate_model(
-    model: nn.Module, loader: DataLoader, device: torch.device
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    task: str = "classification",
 ) -> Dict[str, float]:
     """
-    Compute top-1 and top-5 accuracy (%).
+    Evaluate a model and return a task-appropriate metric dict.
+
+    Routes through ``evaluate_primary_metric`` so the ``top1`` slot always
+    carries a "higher is better" scalar regardless of task:
+    classification → top-1, segmentation → mIOU, **detection → mAP@0.5**,
+    regression → ``-rmse``. Detection batches (``(List[Tensor], List[Dict])``)
+    would crash the plain top-k path, so the ``task`` argument must be
+    threaded through from ``config.task`` at every detection call site.
 
     Returns:
-        {"top1": float, "top5": float}
+        {"top1": float, "top5": float, ...}
     """
-    from neuroquant.utils.metrics import compute_topk_accuracy
-    return compute_topk_accuracy(model, loader, device)
+    from neuroquant.utils.metrics import evaluate_primary_metric
+    return evaluate_primary_metric(model, loader, device, task=task)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -376,7 +386,8 @@ class NeuroQuantPipeline:
             # Evaluate existing weights on the val split (diagnostic only).
             self.model.to(self.device)
             val_dict = evaluate_model(
-                self.model, self.val_loader, self.device
+                self.model, self.val_loader, self.device,
+                task=self.config.task,
             )
             self.fp32_val_acc = val_dict["top1"]
             logger.info("  Skipping training (use --epochs N to train)")
@@ -387,7 +398,9 @@ class NeuroQuantPipeline:
         # val while methods reported test, so the FP32-vs-quantized
         # comparison was apples-to-oranges and ``accuracy_loss`` could be
         # systematically negative; evaluating both on test fixes it (C1).
-        fp32_test = evaluate_model(self.model, self.test_loader, self.device)
+        fp32_test = evaluate_model(
+            self.model, self.test_loader, self.device, task=self.config.task,
+        )
         self.fp32_acc = fp32_test["top1"]
         self.fp32_top5 = fp32_test["top5"]
         logger.info(
@@ -1814,7 +1827,10 @@ class NeuroQuantPipeline:
                             dom = int(tgt["labels"][0].item()) if tgt["labels"].numel() > 0 else -1
                         else:
                             dom = -1
-                        test_labels_list.append(torch.tensor(dom))
+                        # 1-D (not 0-D) so the later ``torch.cat`` over the
+                        # collected labels does not raise "zero-dimensional
+                        # tensor cannot be concatenated".
+                        test_labels_list.append(torch.tensor([dom]))
                         if len(test_labels_list) >= n_needed:
                             break
             else:
@@ -2812,7 +2828,11 @@ class NeuroQuantPipeline:
         if loader is None or model is None:
             return None
         try:
-            return float(evaluate_model(model, loader, self.device)["top1"])
+            return float(
+                evaluate_model(
+                    model, loader, self.device, task=self.config.task,
+                )["top1"]
+            )
         except Exception as exc:  # pragma: no cover — defensive
             logger.warning("  [eval] top-1 on loader failed: %s", exc)
             return None

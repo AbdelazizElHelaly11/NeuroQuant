@@ -135,6 +135,158 @@ def compute_topk_accuracy(
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Object-Detection mAP@0.5 (self-contained, VOC-style, no extra deps)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _box_iou_xyxy(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Pairwise IoU between two sets of xyxy boxes → ``[len(a), len(b)]``."""
+    if a.numel() == 0 or b.numel() == 0:
+        return torch.zeros((a.shape[0], b.shape[0]), dtype=torch.float32)
+    area_a = (a[:, 2] - a[:, 0]).clamp(min=0) * (a[:, 3] - a[:, 1]).clamp(min=0)
+    area_b = (b[:, 2] - b[:, 0]).clamp(min=0) * (b[:, 3] - b[:, 1]).clamp(min=0)
+    lt = torch.max(a[:, None, :2], b[None, :, :2])
+    rb = torch.min(a[:, None, 2:], b[None, :, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+    union = area_a[:, None] + area_b[None, :] - inter
+    return inter / union.clamp(min=1e-6)
+
+
+def _voc_ap(recall: np.ndarray, precision: np.ndarray) -> float:
+    """All-points (VOC2010+) average precision: area under the P-R curve."""
+    mrec = np.concatenate(([0.0], recall, [1.0]))
+    mpre = np.concatenate(([0.0], precision, [0.0]))
+    # Make precision monotonically decreasing (envelope).
+    for i in range(mpre.size - 1, 0, -1):
+        mpre[i - 1] = max(mpre[i - 1], mpre[i])
+    idx = np.where(mrec[1:] != mrec[:-1])[0]
+    return float(np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]))
+
+
+def compute_detection_map(
+    model: nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+    *,
+    iou_threshold: float = 0.5,
+    score_threshold: float = 0.05,
+    max_images: Optional[int] = None,
+) -> Dict[str, float]:
+    """Mean Average Precision @ IoU=0.5 for a torchvision detection model.
+
+    Self-contained VOC-style mAP — no ``pycocotools`` / ``torchmetrics``
+    dependency. The model is run in eval mode (so it returns a
+    ``List[Dict{boxes, labels, scores}]`` per batch); ground-truth boxes
+    come from the loader's detection collate (``(images, targets)`` with
+    ``targets`` a tuple of ``{"boxes", "labels"}`` dicts).
+
+    Algorithm (per class, standard VOC):
+      1. Gather every predicted box across all images with its score.
+      2. Sort predictions by descending score.
+      3. Greedily match each prediction to an unmatched GT of the same
+         class with IoU ≥ ``iou_threshold`` → TP, else FP.
+      4. Accumulate precision/recall and integrate (all-points AP).
+    AP is averaged over the classes that actually appear in the GT, so
+    the COCO 91-id space with absent classes does not dilute the mean.
+
+    The result rides in the ``top1`` slot (× 100) so the pipeline's
+    task-agnostic "higher is better" objective math (``fp32 − quant``)
+    optimises the mAP drop directly — exactly like segmentation reuses
+    that slot for mIOU.
+    """
+    model.eval()
+    model.to(device)
+
+    # Per-class prediction accumulators and GT counts.
+    preds_by_class: Dict[int, List[Tuple[float, int, torch.Tensor]]] = {}
+    gts_by_class: Dict[int, Dict[int, torch.Tensor]] = {}
+    gt_count: Dict[int, int] = {}
+
+    img_idx = 0
+    seen = 0
+    with torch.no_grad():
+        for batch in data_loader:
+            if not (isinstance(batch, (tuple, list)) and len(batch) == 2):
+                continue
+            images, targets = batch
+            # Detection collate yields a tuple of per-image tensors.
+            if isinstance(images, torch.Tensor):
+                images = [images[i] for i in range(images.shape[0])]
+            images = [img.to(device) for img in images]
+
+            outputs = model(images)
+            if not isinstance(outputs, (list, tuple)):
+                # Not a detection forward — nothing to score.
+                return {"top1": 0.0, "top5": 0.0, "map": 0.0, "map_50": 0.0}
+
+            for out, tgt in zip(outputs, targets):
+                # ── Ground truth for this image ──
+                gt_boxes = tgt.get("boxes") if isinstance(tgt, dict) else None
+                gt_labels = tgt.get("labels") if isinstance(tgt, dict) else None
+                if gt_boxes is None:
+                    gt_boxes = torch.zeros((0, 4))
+                    gt_labels = torch.zeros((0,), dtype=torch.int64)
+                gt_boxes = gt_boxes.to(device).float()
+                gt_labels = gt_labels.to(device).long()
+                for c in gt_labels.unique().tolist():
+                    mask = gt_labels == c
+                    gts_by_class.setdefault(c, {})[img_idx] = gt_boxes[mask]
+                    gt_count[c] = gt_count.get(c, 0) + int(mask.sum().item())
+
+                # ── Predictions for this image ──
+                p_boxes = out.get("boxes", torch.zeros((0, 4), device=device))
+                p_scores = out.get("scores", torch.zeros((0,), device=device))
+                p_labels = out.get("labels", torch.zeros((0,), dtype=torch.int64, device=device))
+                keep = p_scores >= score_threshold
+                p_boxes, p_scores, p_labels = p_boxes[keep], p_scores[keep], p_labels[keep]
+                for c in p_labels.unique().tolist():
+                    cmask = p_labels == c
+                    for box, sc in zip(p_boxes[cmask], p_scores[cmask]):
+                        preds_by_class.setdefault(c, []).append(
+                            (float(sc.item()), img_idx, box)
+                        )
+
+                img_idx += 1
+                seen += 1
+            if max_images is not None and seen >= max_images:
+                break
+
+    if not gt_count:
+        return {"top1": 0.0, "top5": 0.0, "map": 0.0, "map_50": 0.0}
+
+    aps: List[float] = []
+    for c, n_gt in gt_count.items():
+        preds = sorted(preds_by_class.get(c, []), key=lambda r: r[0], reverse=True)
+        if n_gt == 0:
+            continue
+        tp = np.zeros(len(preds), dtype=np.float64)
+        fp = np.zeros(len(preds), dtype=np.float64)
+        matched: Dict[int, set] = {}
+        gt_for_c = gts_by_class.get(c, {})
+        for i, (_, im_id, box) in enumerate(preds):
+            gboxes = gt_for_c.get(im_id)
+            if gboxes is None or gboxes.numel() == 0:
+                fp[i] = 1.0
+                continue
+            ious = _box_iou_xyxy(box[None, :].to(gboxes.device), gboxes)[0]
+            best = int(torch.argmax(ious).item())
+            if float(ious[best].item()) >= iou_threshold and best not in matched.setdefault(im_id, set()):
+                tp[i] = 1.0
+                matched[im_id].add(best)
+            else:
+                fp[i] = 1.0
+        tp_cum = np.cumsum(tp)
+        fp_cum = np.cumsum(fp)
+        recall = tp_cum / max(n_gt, 1)
+        precision = tp_cum / np.maximum(tp_cum + fp_cum, 1e-9)
+        aps.append(_voc_ap(recall, precision))
+
+    mean_ap = float(np.mean(aps) * 100.0) if aps else 0.0
+    return {"top1": mean_ap, "top5": mean_ap, "map": mean_ap, "map_50": mean_ap}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Regression Metrics (RMSE / MAE / R²)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -240,12 +392,18 @@ def evaluate_primary_metric(
     """
     if task == "regression":
         return compute_regression_metrics(model, data_loader, device)
-    # classification / detection / segmentation / nlp all funnel through
+    if task == "detection":
+        # Detection batches are ``(List[Tensor], List[Dict])`` — they would
+        # crash ``compute_topk_accuracy`` (which assumes a stackable
+        # ``batch[0]``). Route to the self-contained VOC mAP@0.5, which
+        # also rides its result in the ``top1`` slot so the rest of the
+        # pipeline stays task-agnostic.
+        return compute_detection_map(model, data_loader, device)
+    # classification / segmentation / nlp funnel through
     # ``compute_topk_accuracy``, which dispatches on the output shape:
-    # classification yields top-1, **segmentation yields mIOU** in the
+    # classification yields top-1 and **segmentation yields mIOU** in the
     # ``top1`` slot (so NSGA's ``fp32 − quant`` objective optimises the
-    # mIOU drop directly), and detection (a list output) degrades to a
-    # no-op there — compute mAP separately for detection.
+    # mIOU drop directly).
     return compute_topk_accuracy(model, data_loader, device)
 
 

@@ -1,0 +1,3 @@
+# Shell scripts must always check out with LF endings — CRLF breaks the
+# shebang on Linux (HPC) with "bad interpreter: /bin/bash^M".
+*.sh text eol=lf

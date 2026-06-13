@@ -1,0 +1,159 @@
+# NeuroQuant v2.0 — Object-Detection experiment (COCO val2017 subset)
+# ---------------------------------------------------------------------------
+# Reliable, time-boxed (<6 h on a single A100 MIG / 20 GB) detection run.
+#
+#   * Model : fasterrcnn_mobilenet_v3_large_320_fpn, COCO-pretrained
+#             (real ~0.22 box-mAP baseline — NO training needed).
+#   * Data  : COCO val2017 subset via the dependency-free adapter; the
+#             headline test slice is disjoint from train/search/val
+#             (no data leak).
+#   * Metric: self-contained VOC mAP@0.5 (rides the ``top1`` slot).
+#
+# Download the subset on the LOGIN NODE first:
+#   python -m neuroquant.data.coco_detection --download --root ./data/coco
+# ---------------------------------------------------------------------------
+
+# ── Model ────────────────────────────────────────────────────────────────
+model:
+  name: "fasterrcnn_mobilenet_v3_large_320_fpn"   # mobile-optimised, min/max 320
+  pretrained: true              # COCO DEFAULT weights → real, non-random mAP
+  path: null
+  class: null
+  num_classes: 91               # COCO (informational; pretrained head defines it)
+  input_shape: [3, 320, 320]    # matches the adapter's resize + the 320 model
+  task: "detection"
+
+# ── Dataset ──────────────────────────────────────────────────────────────
+dataset:
+  name: "coco"
+  # Dependency-free COCO adapter. Returns [0,1] images (the detector
+  # normalises internally) + {boxes(xyxy), labels}. split="train" and
+  # split="test" are deterministically DISJOINT id partitions of the
+  # capped val2017 subset, so the test mAP is measured on unseen images.
+  class: "neuroquant.data.coco_detection.CocoDetectionDataset"
+  path: "./data/coco"           # dir holding val2017/ + annotations/
+  batch_size: 4                 # detection is memory-heavy; lists, not stacks
+  num_workers: 4                # POSIX HPC (auto-forced to 0 on Windows)
+
+# ── Output ───────────────────────────────────────────────────────────────
+output:
+  dir: "./artifacts_detection"
+  mlflow_tracking_uri: "./mlruns"
+  experiment_name: "neuroquant_detection_coco"
+
+# ── Methods (all six) ────────────────────────────────────────────────────
+methods:
+  - ptq
+  - qat
+  - gptq
+  - smoothquant
+  - awq
+  - smoothquant_gptq
+
+# ── Bitwidths ────────────────────────────────────────────────────────────
+bitwidths:
+  supported: [4, 8]
+  io_layer: 8
+
+# ── Hyperparameters (trimmed for the 6 h budget) ─────────────────────────
+hyperparams:
+  seed: 42
+  device: "auto"
+
+  # Calibration — fewer batches (detection forward is slow).
+  calibration_batches: 8
+  calibration_strategy_io: "kl_divergence"
+  calibration_strategy_intermediate: "mse"
+
+  # Hessian / clustering
+  hessian_batches: 8
+  cluster_high_percentile: 0.66
+  cluster_low_percentile: 0.33
+  hessian_estimator: "fisher"
+
+  # NSGA-II search — smaller pop/gens, surrogate keeps real mAP evals low.
+  nsga_population_size: 16
+  nsga_generations: 12
+  nsga_crossover_prob: 0.9
+  nsga_mutation_prob: 0.1
+  nsga_accuracy_objective: "top1"      # mAP rides in the top1 slot
+  nsga_search_mode: "per_layer"
+  nsga_use_surrogate: true
+  nsga_surrogate_warmup_evals: 20
+  nsga_surrogate_proposed_per_gen: 128
+  nsga_sensitivity_weighted_mutation: true
+
+  # AdaRound — short reconstruction (per-layer), small sample budget.
+  adaround_epochs: 20
+  adaround_lr: 0.0001
+  adaround_reg_param: 0.01
+  adaround_ordered: true
+  adaround_max_samples_per_layer: 256
+
+  # QAT — 2 epochs is enough to exercise the path; not chasing SOTA.
+  qat_epochs: 2
+  qat_lr: 0.0005
+  qat_momentum: 0.9
+  qat_weight_decay: 0.0001
+  qat_early_stop_patience: 1
+  qat_warmstart_source: "ptq_best_acc"
+  qat_act_bitwidth: 8
+  qat_fold_bn: true
+  qat_distill_alpha: 0.5               # ignored for detection (KD is cls-only)
+  qat_distill_temperature: 4.0
+
+  # PTQ rerank
+  ptq_real_rerank_topk: 3
+  ptq_tradeoff_max_acc_drop: 2.0
+
+  # GPTQ
+  gptq_block_size: 128
+  gptq_percdamp: 0.01
+
+  # SmoothQuant
+  smoothquant_alpha: 0.5
+  smoothquant_per_layer_alpha: true
+  smoothquant_alpha_grid: [0.4, 0.5, 0.6]
+  smoothquant_alpha_strategy: "closed_form"
+
+  # AWQ
+  awq_group_size: 128
+  awq_alpha_grid: [0.0, 0.25, 0.5, 0.75, 1.0]
+  awq_alpha_strategy: "golden"
+  awq_keep_top_pct: 0.0
+
+  alpha_cluster_amortize: true
+
+  # XAI / explainability
+  xai_num_images: 4
+  xai_grad_cam_alpha: 0.4
+  xai_shap_n_samples: 25
+  xai_plot_dpi: 150
+
+  # Evaluation + reporting
+  eval_primary_accuracy: "top1"
+  latency_warmup_runs: 5
+  latency_measure_runs: 20
+  latency_batch_size: 1
+  hardware_report_path: ""
+  use_latency_in_pareto: false
+
+  # Wave 4 — DISABLED for detection: torchvision detectors are awkward /
+  # slow to ONNX-export, and the LUT build would burn time for no gain.
+  # The pipeline already degrades these gracefully, but turning them off
+  # keeps the run lean and removes a failure surface.
+  onnx_export_enabled: false
+  hardware_aware_search: false
+  latency_lut_bitwidths: [4, 8]
+
+# ── Phases (full pipeline) ───────────────────────────────────────────────
+phases:
+  - phase_0_preparation
+  - phase_1a_hessian_clustering
+  - phase_1c_nsga_search
+  - phase_1d_adaround
+  - phase_1e_qat
+  - phase_1f_gptq_smooth_awq
+  - phase_2_pareto
+  - phase_3_xai
+  - phase_4_mlflow

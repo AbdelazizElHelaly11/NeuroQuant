@@ -44,6 +44,7 @@ from neuroquant.quantization.alpha_search import (
     ClusterAmortizer, closed_form_alpha, golden_section_alpha,
 )
 from neuroquant.quantization.base import BaseQuantizer
+from neuroquant.utils.common import batch_images_to_device
 from neuroquant.utils.numerics import MAX_MIGRATION, MIN_MIGRATION, MIN_SCALE
 
 logger = logging.getLogger("neuroquant")
@@ -378,7 +379,7 @@ class SmoothQuantQuantizer(BaseQuantizer):
             for i, batch in enumerate(data_loader):
                 if i >= num_batches:
                     break
-                images = batch[0].to(self.device)
+                images = batch_images_to_device(batch, self.device)
                 model(images)
 
         for h in hooks:
@@ -522,7 +523,7 @@ class SmoothQuantQuantizer(BaseQuantizer):
                 for i, batch in enumerate(data_loader):
                     if i >= num_batches:
                         break
-                    images = batch[0].to(self.device)
+                    images = batch_images_to_device(batch, self.device)
                     model(images)
         finally:
             for h in hooks:

@@ -25,6 +25,29 @@ import torch.nn as nn
 logger = logging.getLogger("neuroquant")
 
 
+def batch_images_to_device(batch: Any, device: torch.device) -> Any:
+    """Extract the image input from a dataloader batch and move it to ``device``.
+
+    Task-agnostic so every calibration / activation-capture loop can feed a
+    model without knowing the dataset's collate contract:
+
+      * classification / segmentation / regression — ``batch[0]`` is a
+        stackable ``Tensor[B, ...]`` → moved with ``.to(device)``.
+      * **detection** — the collate yields ``(images, targets)`` where
+        ``images`` is a *tuple/list of per-image tensors* (ragged box
+        counts forbid stacking). A bare ``batch[0].to(device)`` raises
+        ``AttributeError`` on the tuple; here we move each image instead
+        and return the list the torchvision detector expects.
+
+    Returns the moved image(s): a ``Tensor`` for stackable tasks, or a
+    ``List[Tensor]`` for detection.
+    """
+    images = batch[0] if isinstance(batch, (list, tuple)) else batch
+    if isinstance(images, (list, tuple)):
+        return [img.to(device) for img in images]
+    return images.to(device)
+
+
 def set_seed(seed: int = 42, strict: bool = True) -> None:
     """Set random seed and (when ``strict``) enforce deterministic kernels.
 

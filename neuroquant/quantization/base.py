@@ -100,12 +100,17 @@ class BaseQuantizer(abc.ABC):
         Returns:
             QuantizationResult with accuracy, top5, latency, ebops.
         """
-        from neuroquant.utils.metrics import compute_topk_accuracy, benchmark_latency
+        from neuroquant.utils.metrics import evaluate_primary_metric, benchmark_latency
 
-        # Top-k accuracy
-        acc = compute_topk_accuracy(model, test_loader, self.device)
+        # Task-appropriate headline metric in the ``top1`` slot: top-1 for
+        # classification, mIOU for segmentation, **mAP@0.5 for detection**,
+        # -rmse for regression. Routing through ``evaluate_primary_metric``
+        # (not the raw top-k path) is what keeps phase-1f scoring from
+        # crashing on detection's ragged ``(images, targets)`` batches.
+        task = getattr(self.config, "task", "classification")
+        acc = evaluate_primary_metric(model, test_loader, self.device, task=task)
         top1 = acc["top1"]
-        top5 = acc["top5"]
+        top5 = acc.get("top5", top1)
 
         # EBops (bytes) and model size. Use the binary MiB convention
         # (1024²) so this matches ``compute_quantized_size_mb`` and the
@@ -277,13 +282,15 @@ class BaseQuantizer(abc.ABC):
                 h = module.register_forward_hook(make_hook(name))
                 hooks.append(h)
 
+        from neuroquant.utils.common import batch_images_to_device
+
         model.eval()
         model.to(device)
         with torch.no_grad():
             for i, batch in enumerate(data_loader):
                 if i >= num_batches:
                     break
-                images = batch[0].to(device)
+                images = batch_images_to_device(batch, device)
                 model(images)
 
         for h in hooks:

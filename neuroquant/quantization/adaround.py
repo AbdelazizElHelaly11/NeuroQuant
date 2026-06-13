@@ -41,6 +41,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from neuroquant.config import AdaroundResult, QuantizationConfig
+from neuroquant.utils.common import batch_images_to_device
 from neuroquant.utils.numerics import MIN_SCALE
 
 logger = logging.getLogger("neuroquant")
@@ -402,7 +403,7 @@ class AdaroundOptimizer:
                 for i, batch in enumerate(self.calib_loader):
                     if taken[0] >= max_n or i >= hp_batches:
                         break
-                    images = batch[0].to(self.device)
+                    images = batch_images_to_device(batch, self.device)
                     self.model(images)
         finally:
             h.remove()
@@ -473,7 +474,7 @@ class AdaroundOptimizer:
                 for i, batch in enumerate(self.calib_loader):
                     if i >= n_batches:
                         break
-                    images = batch[0].to(self.device)
+                    images = batch_images_to_device(batch, self.device)
                     self.model(images)
         finally:
             for h in hooks:
