@@ -184,23 +184,4 @@ hyperparams:
 *For comprehensive API documentation and detailed usage workflows, visit the [NeuroQuant Documentation Site](https://AbdelazizElHelaly11.github.io/NeuroQuant/).*
 
 ---
-
-## Screenshots / Demo
-
-NeuroQuant generates comprehensive visualizations during its run. Below are placeholders for the generated pipeline outputs stored in your `artifacts/` directory.
-
-### Pareto Optimization & Method Comparisons
-> **Note:** The `artifacts/neuroquant_report.html` file provides an interactive, self-contained dashboard of these results.
-
-![Tier Distribution & Sensitivity Heatmap](docs/assets/sensitivity_heatmap_placeholder.png)
-*(Replace the link above with a generated `sensitivity_heatmap.png` from your run)*
-
-### XAI Error Attribution
-NeuroQuant highlights exactly where quantization introduces errors via Grad-CAM and SHAP.
-
-![Grad-CAM Error Attribution](docs/assets/grad_cam_placeholder.png)
-*(Replace the link above with an example from `artifacts/error_attribution/` or `artifacts/xai/`)*
-
----
-
 *This project was developed in partial fulfillment of the requirements for the Degree of Bachelor of Science in CSAI at Zewail City of Science and Technology.*
