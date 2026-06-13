@@ -1,4 +1,4 @@
-# NeuroQuant v2.1
+# NeuroQuant
 
 [![python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue)]()
 [![license](https://img.shields.io/badge/license-MIT-green)]()
@@ -6,265 +6,201 @@
 
 **Production-grade neural-network quantization framework — multi-objective NSGA search, ONNX deployment fidelity, and built-in explainability across classification, detection, segmentation, regression, and HuggingFace NLP.**
 
-NeuroQuant takes a pre-trained PyTorch model and produces deployable INT8 / mixed-precision artefacts that have been **measured, not estimated**, on the same runtime that ships in production. Every public number is the result of running a real quantized graph through ONNX Runtime — no synthetic shortcuts.
+---
 
-It has **two front doors**:
+## Team Members
+| Name | Student ID | Program |
+| :--- | :--- | :--- |
+| **Abdelaziz Elhelaly** | **202201827** | **Computer Science (CSAI)** |
+| **Abdelwahab Hassan** | **202201281** | **Computer Science (CSAI)** |
+| **Mostafa Nashaat** | **202202075** | **Computer Science (CSAI)** |
+| **Abdelrahman Elsayed** | **202202049** | **Computer Science (CSAI)** |
 
-- a **CLI pipeline** that runs the whole flow from a single YAML, and
-- a **flat Python library** (`from neuroquant import PTQQuantizer, …`) where every quantizer works config-free in three lines.
+**Supervisors:** 
+- **Dr. Mohamed Fakhry Eldin Ghalwash (Main)**
+- **Prof. Ahmed Abdelsamea (Joint)**
 
 ---
 
-## Tasks supported
+## Problem Statement
 
-| Task             | Models                                                                   | Primary metric   | XAI                                       |
-| ---------------- | ------------------------------------------------------------------------ | ---------------- | ----------------------------------------- |
-| `classification` | any torchvision / timm / custom CNN **or** ViT                           | Top-1            | Grad-CAM (CNN) · Attention Rollout (ViT)  |
-| `detection`      | `torchvision.models.detection` (Faster/Mask R-CNN, SSD, RetinaNet, FCOS) | Top-1 surrogate  | task-aware Grad-CAM                        |
-| `segmentation`   | `torchvision.models.segmentation` (FCN, DeepLabV3, LRASPP)               | mIOU             | task-aware Grad-CAM                        |
-| `regression`     | any `[B, K]`-output model                                                | RMSE / MAE / R²  | Grad-CAM / Attention Rollout              |
-| `nlp`            | any HuggingFace model (`pip install neuroquant[nlp]`)                     | Top-1            | —                                         |
+The deployment of state-of-the-art deep learning models in production environments and on edge devices is fundamentally hindered by their significant computational costs, memory footprint, and high inference latency. While quantization reduces these overheads by representing weights and activations in lower bitwidths (e.g., INT8), existing academic tools frequently fail in real-world scenarios. They often rely on simulated inference that masks actual hardware performance, lack comprehensive multi-objective optimization (balancing accuracy, true on-disk size, and hardware latency), and are opaque regarding how quantization degrades model interpretability. 
 
-Vision Transformers are auto-detected and routed through **Attention Rollout** (Abnar & Zuidema, 2020) in Phase 3 — no Conv2d feature maps required.
+There is a critical need for a production-grade framework that addresses these gaps by delivering true INT8 artifacts, incorporating hardware-aware Pareto optimization, and integrating Explainable AI (XAI) to ensure both uncompromising performance and trustworthiness in deployment.
 
 ---
 
-## What it does
+## Features
 
-```
-   FP32 PyTorch model  ─────►  9-phase pipeline  ─────►  INT8 .onnx + metrics
-
-   P0   Prepare model + dataset, FP32 baseline (scored on the test split)
-   P1a  Hessian / Fisher per-layer sensitivity + 3-tier clustering
-   P1c  Surrogate-assisted NSGA multi-objective search (2- or 3-obj)
-   P1d  AdaRound canonical input→output weight rounding
-   P1e  Real W+A QAT with FP32-teacher knowledge distillation
-   P1f  GPTQ + SmoothQuant + AWQ + SmoothQuant→GPTQ (INT4 + INT8 each)
-   P2   Pareto analysis + plots
-   P3   Grad-CAM / Attention Rollout + SHAP explainability
-   P4   MLflow finalisation + HTML report + reproducibility manifest
-```
-
-The pipeline runs to completion in roughly a minute on CPU for a CIFAR-class model.
-
-> Phase IDs are intentionally non-contiguous: the old `phase_1b` FITCompress
-> seed was removed (Hessian-tier clustering + the in-loop surrogate cover
-> the same role more cheaply), so legacy checkpoints still resolve.
+- **Comprehensive Quantization Arsenal:** Out-of-the-box support for PTQ, QAT, GPTQ, SmoothQuant, AWQ, SmoothQuant→GPTQ, and AdaRound.
+- **Hardware-Aware Multi-Objective Search:** Utilizes Surrogate-assisted NSGA-II to optimize for model accuracy, true `.onnx` filesystem size, and real ONNX Runtime latency.
+- **True Deployment Fidelity:** Emits real static-INT8 ONNX graphs rather than relying on FP32 simulations.
+- **Explainable AI (XAI) Integration:** Built-in Grad-CAM, task-aware Grad-CAM, Attention Rollout (for ViTs), and SHAP for analyzing per-layer quantization error attribution.
+- **Versatile Task Support:** Seamlessly quantizes models for classification, detection (Faster/Mask R-CNN, SSD, RetinaNet), segmentation, regression, and HuggingFace NLP tasks.
+- **Strict Pipeline Determinism:** Guarantees reproducibility through seeded loaders, CuDNN deterministic flags, and robust `weights_only=True` checkpointing.
 
 ---
 
-## Why it is production-grade
+## System Architecture
 
-This framework was built deliberately to avoid the "research prototype" failure modes that disqualify most academic quantization tooling from real deployment:
+NeuroQuant transforms a pre-trained PyTorch model into a deployable INT8 or mixed-precision artifact through a rigorous and deterministic 9-phase pipeline.
 
-| Concern                       | What NeuroQuant does                                                                                                                            |
-| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Real INT inference**        | Emits true static-INT8 ONNX graphs via `onnxruntime.quantization.quantize_static`, not FP32 simulation.                                         |
-| **Real on-disk size**         | `model_size_mb` is the literal `.onnx` filesystem size, not `numel × bw / 8`. The synthetic estimate is kept as `theoretical_size_mb`.          |
-| **Real latency**              | `latency_ms` is measured under ONNX Runtime on the same machine that will deploy the artefact.                                                  |
-| **Hardware-aware search**     | The optional NSGA third objective sums a per-layer ORT latency LUT — every gene's latency cost is a real timing, not a FLOP estimate.           |
-| **No leakage between splits** | Train / search / val / test are 80/10/10/test-set; NSGA fitness reads search, QAT early-stop reads val, and **the FP32 baseline _and_ every method headline read test** (so the comparison is apples-to-apples). |
-| **Honest calibration**        | PTQ/GPTQ/AWQ/SmoothQuant, Fisher sensitivity, and AdaRound calibrate on an **eval-transform** view of the data — never randomly-augmented images. |
-| **Strict determinism**        | `set_seed(strict=True)` enforces `CUBLAS_WORKSPACE_CONFIG`, `use_deterministic_algorithms`, `cudnn.deterministic`, plus a seeded loader + worker RNG. |
-| **Safe checkpoints**          | All `torch.load(weights_only=True)`; pickle path is closed. Architectural wrappers persist as JSON manifests, resumable phase-by-phase.         |
-| **Real W+A QAT**              | INT8 activations always; weight parametrisation via `torch.nn.utils.parametrize` (autograd-aware STE) with FP32-teacher KD.                     |
-| **Validated config**          | Pydantic v2 dataclasses with field validators — bad values (including search-mode / α-strategy / bitwidth choices) fail at load, not deep in a phase. |
+### High-Level AI/ML Pipeline
+1. **P0 (Preparation):** FP32 baseline evaluation on the test split, establishing a true baseline.
+2. **P1a (Sensitivity Analysis):** Hessian / Fisher per-layer sensitivity and 3-tier clustering.
+3. **P1c (NSGA Search):** Surrogate-assisted NSGA-II multi-objective search (2- or 3-objective).
+4. **P1d (AdaRound):** Canonical input→output weight rounding optimization.
+5. **P1e (QAT):** Real Weight+Activation Quantization-Aware Training with FP32-teacher knowledge distillation.
+6. **P1f (Advanced PTQ):** Implementation of GPTQ, SmoothQuant, AWQ, and SmoothQuant→GPTQ (INT4 + INT8 each).
+7. **P2 (Pareto Analysis):** Generation of Pareto frontiers, accuracy vs. latency/size tradeoffs, and bitwidth distributions.
+8. **P3 (Explainability):** Grad-CAM / Attention Rollout heatmaps + SHAP attribution for comprehensive model interpretability.
+9. **P4 (Finalization):** MLflow logging, self-contained HTML report generation, and reproducibility manifest creation.
 
----
-
-## Install
-
-NeuroQuant is published on PyPI as **`neuroquant`** and supports Python 3.10+.
-
-```bash
-pip install neuroquant
-neuroquant --help
-```
-
-GPU users install PyTorch from the CUDA wheel index first, then NeuroQuant on top:
-
-```bash
-# CUDA 12.1 example — check pytorch.org for your driver/CUDA combo
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install neuroquant
-```
-
-From a source checkout (for development):
-
-```bash
-git clone https://github.com/AbdelazizElHelaly11/NeuroQuant
-cd NeuroQuant
-pip install -e ".[dev]"        # editable + dev extras
-```
-
-### Optional extras
-
-The core install stays small; heavier dependencies are opt-in:
-
-| Extra                | Adds                                       | Needed for                                                     |
-| -------------------- | ------------------------------------------ | -------------------------------------------------------------- |
-| `neuroquant[xai]`    | `shap`                                      | Phase 3 SHAP attribution (Grad-CAM works without it).          |
-| `neuroquant[nlp]`    | `transformers`, `datasets`, `tokenizers`    | `task: nlp` and `dataset_name: hf:<name>` HuggingFace support. |
-| `neuroquant[dev]`    | `ruff`, `build`, `pytest`, `pytest-cov`     | Linting, wheel builds, and the test suite.                     |
-| `neuroquant[docs]`   | `mkdocs-material`, `mkdocstrings[python]`    | Building / serving the documentation site.                     |
-
-Combine with comma syntax: `pip install neuroquant[xai,nlp]`.
+### Design Decisions & Scalability
+- **Dual Interface:** Accessible via a fully automated CLI pipeline using a single YAML configuration, or as a flat Python library for config-free integration (`from neuroquant import PTQQuantizer`).
+- **Data Fidelity:** Calibration relies strictly on inference-time "eval-transform" data pipelines rather than randomly augmented images to avoid distribution shifts.
+- **Evaluation Integrity:** There is no data leakage between splits. The FP32 baseline and every method's headline metric are evaluated exclusively on the test split.
 
 ---
 
-## Quickstart — CLI
+## Technologies Used
 
-The `neuroquant` console script is installed on PATH (it is `neuroquant.cli:main`; `python -m neuroquant.cli` works too).
-
-```bash
-# Scaffold a fully-commented config.yaml in the current directory
-neuroquant --init
-
-# Full pipeline on the bundled config (CIFAR-10 + MobileNetV2)
-neuroquant --config config.yaml --epochs 20
-
-# Fast smoke (CPU, no training, first three phases)
-neuroquant --config config.yaml --epochs 0 --device cpu \
-  --phases phase_0_preparation phase_1a_hessian_clustering phase_1c_nsga_search
-
-# Resume after interruption — skips phases that already have checkpoints
-neuroquant --config config.yaml --epochs 20 --resume
-```
-
-Everything is written to `output_dir` (default `./artifacts/`):
-
-```
-artifacts/
-├── checkpoints/                 # per-phase resume points (.json + .pth)
-├── onnx/                        # FP32 + per-method INT8 .onnx files
-├── pareto/                      # Pareto scatter / 3-D / bitwidth / table + JSON
-├── error_attribution/          # per-method per-layer error PNGs
-├── xai/                         # Grad-CAM / rollout heatmaps + comparison matrix
-├── sensitivity_heatmap.png      # Phase 1a sensitivity + tier distribution
-├── tier_distribution.png
-├── pareto_summary.json
-├── pipeline_report.txt
-├── neuroquant_report.html       # self-contained, shareable HTML report
-├── reproducibility_manifest.json
-└── latency_lut.json             # only when hardware_aware_search=true
-```
-
-Open `artifacts/neuroquant_report.html` in any browser to read the run end-to-end — method table, Pareto plots, sensitivity heatmap, XAI grid, per-method error attribution, and deployment-fidelity caveats.
+- **Deep Learning Framework:** PyTorch, Torchvision, Torchaudio
+- **Inference & Deployment:** ONNX, ONNX Runtime (`onnxruntime`), ONNX Script
+- **Optimization & Search:** Pymoo (NSGA-II), Scikit-Learn
+- **Experiment Tracking:** MLflow
+- **Explainable AI:** SHAP, Custom Grad-CAM/Attention Rollout implementations
+- **Configuration Management:** Pydantic v2, PyYAML
+- **Data Handling:** Pandas, HuggingFace `datasets` & `transformers`
+- **Visualization:** Matplotlib, Seaborn
+- **Documentation:** MkDocs Material
 
 ---
 
-## Quickstart — library
+## Setup Instructions
 
-Every quantizer accepts `config=None` and falls back to a fully-defaulted `QuantizationConfig()`, so you can drive it from a notebook without any YAML:
+### Environment Requirements
+- **OS:** Linux, Windows, or macOS
+- **Python:** 3.10, 3.11, or 3.12
+- **Hardware:** NVIDIA GPU with CUDA 11.8/12.x is highly recommended for QAT and GPTQ processing, though CPU fallback is supported.
+
+### Installation Steps
+
+1. **Clone the Repository:**
+   ```bash
+   git clone https://github.com/AbdelazizElHelaly11/NeuroQuant.git
+   cd NeuroQuant
+   ```
+
+2. **Create and Activate a Virtual Environment:**
+   ```bash
+   python -m venv venv
+   # On Windows:
+   venv\Scripts\activate
+   # On Linux/Mac:
+   source venv/bin/activate
+   ```
+
+3. **Install PyTorch:**
+   Ensure you install the CUDA-enabled version of PyTorch if using a GPU.
+   ```bash
+   # Example for CUDA 12.1
+   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+   ```
+
+4. **Install NeuroQuant:**
+   ```bash
+   # Install the package in editable mode with development dependencies
+   pip install -e ".[dev]"
+   ```
+   *Note on Optional Extras:* Install with `pip install -e ".[xai,nlp]"` if you require SHAP attribution or HuggingFace NLP support.
+
+---
+
+## Deployment Instructions
+
+NeuroQuant outputs directly deployable ONNX models.
+
+1. **Initialize the Pipeline Configuration:**
+   ```bash
+   neuroquant --init
+   ```
+   This generates a `config.yaml` file in the current directory.
+
+2. **Execute the Pipeline:**
+   ```bash
+   neuroquant --config config.yaml --epochs 20
+   ```
+   *(To resume an interrupted run safely without discarding checkpoints, append the `--resume` flag).*
+
+3. **Artifact Retrieval:**
+   Upon completion, navigate to the `artifacts/` directory.
+   - Deployable INT8 graphs are stored in `artifacts/onnx/`.
+   - Comprehensive metrics, hardware look-up tables (`latency_lut.json`), and reproducibility manifests are found alongside them.
+   - The interactive `neuroquant_report.html` serves as your deployment dashboard.
+
+---
+
+## Usage Guide
+
+### 1. Using the Python Library (Direct Integration)
+For developers integrating quantization within existing training scripts, NeuroQuant works config-free.
 
 ```python
 from neuroquant import PTQQuantizer
+import torchvision.models as models
 
-ptq = PTQQuantizer(my_model)                       # config-free
-q_model = ptq.quantize(calib_loader, bitwidth=4)   # your original model is untouched
+# Load your model and calibration data loader
+model = models.resnet18(weights='DEFAULT')
+calib_loader = ... # Your DataLoader
+
+# Initialize and run config-free post-training quantization
+ptq = PTQQuantizer(model)
+q_model = ptq.quantize(calib_loader, bitwidth=8)
 ```
 
-The whole public surface imports flat:
-
-```python
-from neuroquant import (
-    QuantizationConfig,
-    PTQQuantizer, AWQQuantizer, GPTQQuantizer,
-    SmoothQuantQuantizer, SmoothQuantGPTQQuantizer,
-    QATTrainer, AdaroundOptimizer,
-    NSGAIIClusterSearch, LayerClusterer, AccuracySurrogate,
-    XAIGenerator, ParetoAnalyzer, ParetoVisualizer,
-)
+### 2. Using the CLI (Research & Automated Sweeps)
+For a fast smoke test on CPU without training:
+```bash
+neuroquant --config config.yaml --epochs 0 --device cpu \
+  --phases phase_0_preparation phase_1a_hessian_clustering phase_1c_nsga_search
 ```
 
-See the [library guide](docs/library_mode.md) for detection, segmentation, regression, NLP, and ViT examples.
-
----
-
-## Configuration
-
-All knobs live in [`config.yaml`](config.yaml) (regenerate it any time with `neuroquant --init`). Common overrides:
-
+**Customizing Configurations (`config.yaml`):**
 ```yaml
 model:
-  name: resnet18              # any torchvision name (CNN or ViT)
-  num_classes: 10
-  input_shape: [3, 32, 32]
-  task: classification        # classification | detection | segmentation | regression | nlp
+  name: resnet18
+  task: classification
 
 dataset:
-  name: cifar10               # cifar10 | cifar100 | imagefolder | synthetic | hf:<name>
-  class: null                 # optional "pkg.module.MyDataset"
-  train_dir: null             # optional ImageFolder split dirs
-  val_dir: null
-  test_dir: null
+  name: cifar10
   batch_size: 128
 
-methods: [ptq, qat, gptq, smoothquant, awq, smoothquant_gptq]
-bitwidths:
-  supported: [4, 8]
-  io_layer: 8                 # force first/last layers to INT8
-
 hyperparams:
-  hardware_aware_search: true        # 3-objective NSGA [acc, size, ORT latency]
-  onnx_export_enabled: true          # real INT8 ONNX size + ORT latency
-  nsga_use_surrogate: true           # BRP-NAS / OFA-style accuracy surrogate
-  qat_distill_alpha: 0.5             # KD with the FP32 teacher
-  smoothquant_per_layer_alpha: true  # per-layer migration strength
-  hessian_estimator: fisher          # ~3× faster than the diagonal Hessian
+  hardware_aware_search: true
+  onnx_export_enabled: true
 ```
 
-Pydantic field validators run at load time — invalid values surface immediately with the offending field path:
-
-```text
-ValueError: Configuration validation failed:
-  num_classes must be >= 2.
-```
+*For comprehensive API documentation and detailed usage workflows, visit the [NeuroQuant Documentation Site](https://AbdelazizElHelaly11.github.io/NeuroQuant/).*
 
 ---
 
-## Quantization methods
+## Screenshots / Demo
 
-| Method                | When to use                                                            | Module                                                                          |
-| --------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| **PTQ**               | Fast baseline; per-output-channel INT8/INT4 weights.                   | [`neuroquant/quantization/ptq.py`](neuroquant/quantization/ptq.py)               |
-| **QAT**               | Best accuracy at INT8; real W+A training with FP32-teacher KD.         | [`neuroquant/quantization/qat.py`](neuroquant/quantization/qat.py)               |
-| **GPTQ**              | Best accuracy at INT4 weights; Hessian-inverse optimal rounding.       | [`neuroquant/quantization/gptq.py`](neuroquant/quantization/gptq.py)             |
-| **SmoothQuant**       | Activation-friendly INT8; per-layer α (closed-form or grid).          | [`neuroquant/quantization/smoothquant.py`](neuroquant/quantization/smoothquant.py) |
-| **AWQ**               | INT4 with salient-channel preservation; per-layer α + FP16 carve-out.  | [`neuroquant/quantization/awq.py`](neuroquant/quantization/awq.py)               |
-| **SmoothQuant→GPTQ**  | Production recipe — strict-Pareto improvement over either method alone. | [`neuroquant/quantization/smoothquant_gptq.py`](neuroquant/quantization/smoothquant_gptq.py) |
-| **AdaRound**          | Post-PTQ refinement; canonical input→output traversal.                 | [`neuroquant/quantization/adaround.py`](neuroquant/quantization/adaround.py)     |
+NeuroQuant generates comprehensive visualizations during its run. Below are placeholders for the generated pipeline outputs stored in your `artifacts/` directory.
 
-> **AWQ does not support `task=detection`** — its per-layer α search needs static activation shapes, which the RPN/RoI heads of torchvision detectors don't provide. It raises a clear `NotImplementedError` pointing you to PTQ / QAT.
+### Pareto Optimization & Method Comparisons
+> **Note:** The `artifacts/neuroquant_report.html` file provides an interactive, self-contained dashboard of these results.
 
----
+![Tier Distribution & Sensitivity Heatmap](docs/assets/sensitivity_heatmap_placeholder.png)
+*(Replace the link above with a generated `sensitivity_heatmap.png` from your run)*
 
-## Documentation
+### XAI Error Attribution
+NeuroQuant highlights exactly where quantization introduces errors via Grad-CAM and SHAP.
 
-Full docs (MkDocs Material) are published at **<https://AbdelazizElHelaly11.github.io/NeuroQuant/>** and live in [`docs/`](docs/):
-
-| Page                                             | For                                                        |
-| ------------------------------------------------ | --------------------------------------------------------- |
-| [Getting Started](docs/getting_started.md)       | Install matrix, optional extras, verifying the install.   |
-| [Using the CLI Pipeline](docs/pipeline_mode.md)  | Researchers running a full, reproducible run from YAML.    |
-| [Using the Python Library](docs/library_mode.md) | Developers integrating quantizers into their own scripts. |
-| [API Reference](docs/api_reference.md)           | Auto-generated from docstrings via `mkdocstrings`.        |
-
-Build the site locally with `pip install -e ".[docs]" && mkdocs serve`.
+![Grad-CAM Error Attribution](docs/assets/grad_cam_placeholder.png)
+*(Replace the link above with an example from `artifacts/error_attribution/` or `artifacts/xai/`)*
 
 ---
 
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md). The latest release, **v2.1.1**, is a
-pipeline-audit pass: the FP32 baseline is now scored on the test split
-(matching every method's headline), calibration runs on inference-time
-preprocessing, mixed-precision size/EBops report real savings, ONNX
-deployment fields survive `--resume`, the Pareto hypervolume is
-normalized, and config load-time validation covers every choice field.
-
----
-
-## License
-
-MIT. See [LICENSE](LICENSE) for the full text.
+*This project was developed in partial fulfillment of the requirements for the Degree of Bachelor of Science in CSAI at Zewail City of Science and Technology.*
