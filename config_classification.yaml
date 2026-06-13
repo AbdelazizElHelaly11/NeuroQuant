@@ -1,0 +1,131 @@
+# NeuroQuant v2.0 — Classification Experiment (ResNet-50 + ImageNette)
+# ---------------------------------------------------------------------------
+# Full thesis-grade pipeline execution for Image Classification.
+# 
+# Model: ResNet-50 (ImageNet Pre-trained)
+# Dataset: ImageNette (10 classes, high-res 224x224)
+# ---------------------------------------------------------------------------
+
+model:
+  name: "resnet50"
+  pretrained: true              # Starts with ImageNet weights
+  path: null
+  class: null
+  num_classes: 10               # ImageNette has 10 classes; head will be replaced and fine-tuned
+  input_shape: [3, 224, 224]    # Standard ResNet spatial size
+  task: "classification"
+
+dataset:
+  name: "imagenet"              # Use 'imagenet' as the key to trigger the ImageNet normalization stats
+  class: "torchvision.datasets.Imagenette" # Use custom class loader to handle split="train" instead of train=True
+  path: "./data/imagenette"
+  batch_size: 128               # High throughput for classification
+  num_workers: 8
+
+output:
+  dir: "./artifacts_classification"
+  mlflow_tracking_uri: "./mlruns"
+  experiment_name: "neuroquant_class_resnet50"
+
+methods:
+  - ptq
+  - qat
+  - gptq
+  - smoothquant
+  - awq
+  - smoothquant_gptq
+
+bitwidths:
+  supported: [4, 8]
+  io_layer: 8
+
+hyperparams:
+  seed: 42
+  device: "auto"
+  
+  # Phase 0: Fine-tune the ResNet-50 head on the 10 classes
+  epochs: 5                     # 5 epochs is enough to adapt the pre-trained features
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  optimizer: "adamw"
+
+  calibration_batches: 8
+  calibration_strategy_io: "kl_divergence"
+  calibration_strategy_intermediate: "mse"
+
+  hessian_batches: 8
+  cluster_high_percentile: 0.66
+  cluster_low_percentile: 0.33
+  hessian_estimator: "fisher"
+
+  nsga_population_size: 20
+  nsga_generations: 15
+  nsga_crossover_prob: 0.9
+  nsga_mutation_prob: 0.1
+  nsga_accuracy_objective: "top1"
+  nsga_search_mode: "per_layer"
+  nsga_use_surrogate: true
+  nsga_surrogate_warmup_evals: 20
+  nsga_surrogate_proposed_per_gen: 128
+  nsga_sensitivity_weighted_mutation: true
+
+  adaround_epochs: 20
+  adaround_lr: 0.0001
+  adaround_reg_param: 0.01
+  adaround_ordered: true
+  adaround_max_samples_per_layer: 256
+
+  qat_epochs: 2                 # Fast QAT recovery
+  qat_lr: 0.0001
+  qat_momentum: 0.9
+  qat_weight_decay: 0.0001
+  qat_early_stop_patience: 1
+  qat_warmstart_source: "ptq_best_acc"
+  qat_act_bitwidth: 8
+  qat_fold_bn: true
+  qat_distill_alpha: 0.5
+  qat_distill_temperature: 4.0
+
+  ptq_real_rerank_topk: 3
+  ptq_tradeoff_max_acc_drop: 2.0
+
+  gptq_block_size: 128
+  gptq_percdamp: 0.01
+
+  smoothquant_alpha: 0.5
+  smoothquant_per_layer_alpha: true
+  smoothquant_alpha_grid: [0.4, 0.5, 0.6]
+  smoothquant_alpha_strategy: "closed_form"
+
+  awq_group_size: 128
+  awq_alpha_grid: [0.0, 0.25, 0.5, 0.75, 1.0]
+  awq_alpha_strategy: "golden"
+  awq_keep_top_pct: 0.0
+
+  alpha_cluster_amortize: true
+
+  xai_num_images: 5
+  xai_grad_cam_alpha: 0.4
+  xai_shap_n_samples: 25
+  xai_plot_dpi: 150
+
+  eval_primary_accuracy: "top1"
+  latency_warmup_runs: 5
+  latency_measure_runs: 20
+  latency_batch_size: 1
+  hardware_report_path: ""
+  use_latency_in_pareto: false
+  onnx_export_enabled: true
+  hardware_aware_search: false
+  latency_lut_bitwidths: [4, 8]
+
+phases:
+  - phase_0_preparation
+  - phase_1a_hessian_clustering
+  - phase_1c_nsga_search
+  - phase_1d_adaround
+  - phase_1e_qat
+  - phase_1f_gptq_smooth_awq
+  - phase_2_pareto
+  - phase_3_xai
+  - phase_4_mlflow
